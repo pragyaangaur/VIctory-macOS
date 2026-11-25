@@ -228,6 +228,32 @@ struct Pipeline {
 }
 const _: () = assert!(offset_of!(Pipeline, packet) == 0x10);
 
+impl Pipeline {
+    fn new(shaders: Vec<Arc<Shader>>, #[cfg(windows)] graphics: Option<Box<Graphics>>) -> Self {
+        tracing::trace!(?shaders, "pipeline state");
+        #[cfg(windows)]
+        let host = Arc::new(make::Pending::new(shaders.clone(), graphics));
+        #[cfg(windows)]
+        make::early(&host);
+        Self::with_host(
+            shaders,
+            #[cfg(windows)]
+            host,
+        )
+    }
+
+    fn with_host(shaders: Vec<Arc<Shader>>, #[cfg(windows)] host: Arc<make::Pending>) -> Self {
+        Self {
+            object: Object::new(&FUNCTIONS),
+            packet: [0; 8],
+            #[cfg(windows)]
+            host,
+            shaders,
+            bound: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+}
+
 /// Stage names, in description order.
 const GRAPHICS_STAGES: [&str; 5] = ["vertex", "pixel", "domain", "hull", "geometry"];
 
@@ -383,20 +409,12 @@ fn hand_out(
     iid: *const Iid,
     out: *mut This,
 ) -> HRESULT {
-    tracing::trace!(?shaders, "pipeline state");
-    #[cfg(windows)]
-    let host = Arc::new(make::Pending::new(shaders.clone(), graphics));
-    #[cfg(windows)]
-    make::early(&host);
-    let pipeline = Box::new(Pipeline {
-        object: Object::new(&FUNCTIONS),
-        packet: [0; 8],
-        #[cfg(windows)]
-        host,
+    let pipeline = Pipeline::new(
         shaders,
-        bound: std::sync::atomic::AtomicBool::new(false),
-    });
-    object::hand_out(PIPELINE, pipeline, iid, &PIPELINE_IIDS, out)
+        #[cfg(windows)]
+        graphics,
+    );
+    object::hand_out(PIPELINE, Box::new(pipeline), iid, &PIPELINE_IIDS, out)
 }
 
 /// Device method.
@@ -582,13 +600,18 @@ static FUNCTIONS: Table<24> = {
 };
 
 #[cfg(feature = "diagnostics")]
-pub(crate) use console_probe::create_console_probe;
+pub(crate) use console_probe::{create_console_probe, derive_console_probe};
 
 #[cfg(feature = "diagnostics")]
 mod console_probe {
     use std::sync::atomic::{AtomicU32, Ordering};
 
-    use super::{HRESULT, Iid, PIPELINE, PIPELINE_IIDS, Table, This, hand_out, object, offset_of};
+    #[cfg(windows)]
+    use std::sync::Arc;
+
+    use super::{
+        E_INVALIDARG, HRESULT, Iid, PIPELINE, PIPELINE_IIDS, Pipeline, Table, This, object, offset_of,
+    };
     use object::{E_POINTER, S_OK};
 
     const PIPE_MARKER: u32 = 0x8C0F_E002;
@@ -656,15 +679,51 @@ mod console_probe {
         }
     }
 
-    /// The console descriptors at these device slots are still unidentified.
-    /// Create a VIctory pipeline without shaders to exercise the object ABI.
+    /// The console cache format is unknown. Provide a pipeline object with no
+    /// shaders so the title can exercise the console object ABI.
     pub(crate) fn create_console_probe(iid: *const Iid, out: *mut This) -> HRESULT {
-        let mut pc = std::ptr::null();
-        let hr = hand_out(
+        let pipeline = Pipeline::new(
             Vec::new(),
             #[cfg(windows)]
             None,
+        );
+        wrap(pipeline, iid, out)
+    }
+
+    /// Create a new object with the base's shaders and host state. This probe
+    /// leaves the console state patches unapplied.
+    pub(crate) fn derive_console_probe(base: This, iid: *const Iid, out: *mut This) -> HRESULT {
+        // SAFETY: a non-null, aligned base is a live interface the title is
+        // borrowing for this call. Inspect its table before casting it.
+        let pc = match (!base.is_null() && base.is_aligned()).then(|| unsafe { vtable(base) }) {
+            Some(table) if table == FUNCTIONS.0.as_ptr() => probe(base).pc,
+            Some(table) if table == super::FUNCTIONS.0.as_ptr() => base,
+            _ => {
+                tracing::warn!(?base, "console PSO probe needs a VIctory base pipeline");
+                if !out.is_null() {
+                    // SAFETY: the title supplies writable storage for the result.
+                    unsafe { out.write(std::ptr::null()) };
+                }
+                return E_INVALIDARG;
+            }
+        };
+        // SAFETY: pc is a live Pipeline, either directly or kept by its wrapper.
+        let base = unsafe { &*pc.cast::<Pipeline>() };
+        let pipeline = Pipeline::with_host(
+            base.shaders.clone(),
+            #[cfg(windows)]
+            Arc::clone(&base.host),
+        );
+        wrap(pipeline, iid, out)
+    }
+
+    fn wrap(pipeline: Pipeline, iid: *const Iid, out: *mut This) -> HRESULT {
+        let mut pc = std::ptr::null();
+        let hr = object::hand_out(
+            PIPELINE,
+            Box::new(pipeline),
             iid,
+            &PIPELINE_IIDS,
             if out.is_null() { out } else { &mut pc },
         );
         if !out.is_null() {
@@ -684,9 +743,14 @@ mod console_probe {
         unsafe { &*this.cast::<ConsolePsoProbe>() }
     }
 
+    unsafe fn vtable(this: This) -> *const *const () {
+        // SAFETY: the caller passes a live interface with a vtable at offset zero.
+        unsafe { this.cast::<*const *const ()>().read() }
+    }
+
     pub(super) fn backing_pipeline(this: This) -> This {
         // SAFETY: both pipeline layouts start with a vtable pointer.
-        let table = unsafe { this.cast::<*const *const ()>().read() };
+        let table = unsafe { vtable(this) };
         if table == FUNCTIONS.0.as_ptr() {
             probe(this).pc
         } else {
@@ -775,6 +839,57 @@ mod console_probe {
     mod tests {
         use super::*;
         use object::{E_NOINTERFACE, E_NOTIMPL, IUNKNOWN, S_FALSE, slot};
+
+        #[test]
+        fn derived_console_pso_keeps_the_base_state_after_release() {
+            use std::ffi::c_void;
+
+            type Ref = extern "system" fn(This) -> u32;
+            type Derive =
+                extern "system" fn(This, This, u32, *const c_void, *const Iid, *mut This) -> HRESULT;
+
+            let shader = super::super::shader("compute", b"derived pipeline test");
+            let mut base = std::ptr::null();
+            let base_pipeline = Pipeline::new(
+                vec![shader.clone()],
+                #[cfg(windows)]
+                None,
+            );
+            let iid = &PIPELINE_IIDS[0];
+            assert_eq!(wrap(base_pipeline, iid, &mut base), S_OK);
+
+            let device = crate::device::device();
+            let derive = slot::<Derive>(device, 0x1b8);
+            let patches = [0u8; 64];
+            let mut derived = std::ptr::null();
+            let hr = derive(device, base, 1, patches.as_ptr().cast(), iid, &mut derived);
+            if std::env::var_os("VICTORY_STUB_DEVICE_QUERY").is_some() {
+                assert_eq!(hr, S_OK);
+            } else {
+                assert_eq!(hr, E_NOTIMPL);
+                assert_eq!(derive_console_probe(base, iid, &mut derived), S_OK);
+            }
+
+            let pc = backing_pipeline(derived);
+            let base_pc = backing_pipeline(base);
+            assert!(!pc.is_null());
+            assert_ne!(pc, base_pc);
+            assert_eq!(probe(derived).rs << 1, pc as usize);
+            #[cfg(windows)]
+            assert!(Arc::ptr_eq(
+                &super::super::pipeline(pc).host,
+                &super::super::pipeline(base_pc).host,
+            ));
+            assert_eq!(slot::<Ref>(base, 0x10)(base), 0);
+            let shaders = &super::super::pipeline(derived).shaders;
+            assert_eq!(shaders.len(), 1);
+            assert_eq!(shaders[0].hash, shader.hash);
+            assert_eq!(slot::<Ref>(derived, 0x10)(derived), 0);
+
+            let mut rejected = device;
+            assert_eq!(derive_console_probe(device, iid, &mut rejected), E_INVALIDARG);
+            assert!(rejected.is_null());
+        }
 
         #[test]
         fn console_pso_exposes_inline_fields_and_holds_its_backing_pipeline() {

@@ -233,18 +233,40 @@ extern "system" fn node_count(_: This) -> u32 {
     1
 }
 
-/// Unidentified pipeline creation methods at `0x1b8`, `0x1c8`, and `0x218`
-/// (#24). With `VICTORY_STUB_DEVICE_QUERY` set, return a console-shaped PSO
-/// for the title's inline reads at `+0x247a098`. The descriptor formats are
-/// still unknown, so the probe leaves their contents untouched.
-extern "system" fn create_pipeline_x_probe<const SLOT: usize>(
+/// CreateDerivedPipelineStateX at `0x1b8`. The patch count and patch map come
+/// before the IID and output pointer in this slot's calling convention.
+extern "system" fn create_derived_pipeline_x_probe(
+    _this: This,
+    base: This,
+    patch_count: u32,
+    patches: *const c_void,
+    iid: *const Iid,
+    out: *mut This,
+) -> HRESULT {
+    #[cfg(feature = "diagnostics")]
+    if pipeline_probe_enabled() {
+        tracing::debug!(
+            ?base,
+            patch_count,
+            ?patches,
+            "derived console PSO probe requested (patches ignored)"
+        );
+        return pipeline::derive_console_probe(base, iid, out);
+    }
+    let _ = (base, patch_count, patches, iid, out);
+    E_NOTIMPL
+}
+
+/// DeserializeGraphicsPipelineStateX (0x1c8) and DeserializeComputePipelineStateX
+/// (0x218). Their cache blobs only supply a console-shaped placeholder for now.
+extern "system" fn deserialize_pipeline_x_probe<const SLOT: usize>(
     _this: This,
     desc: *const c_void,
     iid: *const Iid,
     out: *mut This,
 ) -> HRESULT {
     #[cfg(feature = "diagnostics")]
-    if *STUB_DEVICE_QUERY.get_or_init(|| std::env::var_os("VICTORY_STUB_DEVICE_QUERY").is_some()) {
+    if pipeline_probe_enabled() {
         tracing::debug!(
             slot = format_args!("{SLOT:#x}"),
             ?desc,
@@ -256,9 +278,11 @@ extern "system" fn create_pipeline_x_probe<const SLOT: usize>(
     E_NOTIMPL
 }
 
-/// Whether `VICTORY_STUB_DEVICE_QUERY` is set (read once).
 #[cfg(feature = "diagnostics")]
-static STUB_DEVICE_QUERY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+fn pipeline_probe_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("VICTORY_STUB_DEVICE_QUERY").is_some())
+}
 
 /// Feature query 2: the highest of the requested feature levels we support.
 #[repr(C)]
@@ -449,9 +473,9 @@ static FUNCTIONS: Table<160> = {
     f[39] = query::create as *const (); // 0x138
     f[41] = signature::create as *const (); // 0x148
     f[48] = queue::create_x as *const (); // 0x180
-    f[55] = create_pipeline_x_probe::<0x1b8> as *const ();
-    f[57] = create_pipeline_x_probe::<0x1c8> as *const ();
-    f[67] = create_pipeline_x_probe::<0x218> as *const ();
+    f[55] = create_derived_pipeline_x_probe as *const ();
+    f[57] = deserialize_pipeline_x_probe::<0x1c8> as *const ();
+    f[67] = deserialize_pipeline_x_probe::<0x218> as *const ();
     f[61] = descriptor::create_sampler_x as *const (); // 0x1e8
     f[62] = pipeline::create_compute_x as *const (); // 0x1f0
     f[69] = object::ignore as *const (); // 0x228 debug error filter
