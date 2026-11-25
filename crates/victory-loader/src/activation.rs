@@ -18,7 +18,7 @@ use windows_sys::Win32::System::LibraryLoader::{LOAD_LIBRARY_SEARCH_SYSTEM32, Lo
 use windows_sys::Win32::System::Memory::{
     MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_GUARD, PAGE_NOACCESS, VirtualQuery,
 };
-use windows_sys::Win32::System::Threading::GetCurrentProcess;
+use windows_sys::Win32::System::Threading::{GetCurrentProcess, GetCurrentThreadId};
 
 #[path = "activation/events.rs"]
 mod events;
@@ -161,13 +161,15 @@ extern "system" fn ready(success: i32) {
     ARMED.store(if success == 1 { 1 } else { -1 }, Ordering::Release);
 }
 
-extern "system" fn record(kind: u32, tid: u32, code: u32, caller: usize, entry: u64) -> u64 {
+extern "system" fn record(kind: u32, code: u32, caller: usize, entry: u64) -> u64 {
     let Some(trace) = TRACE.get() else { return 0 };
     trace.active.fetch_add(1, Ordering::SeqCst);
     let id = std::panic::catch_unwind(|| {
         if trace.finished.load(Ordering::SeqCst) {
             return 0;
         }
+        // SAFETY: this synchronous callback runs on the intercepted Windows thread.
+        let tid = unsafe { GetCurrentThreadId() };
         let mut events = trace.events.lock().unwrap_or_else(|e| e.into_inner());
         events.record(trace.image, trace.size, kind, tid, code, caller, entry)
     })
