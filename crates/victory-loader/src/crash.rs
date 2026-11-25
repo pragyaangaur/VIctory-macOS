@@ -586,9 +586,14 @@ unsafe extern "system" fn handler(info: *mut EXCEPTION_POINTERS) -> i32 {
     // SAFETY: as above.
     let code = unsafe { (*(*info).ExceptionRecord).ExceptionCode };
     #[cfg(feature = "diagnostics")]
-    if code == EXCEPTION_BREAKPOINT && DUMP_REGISTRY.get().is_some() {
-        // SAFETY: the context record is valid for the faulting thread.
-        unsafe { dump_title_registry(&*(*info).ContextRecord) };
+    if code == EXCEPTION_BREAKPOINT {
+        // SAFETY: the exception record and context describe this fault.
+        let address = unsafe { (*(*info).ExceptionRecord).ExceptionAddress };
+        crate::activation::on_breakpoint(address as usize);
+        if DUMP_REGISTRY.get().is_some() {
+            // SAFETY: the context record is valid for the faulting thread.
+            unsafe { dump_title_registry(&*(*info).ContextRecord) };
+        }
     }
     #[cfg(feature = "diagnostics")]
     if code == EXCEPTION_BREAKPOINT
@@ -981,13 +986,13 @@ unsafe fn dump_title_registry(context: &CONTEXT) {
     let Some(dir) = DUMP_REGISTRY.get() else {
         return;
     };
-    // The first title int3 is the registry assert; later ones add nothing.
-    if DONE.swap(true, Ordering::Relaxed) {
-        return;
-    }
     let Some(base) = crate::threads::title_image_base(context.Rip as usize) else {
         return;
     };
+    // Ignore breakpoints outside title code without consuming the dump.
+    if DONE.swap(true, Ordering::Relaxed) {
+        return;
+    }
     let _ = std::fs::create_dir_all(dir);
     let mut txt = String::new();
     let mut add = |l: String| {
