@@ -70,6 +70,8 @@ pub(crate) struct Host {
     fence: ID3D12Fence,
     /// The last value signalled on `fence`, behind the submission lock.
     submitted: Mutex<u64>,
+    /// Under Wine, proves that completed fences correspond to GPU work (#173).
+    canary: OnceLock<Option<crate::canary::GpuCanary>>,
     event: HANDLE,
     rtvs: ID3D12DescriptorHeap,
     rtv_size: u32,
@@ -90,7 +92,8 @@ pub(crate) struct Host {
 }
 
 // SAFETY: D3D12 devices, queues, fences and descriptor heaps are
-// free-threaded; the event handle is only waited on under `submitted`.
+// free-threaded; the event and the canary's mapped buffers are only used
+// under `submitted`.
 unsafe impl Send for Host {}
 // SAFETY: as above.
 unsafe impl Sync for Host {}
@@ -274,6 +277,7 @@ fn create() -> windows::core::Result<Host> {
             queue,
             fence,
             submitted: Mutex::new(0),
+            canary: OnceLock::new(),
             event,
             rtvs,
             rtv_size,
@@ -1266,6 +1270,32 @@ impl Host {
             .chain(runs.iter().copied())
             .collect();
         let runs = &runs[..];
+        // D3DMetal can complete fences after the host starts ignoring all of
+        // this process's GPU work (#173). Under Wine, prove progress with a
+        // tiny copy whose value changes each submission. Other hosts already
+        // report removal through D3D12 and pay nothing for this.
+        let canary = self
+            .canary
+            .get_or_init(|| {
+                if !crate::shader_cache::under_wine() {
+                    return None;
+                }
+                match crate::canary::GpuCanary::new(self) {
+                    Ok(canary) => {
+                        tracing::info!("host GPU progress canary on");
+                        Some(canary)
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            "host GPU progress canary unavailable; \
+                             completed-but-ignored submissions cannot be detected"
+                        );
+                        None
+                    }
+                }
+            })
+            .as_ref();
         // A frame `crate::capture` lists: every command of every list, in
         // the order the GPU runs them (with `VICTORY_D3D12_DRED`, which
         // notes them).
@@ -1319,19 +1349,50 @@ impl Host {
         let mut removed_in = None;
         for (i, group) in groups.iter().enumerate() {
             *submitted += 1;
+            if canary.is_some_and(crate::canary::GpuCanary::active)
+                && let Some(canary) = canary
+                && let Err(e) = canary.record(*submitted)
+            {
+                fail(format_args!("host GPU progress canary could not be recorded ({e})"));
+            }
             let started = std::time::Instant::now();
             #[cfg(feature = "diagnostics")]
             crate::resource::life::note(0, crate::resource::life::SUBMITTED, *submitted, 0);
-            // SAFETY: closed lists; the fence and event are ours.
+            // SAFETY: closed lists; the fence, event and canary are ours.
             unsafe {
                 self.queue.ExecuteCommandLists(group);
+                if canary.is_some_and(crate::canary::GpuCanary::active)
+                    && let Some(canary) = canary
+                {
+                    canary.execute(&self.queue);
+                }
                 let waited = self
                     .queue
                     .Signal(&self.fence, *submitted)
                     .and_then(|()| self.fence.SetEventOnCompletion(*submitted, self.event));
                 match waited {
-                    Ok(()) => self.wait_for(*submitted),
-                    Err(e) => tracing::warn!(error = %e, "host submission not waited for"),
+                    Ok(()) => {
+                        self.wait_for(*submitted);
+                        if canary.is_some_and(crate::canary::GpuCanary::active)
+                            && let Some(canary) = canary
+                            && let Err(stalled) = canary.check(*submitted)
+                        {
+                            fail(format_args!(
+                                "host GPU stopped running work: fence {} completed but its \
+                                 progress canary read {}; the host may be ignoring \
+                                 submissions after a firmware lockup",
+                                stalled.expected, stalled.observed
+                            ));
+                        }
+                    }
+                    Err(e) => {
+                        // Do not reuse the canary's upload word while a
+                        // submission whose completion is unknown may read it.
+                        if let Some(canary) = canary {
+                            canary.disable();
+                        }
+                        tracing::warn!(error = %e, "host submission not waited for");
+                    }
                 }
             }
             #[cfg(feature = "diagnostics")]
@@ -2974,7 +3035,7 @@ impl Host {
 
     /// A mapped buffer of `size` bytes: upload memory, or (`readback`)
     /// readback memory in the copy-destination state.
-    fn mapped_buffer(&self, size: u64, readback: bool) -> Option<(ID3D12Resource, *mut u8)> {
+    pub(crate) fn mapped_buffer(&self, size: u64, readback: bool) -> Option<(ID3D12Resource, *mut u8)> {
         let heap = D3D12_HEAP_PROPERTIES {
             Type: if readback { D3D12_HEAP_TYPE_READBACK } else { D3D12_HEAP_TYPE_UPLOAD },
             ..Default::default()

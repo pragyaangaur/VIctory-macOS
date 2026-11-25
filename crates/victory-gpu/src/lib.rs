@@ -18,6 +18,8 @@
 
 #[cfg(windows)]
 mod bindless;
+#[cfg(any(windows, test))]
+mod canary;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod capture;
 #[cfg(windows)]
