@@ -1238,6 +1238,7 @@ impl Host {
                     .collect::<Vec<_>>()
             })
             .collect();
+        crate::descriptor::dex_restore_pending(&heaps);
         // And textures read through tables, uploaded by the same list.
         let textures: Vec<_> = runs
             .iter()
@@ -3180,6 +3181,14 @@ impl Meter {
                         crate::resource::PLACED_BYTES.load(Ordering::Relaxed) as f64 / 1e6,
                         crate::list::UPLOADS[0].load(Ordering::Relaxed),
                         crate::list::UPLOADS[1].load(Ordering::Relaxed) as f64 / 1e6,
+                    );
+                }
+                if crate::descriptor::host::dex_enabled() {
+                    let [deferred, resolved, failed] =
+                        crate::descriptor::host::dex_stats();
+                    tracing::info!(
+                        deferred, resolved, failed,
+                        "DexMetal descriptor census"
                     );
                 }
                 let [gpu, title] = crate::resource::texture_census().map(|r| r.map(|b| b as f64 / 1e6));

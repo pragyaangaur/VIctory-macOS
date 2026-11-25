@@ -475,6 +475,82 @@ void main(uint3 id : SV_DispatchThreadID) {
         out
     }
 
+    fn dex_resource(dimension: u32, width: u64, height: u32, format: u32, layout: u32, flags: u32) -> This {
+        let desc: [u32; 14] = [
+            dimension, 0, 0, 0, width as u32, (width >> 32) as u32, height, 1 | 1 << 16, format, 1, 0,
+            layout, flags, 0,
+        ];
+        let properties = [1u32, 0, 0, 0, 0];
+        let mut out = std::ptr::null();
+        let iid = crate::object::guid(
+            0x696442be,
+            0xa72e,
+            0x4059,
+            [0xbc, 0x79, 0x5b, 0x5c, 0x98, 0x04, 0x0f, 0xad],
+        );
+        let made: HRESULT = crate::resource::create_committed(
+            std::ptr::null(),
+            properties.as_ptr().cast(),
+            0,
+            desc.as_ptr().cast(),
+            0,
+            std::ptr::null(),
+            &iid,
+            &mut out,
+        );
+        assert_eq!(made, S_OK);
+        out
+    }
+
+    #[test]
+    fn dexmetal_waits_for_table_and_heap() {
+        assert!(crate::descriptor::host::dex_enabled());
+        let _host = crate::host::host()
+            .expect("DexMetal needs a real D3D12 host");
+        let null = std::ptr::null();
+        let a = dex_resource(3, 4, 1, 28, LINEAR, 0);
+        let b = dex_resource(3, 4, 1, 28, LINEAR, 4);
+        let heap_desc: [u32; 8] = [0, 8, 1, 0, 0, 0, 0, 0];
+        let mut heap = null;
+        let iid = crate::object::guid(
+            0x8efb471d, 0x616c, 0x4f49,
+            [0x90, 0xf7, 0x12, 0x7b, 0xb7, 0x63, 0xfa, 0x51],
+        );
+        assert_eq!(
+            crate::descriptor::create_heap(
+                null, heap_desc.as_ptr().cast(), &iid, &mut heap
+            ), S_OK
+        );
+        let title_heap = crate::descriptor::heap(heap);
+        let slot = |i: u64| title_heap.start + 32 * i;
+        crate::descriptor::create_srv(null, a, null.cast(), slot(0));
+        crate::descriptor::create_srv(null, a, null.cast(), slot(1));
+        let uav: [u32; 10] = [28, 4, 0, 0, 0, 0, 0, 0, 0, 0];
+        crate::descriptor::create_uav(null, b, null, &uav, slot(2));
+        let h = title_heap.host().expect("host heap");
+        assert!(crate::resource::made_copy(a).is_none());
+        assert!(crate::resource::made_copy(b).is_none());
+        assert!(!h.kept(0) && !h.kept(1) && !h.kept(2));
+        assert!(h.mirror(0, slot(0), true).is_some());
+        assert!(h.kept(0));
+        assert!(crate::resource::made_copy(a).is_some());
+        assert!(!h.kept(1));
+        crate::descriptor::dex_restore_pending(&[h.viewed.clone()]);
+        assert!(h.kept(1) && h.kept(2));
+        assert!(crate::resource::made_copy(b).is_some());
+        eprintln!("DEXMETAL_PUBLICATION_VERIFIED");
+    }
+
+    #[test]
+    fn dexmetal_direct_heap_numeric() {
+        assert!(crate::descriptor::host::dex_enabled());
+        let _host = crate::host::host()
+            .expect("DexMetal needs a real D3D12 host");
+        heap_views_are_current();
+        eprintln!("DEXMETAL_NUMERICS_VERIFIED");
+    }
+
+
     /// A title resource at `address` (title memory of its own), as the
     /// title places buffers and textures in its heaps.
     fn resource_at(address: usize, dimension: u32, width: u64, height: u32, format: u32, layout: u32) -> This {
@@ -622,6 +698,11 @@ void main(uint3 id : SV_DispatchThreadID) {
         crate::descriptor::create_uav(null, dst, null, &uav, slot(1));
         crate::descriptor::create_srv(null, tex, std::ptr::null(), slot(2));
         let heap_host = title_heap.host().expect("a host view heap");
+        if crate::descriptor::host::dex_enabled() {
+            assert!(crate::resource::made_copy(tex).is_none(),
+                "texture must still be deferred before submission");
+            assert!(!heap_host.kept(2));
+        }
         let (root, pso) = compile();
         let list = host.new_list().unwrap();
         let (dst_bytes, _) = crate::resource::buffer_bytes(dst).unwrap();
@@ -644,6 +725,10 @@ void main(uint3 id : SV_DispatchThreadID) {
             write(base, texel);
             host.execute(&[&list]);
             let words = out.read_host(dst_bytes as u64, 64);
+            if crate::descriptor::host::dex_enabled() {
+                assert!(heap_host.kept(2));
+                assert_eq!(words.len(), 64);
+            }
             for (i, &v) in words.iter().enumerate() {
                 assert_eq!(v, base + i as u32 + u32::from(texel), "round {round}, dword {i}");
             }

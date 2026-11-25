@@ -26,6 +26,8 @@ pub(crate) struct HostHeap {
     sampler: bool,
     /// The record (view index and generation) each slot was last made from.
     made: Mutex<Vec<u64>>,
+    // Resource-object views whose host texture has not been made.
+    dex_pending: Mutex<std::collections::BTreeSet<u32>>,
     /// The host resource each slot views, held while the slot does: shaders
     /// index heaps directly, so a slot the title has not rewritten since it
     /// released the resource may still be read, and a freed host resource
@@ -207,6 +209,7 @@ impl HostHeap {
             dynamic: extra,
             sampler,
             made: Mutex::new(vec![0; count as usize]),
+            dex_pending: Mutex::new(Default::default()),
             kept: Mutex::new(Paged::new((count + extra) as usize)),
             next: Mutex::new((0, vec![false; extra as usize])),
             pairs: Mutex::new((count + extra, Vec::new())),
@@ -702,6 +705,9 @@ impl HostHeap {
         let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
         let view = (tag == VIEW_TAG).then(|| view_at(i, generation)).flatten();
         let Some(view) = view else {
+            self.dex_pending.lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&index);
             // Not a view of ours (never written, or of a resource the
             // title released): nothing to read.
             if made[index as usize] != 0 {
@@ -716,7 +722,10 @@ impl HostHeap {
         // (heap syncs revisit it at every submission).
         let lazy = || {
             for_draw
-                && is_texture(&view)
+                && (is_texture(&view) ||
+                    self.dex_pending.lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .contains(&index))
                 && self.kept.lock().unwrap_or_else(|e| e.into_inner()).get(index as usize).is_none()
         };
         if made[index as usize] == key && !lazy() {
@@ -728,7 +737,10 @@ impl HostHeap {
         // when a draw reads them through a table: a host texture (and a
         // staging copy) for each of the ~20,000 the title has views of
         // ran the host out of memory (run b2).
-        let later = !for_draw && is_placed_texture(&view);
+        let dex_later = !for_draw && dex_waits(&view);
+        let later = !for_draw && (
+            is_placed_texture(&view) || dex_later
+        );
         if !later {
             // What the view needs (the texture it views, the copy of the
             // memory) is made without the slot lock, which title threads
@@ -760,6 +772,22 @@ impl HostHeap {
             } else {
                 make_marked(&view, self.cpu(index))
             };
+            {
+                use std::sync::atomic::Ordering::Relaxed;
+                let mut pending = self.dex_pending.lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                if dex_later {
+                    if pending.insert(index) {
+                        DEX_DEFERRED.fetch_add(1, Relaxed);
+                    }
+                } else if pending.remove(&index) {
+                    if kept.is_some() {
+                        DEX_RESOLVED.fetch_add(1, Relaxed);
+                    } else if for_draw {
+                        DEX_FAILED.fetch_add(1, Relaxed);
+                    }
+                }
+            }
             self.set_mark(index, mark);
             if kept.is_none() && !self.sampler {
                 null_for(&view, self.cpu(index));
@@ -770,6 +798,24 @@ impl HostHeap {
             self.keep(index, kept.flatten());
         }
         Some(view)
+    }
+
+    /// Before a direct-heap submission, materialize every
+    /// pending object view in that heap, not just prior read marks.
+    pub(crate) fn dex_restore(&self, start: u64, step: u64) {
+        let slots: Vec<u32> = self.dex_pending.lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter().copied().collect();
+        for i in slots {
+            let handle = start + u64::from(i) * step;
+            // Follow the official heap-sync accessibility check.
+            if !crate::host::read_into(
+                handle as *const u8, &mut [0u8; 12]
+            ) {
+                continue;
+            }
+            self.mirror(i, handle, true);
+        }
     }
 
     /// The view host slot `index` was made from, in a few words, with the
@@ -1526,6 +1572,41 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
 }
 
 /// Whether `view` is a view of a texture the title placed in memory itself.
+pub(crate) fn dex_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> =
+        std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var_os("VICTORY_DEXMETAL_DEFER")
+            .is_some_and(|v| v == "1")
+    })
+}
+
+static DEX_DEFERRED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+static DEX_RESOLVED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+static DEX_FAILED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+pub(crate) fn dex_stats() -> [u64; 3] {
+    use std::sync::atomic::Ordering::Relaxed;
+    [
+        DEX_DEFERRED.load(Relaxed),
+        DEX_RESOLVED.load(Relaxed),
+        DEX_FAILED.load(Relaxed),
+    ]
+}
+
+fn dex_waits(view: &View) -> bool {
+    dex_enabled() && match view {
+        View::Shader(r, _) | View::Unordered(r, _, _) =>
+            crate::resource::dex_waiting(
+                *r as crate::object::This
+            ),
+        _ => false,
+    }
+}
+
 fn is_placed_texture(view: &View) -> bool {
     matches!(view, View::Placed(_, resource, _) if resource[0] != 1)
 }

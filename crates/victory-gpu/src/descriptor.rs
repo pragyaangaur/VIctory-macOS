@@ -205,6 +205,37 @@ pub(crate) fn sync_heaps() {
     }
 }
 
+// DexMetal conservative fallback: direct indexing may select
+// a texture before a previous read mark exists. Restore the active
+// heap's waiting object views before GPU execution and uploads.
+#[cfg(windows)]
+pub(crate) fn dex_restore_pending(
+    active: &[std::sync::Arc<crate::bindless::Viewed>]
+) {
+    if active.is_empty() || !host::dex_enabled() {
+        return;
+    }
+    let heaps = SHADER_HEAPS.lock()
+        .unwrap_or_else(|e| e.into_inner());
+    for &(start, _, at) in heaps.iter() {
+        // SAFETY: registered heaps remain live under this lock.
+        let heap = unsafe { &*(at as *const Heap) };
+        if heap.desc.kind != VIEWS_KIND {
+            continue;
+        }
+        let Some(Some(h)) = heap.host.get() else {
+            continue;
+        };
+        if active.iter().any(|v|
+            std::sync::Arc::ptr_eq(v, &h.viewed)
+        ) {
+            if let Some(step) = increment(heap.desc.kind) {
+                h.dex_restore(start, u64::from(step));
+            }
+        }
+    }
+}
+
 /// Makes the views of slots `slots` that were left null (textures the title
 /// placed itself, textures given up) in every shader-visible view heap, now
 /// that shaders read them (`crate::shadow::take_reads`), and stamps what

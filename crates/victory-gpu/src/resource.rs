@@ -1105,6 +1105,21 @@ pub(crate) fn made_copy(this: This) -> Option<std::sync::Arc<HostTexture>> {
     resource(this).host.lock().unwrap_or_else(|e| e.into_inner()).clone().flatten()
 }
 
+// DexMetal: adapted from the deferred descriptor principle in
+// DexNom/VIctory, revision 2e01ab4760db91820ef5f9a9f85761f83cd6b5d0.
+// Keep the upstream host ownership and refusal states.
+#[cfg(windows)]
+pub(crate) fn dex_waiting(this: This) -> bool {
+    if this.is_null() {
+        return false;
+    }
+    let r = resource(this);
+    if r.desc.dimension == BUFFER {
+        return false;
+    }
+    r.host.lock().unwrap_or_else(|e| e.into_inner()).is_none()
+}
+
 /// A title texture's host copy, shared, for a list to hold.
 #[cfg(windows)]
 pub(crate) fn host_copy(this: This) -> Option<std::sync::Arc<HostTexture>> {
