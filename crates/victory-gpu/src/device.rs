@@ -233,34 +233,26 @@ extern "system" fn node_count(_: This) -> u32 {
     1
 }
 
-/// Diagnostics probe for the `+0x1dac734` start-up assert (#24). The title
-/// calls three D3D12.X device methods — vtable slots `0x1b8`, `0x1c8`, `0x218`,
-/// each `(…, REFIID 765a30f3-f624-4c6f-a828-ace948622445, out)` — and takes an
-/// error branch when the HRESULT is negative. We have no implementation, so
-/// they return `E_NOTIMPL`, the title takes the error branch, and the path that
-/// would register its subsystem (the one `+0x1dac734` checks) never runs.
-///
-/// By default this is unchanged (`E_NOTIMPL`). With `VICTORY_STUB_DEVICE_QUERY`
-/// set, in a diagnostics build, it answers `S_OK` with a null `out` so the
-/// title takes the success branch: `+0x1dac734` then no longer fires, which
-/// confirms these slots gate it. (Init still stops later, at `+0x247a098`,
-/// where the title wants a real object of that IID — not null and not the
-/// device — so this is a probe, not a fix.)
-extern "system" fn query_feature_x(
+/// Unidentified pipeline creation methods at `0x1b8`, `0x1c8`, and `0x218`
+/// (#24). With `VICTORY_STUB_DEVICE_QUERY` set, return a console-shaped PSO
+/// for the title's inline reads at `+0x247a098`. The descriptor formats are
+/// still unknown, so the probe leaves their contents untouched.
+extern "system" fn create_pipeline_x_probe<const SLOT: usize>(
     _this: This,
-    _a: usize,
-    _iid: *const Iid,
-    out: *mut usize,
+    desc: *const c_void,
+    iid: *const Iid,
+    out: *mut This,
 ) -> HRESULT {
     #[cfg(feature = "diagnostics")]
     if *STUB_DEVICE_QUERY.get_or_init(|| std::env::var_os("VICTORY_STUB_DEVICE_QUERY").is_some()) {
-        if !out.is_null() {
-            // SAFETY: the title passes a writable out pointer.
-            unsafe { *out = 0 };
-        }
-        return S_OK;
+        tracing::debug!(
+            slot = format_args!("{SLOT:#x}"),
+            ?desc,
+            "console PSO probe requested"
+        );
+        return pipeline::create_console_probe(iid, out);
     }
-    let _ = out;
+    let _ = (desc, iid, out);
     E_NOTIMPL
 }
 
@@ -457,9 +449,9 @@ static FUNCTIONS: Table<160> = {
     f[39] = query::create as *const (); // 0x138
     f[41] = signature::create as *const (); // 0x148
     f[48] = queue::create_x as *const (); // 0x180
-    f[55] = query_feature_x as *const (); // 0x1b8 (diagnostics probe, see fn)
-    f[57] = query_feature_x as *const (); // 0x1c8 (diagnostics probe, see fn)
-    f[67] = query_feature_x as *const (); // 0x218 (diagnostics probe, see fn)
+    f[55] = create_pipeline_x_probe::<0x1b8> as *const ();
+    f[57] = create_pipeline_x_probe::<0x1c8> as *const ();
+    f[67] = create_pipeline_x_probe::<0x218> as *const ();
     f[61] = descriptor::create_sampler_x as *const (); // 0x1e8
     f[62] = pipeline::create_compute_x as *const (); // 0x1f0
     f[69] = object::ignore as *const (); // 0x228 debug error filter

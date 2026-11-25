@@ -232,6 +232,8 @@ const _: () = assert!(offset_of!(Pipeline, packet) == 0x10);
 const GRAPHICS_STAGES: [&str; 5] = ["vertex", "pixel", "domain", "hull", "geometry"];
 
 fn pipeline<'a>(this: This) -> &'a Pipeline {
+    #[cfg(feature = "diagnostics")]
+    let this = console_probe::backing_pipeline(this);
     // SAFETY: the title passes one of our pipelines.
     unsafe { &*this.cast::<Pipeline>() }
 }
@@ -578,6 +580,286 @@ static FUNCTIONS: Table<24> = {
     f[7] = object::parent_device as *const (); // 0x38
     Table(f)
 };
+
+#[cfg(feature = "diagnostics")]
+pub(crate) use console_probe::create_console_probe;
+
+#[cfg(feature = "diagnostics")]
+mod console_probe {
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    use super::{HRESULT, Iid, PIPELINE, PIPELINE_IIDS, Table, This, hand_out, object, offset_of};
+    use object::{E_POINTER, S_OK};
+
+    const PIPE_MARKER: u32 = 0x8C0F_E002;
+
+    /// The title reads this layout inline (#24, layout identified by xcl-dev/xcl).
+    /// Its reference count is at +0x08, ahead of VIctory's usual +0x0c.
+    #[repr(C)]
+    struct ConsolePsoProbe {
+        vtable: *const *const (),
+        refs: AtomicU32,
+        refs_pad: u32,
+        packet: [u32; 4],
+        flags: u64,
+        tail: u32,
+        tail_pad: u32,
+        pc: This,
+        translated: bool,
+        translated_pad: [u8; 7],
+        rs: usize,
+    }
+
+    const _: () = {
+        assert!(offset_of!(ConsolePsoProbe, refs) == 0x08);
+        assert!(offset_of!(ConsolePsoProbe, packet) == 0x10);
+        assert!(offset_of!(ConsolePsoProbe, flags) == 0x20);
+        assert!(offset_of!(ConsolePsoProbe, tail) == 0x28);
+        assert!(offset_of!(ConsolePsoProbe, pc) == 0x30);
+        assert!(offset_of!(ConsolePsoProbe, translated) == 0x38);
+        assert!(offset_of!(ConsolePsoProbe, rs) == 0x40);
+        assert!(std::mem::size_of::<ConsolePsoProbe>() == 0x48);
+    };
+
+    impl ConsolePsoProbe {
+        /// Takes ownership of the backing pipeline's initial reference.
+        fn new(pc: This) -> Box<Self> {
+            let pc_addr = pc as usize;
+            // The title doubles rs before its vtable call. For the observed
+            // AddRef, use the backing pipeline as an experimental stand-in.
+            debug_assert_eq!(pc_addr & 1, 0);
+            let rs = pc_addr >> 1;
+            let mut probe = Box::new(Self {
+                vtable: FUNCTIONS.0.as_ptr(),
+                refs: AtomicU32::new(1),
+                refs_pad: 0,
+                packet: [PIPE_MARKER, 0, 0, 0],
+                flags: 0,
+                tail: 0,
+                tail_pad: 0,
+                pc,
+                translated: false,
+                translated_pad: [0; 7],
+                rs,
+            });
+            let this = std::ptr::from_mut(probe.as_mut()) as usize;
+            probe.packet[2] = this as u32;
+            probe.packet[3] = (this >> 32) as u32;
+            tracing::debug!(probe = this, ?pc, rs, "console PSO probe created");
+            probe
+        }
+    }
+
+    impl Drop for ConsolePsoProbe {
+        fn drop(&mut self) {
+            super::release(self.pc);
+        }
+    }
+
+    /// The console descriptors at these device slots are still unidentified.
+    /// Create a VIctory pipeline without shaders to exercise the object ABI.
+    pub(crate) fn create_console_probe(iid: *const Iid, out: *mut This) -> HRESULT {
+        let mut pc = std::ptr::null();
+        let hr = hand_out(
+            Vec::new(),
+            #[cfg(windows)]
+            None,
+            iid,
+            if out.is_null() { out } else { &mut pc },
+        );
+        if !out.is_null() {
+            let result = if hr == S_OK {
+                Box::into_raw(ConsolePsoProbe::new(pc)).cast()
+            } else {
+                pc
+            };
+            // SAFETY: the title supplies writable storage for the result.
+            unsafe { out.write(result) };
+        }
+        hr
+    }
+
+    fn probe<'a>(this: This) -> &'a ConsolePsoProbe {
+        // SAFETY: called through this probe's table, or after checking its vtable.
+        unsafe { &*this.cast::<ConsolePsoProbe>() }
+    }
+
+    pub(super) fn backing_pipeline(this: This) -> This {
+        // SAFETY: both pipeline layouts start with a vtable pointer.
+        let table = unsafe { this.cast::<*const *const ()>().read() };
+        if table == FUNCTIONS.0.as_ptr() {
+            probe(this).pc
+        } else {
+            this
+        }
+    }
+
+    extern "system" fn query(this: This, iid: *const Iid, out: *mut This) -> HRESULT {
+        if out.is_null() {
+            return E_POINTER;
+        }
+        if !object::is(iid, &PIPELINE_IIDS) {
+            return object::answer(PIPELINE, iid, None, out);
+        }
+        add_ref(this);
+        // SAFETY: the title supplies writable storage for the result.
+        unsafe { out.write(this) };
+        S_OK
+    }
+
+    extern "system" fn add_ref(this: This) -> u32 {
+        probe(this).refs.fetch_add(1, Ordering::Relaxed) + 1
+    }
+
+    extern "system" fn release(this: This) -> u32 {
+        let remaining = probe(this).refs.fetch_sub(1, Ordering::AcqRel) - 1;
+        if remaining == 0 {
+            // SAFETY: the last reference owns this allocation from Box::into_raw.
+            drop(unsafe { Box::from_raw(this.cast_mut().cast::<ConsolePsoProbe>()) });
+        }
+        remaining
+    }
+
+    macro_rules! forward {
+        ($method:ident, $slot:literal, $($arg:ident: $ty:ty),+) => {
+            extern "system" fn $method(this: This, $($arg: $ty),+) -> HRESULT {
+                // SAFETY: this slot of the backing pipeline table has this signature.
+                let call = unsafe {
+                    std::mem::transmute::<*const (), extern "system" fn(This, $($ty),+) -> HRESULT>(
+                        super::FUNCTIONS.0[$slot],
+                    )
+                };
+                call(probe(this).pc, $($arg),+)
+            }
+        };
+    }
+
+    forward!(get_private_data, 3, id: *const Iid, size: *mut u32, data: *mut u8);
+    forward!(set_private_data, 4, id: *const Iid, size: u32, data: *const u8);
+    forward!(set_name, 6, name: *const u16);
+    forward!(get_device, 7, iid: *const Iid, out: *mut This);
+
+    fn call_backing_stub(slot: usize) -> HRESULT {
+        // SAFETY: slots 5 and 8 of the backing table are both no-argument stubs.
+        let call = unsafe {
+            std::mem::transmute::<*const (), extern "system" fn() -> HRESULT>(
+                super::FUNCTIONS.0[slot],
+            )
+        };
+        call()
+    }
+
+    extern "system" fn set_private_data_interface(_: This, _: *const Iid, _: This) -> HRESULT {
+        call_backing_stub(5)
+    }
+
+    extern "system" fn get_cached_blob(_: This, _: *mut This) -> HRESULT {
+        call_backing_stub(8)
+    }
+
+    static FUNCTIONS: Table<24> = {
+        let mut f = object::missing_table::<PIPELINE, 24>();
+        f[0] = query as *const ();
+        f[1] = add_ref as *const ();
+        f[2] = release as *const ();
+        f[3] = get_private_data as *const ();
+        f[4] = set_private_data as *const ();
+        f[5] = set_private_data_interface as *const ();
+        f[6] = set_name as *const ();
+        f[7] = get_device as *const ();
+        f[8] = get_cached_blob as *const ();
+        Table(f)
+    };
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use object::{E_NOINTERFACE, E_NOTIMPL, IUNKNOWN, S_FALSE, slot};
+
+        #[test]
+        fn console_pso_exposes_inline_fields_and_holds_its_backing_pipeline() {
+            type Ref = extern "system" fn(This) -> u32;
+            type Query = extern "system" fn(This, *const Iid, *mut This) -> HRESULT;
+            let mut this = std::ptr::null();
+            assert_eq!(create_console_probe(&PIPELINE_IIDS[0], &mut this), S_OK);
+
+            let wrapper = probe(this);
+            let address = this as usize;
+            assert_eq!(
+                wrapper.packet,
+                [PIPE_MARKER, 0, address as u32, (address >> 32) as u32]
+            );
+            assert_eq!(
+                (wrapper.flags, wrapper.tail, wrapper.translated),
+                (0, 0, false)
+            );
+            assert_eq!(wrapper.rs << 1, wrapper.pc as usize);
+            let pc = (wrapper.rs << 1) as This;
+            assert_eq!(backing_pipeline(this), pc);
+            assert_eq!(backing_pipeline(pc), pc);
+            super::super::bound(this);
+            assert!(super::super::pipeline(pc).bound.load(Ordering::Relaxed));
+            assert_eq!(slot::<Ref>(pc, 0x08)(pc), 2);
+
+            let mut queried = std::ptr::null();
+            let query = slot::<Query>(this, 0);
+            assert_eq!(query(this, &IUNKNOWN, &mut queried), S_OK);
+            assert_eq!(queried, this);
+            assert_eq!(query(this, &[0; 16], &mut queried), E_NOINTERFACE);
+            assert!(queried.is_null());
+            assert_eq!(query(this, &IUNKNOWN, std::ptr::null_mut()), E_POINTER);
+            assert_eq!(object::refs(pc), 2);
+
+            let release = slot::<Ref>(this, 0x10);
+            assert_eq!(release(this), 1);
+            assert_eq!(release(this), 0);
+            assert_eq!(slot::<Ref>(pc, 0x10)(pc), 0);
+        }
+
+        #[test]
+        fn console_pso_forwards_pipeline_methods_and_reports_creation_errors() {
+            type Set = extern "system" fn(This, *const Iid, u32, *const u8) -> HRESULT;
+            type Get = extern "system" fn(This, *const Iid, *mut u32, *mut u8) -> HRESULT;
+            type GetInterface = extern "system" fn(This, *const Iid, *mut This) -> HRESULT;
+            type GetBlob = extern "system" fn(This, *mut This) -> HRESULT;
+            type Ref = extern "system" fn(This) -> u32;
+            let mut this = std::ptr::null();
+            assert_eq!(create_console_probe(&PIPELINE_IIDS[0], &mut this), S_OK);
+            let pc = backing_pipeline(this);
+            let tag = [1; 16];
+            let data = [42];
+            assert_eq!(slot::<Set>(this, 0x20)(this, &tag, 1, data.as_ptr()), S_OK);
+            let mut read = [0];
+            let mut size = 1;
+            assert_eq!(
+                slot::<Get>(pc, 0x18)(pc, &tag, &mut size, read.as_mut_ptr()),
+                S_OK
+            );
+            assert_eq!(read, data);
+            assert_eq!(
+                slot::<Get>(this, 0x18)(this, &tag, &mut size, read.as_mut_ptr()),
+                S_OK
+            );
+
+            let mut device = std::ptr::null();
+            assert_eq!(
+                slot::<GetInterface>(this, 0x38)(this, &IUNKNOWN, &mut device),
+                S_OK
+            );
+            assert_eq!(device, crate::device::device());
+            slot::<Ref>(device, 0x10)(device);
+            let mut blob = std::ptr::null();
+            assert_eq!(slot::<GetBlob>(this, 0x40)(this, &mut blob), E_NOTIMPL);
+            assert_eq!(slot::<Ref>(this, 0x10)(this), 0);
+            assert_eq!(create_console_probe(&[0; 16], &mut this), E_NOINTERFACE);
+            assert!(this.is_null());
+            assert_eq!(
+                create_console_probe(&PIPELINE_IIDS[0], std::ptr::null_mut()),
+                S_FALSE
+            );
+        }
+    }
+}
 
 #[cfg(windows)]
 pub(crate) mod host;
