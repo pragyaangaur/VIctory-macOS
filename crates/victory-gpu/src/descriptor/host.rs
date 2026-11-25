@@ -982,7 +982,7 @@ fn view_kind(view: &View) -> u32 {
 
 /// Whether a DXGI format is an integer one, and if so whether signed:
 /// `Some(false)` for `UINT`, `Some(true)` for `SINT`, `None` otherwise.
-fn integer_format(format: u32) -> Option<bool> {
+pub(crate) fn integer_format(format: u32) -> Option<bool> {
     match format {
         3 | 7 | 12 | 17 | 25 | 30 | 36 | 42 | 50 | 57 | 62 => Some(false),
         4 | 8 | 14 | 18 | 32 | 38 | 43 | 52 | 59 | 64 => Some(true),

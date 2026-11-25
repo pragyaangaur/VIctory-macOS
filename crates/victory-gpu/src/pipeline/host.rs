@@ -90,6 +90,29 @@ impl Default for GraphicsState {
 }
 
 impl GraphicsState {
+    /// The console ignores blending on integer render targets. D3D12 may
+    /// refuse the whole PSO if the title enables blending on one of them.
+    fn host_blend(&self) -> D3D12_BLEND_DESC {
+        let mut blend = self.blend;
+        let count = (self.targets.NumRenderTargets as usize).min(blend.RenderTarget.len());
+        for (i, format) in self.targets.RTFormats[..count].iter().enumerate() {
+            let independent = blend.IndependentBlendEnable.as_bool();
+            let source = if independent { i } else { 0 };
+            if !blend.RenderTarget[source].BlendEnable.as_bool()
+                || crate::descriptor::host::integer_format(format.0 as u32).is_none()
+            {
+                continue;
+            }
+            if !independent && count > 1 {
+                // All slots inherit RT0, including its write mask and factors.
+                blend.RenderTarget = [blend.RenderTarget[0]; 8];
+                blend.IndependentBlendEnable = true.into();
+            }
+            blend.RenderTarget[i].BlendEnable = false.into();
+        }
+        blend
+    }
+
     /// Takes in one subobject of a stream: its type, then its data at +4
     /// (+8 for those holding pointers).
     ///
@@ -190,7 +213,7 @@ impl GraphicsState {
             .collect();
         format!(
             "{:?} {} {:?} {:?} {inputs:?} {} {} {:?} {} {:?}",
-            self.blend,
+            self.host_blend(),
             self.sample_mask,
             self.rasterizer,
             self.depth,
@@ -629,7 +652,7 @@ impl HostPipeline {
                 pShaderBytecode: if gs.is_empty() { std::ptr::null() } else { gs.as_ptr().cast() },
                 BytecodeLength: gs.len(),
             },
-            BlendState: g.blend,
+            BlendState: g.host_blend(),
             SampleMask: g.sample_mask,
             RasterizerState: g.rasterizer,
             DepthStencilState: g.depth,
@@ -737,7 +760,7 @@ fn mesh_pipeline(
         ),
         ms: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS, ms),
         ps: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, ps),
-        blend: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, g.blend),
+        blend: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, g.host_blend()),
         mask: Sub(
             D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK,
             g.sample_mask,
@@ -890,5 +913,80 @@ mod tests {
             element(DXGI_FORMAT_R32_FLOAT, D3D12_APPEND_ALIGNED_ELEMENT),
         ];
         let _ = offsets(&inputs);
+    }
+}
+
+#[cfg(test)]
+mod blend_tests {
+    use super::*;
+
+    fn mixed_targets(independent: bool) -> GraphicsState {
+        let mut g = GraphicsState::default();
+        g.targets.NumRenderTargets = 4;
+        g.targets.RTFormats[..4].copy_from_slice(&[
+            DXGI_FORMAT_R8_UINT,
+            DXGI_FORMAT_R8G8B8A8_UNORM,
+            DXGI_FORMAT_R16_SINT,
+            DXGI_FORMAT_R16_FLOAT,
+        ]);
+        g.blend.AlphaToCoverageEnable = true.into();
+        g.blend.IndependentBlendEnable = independent.into();
+        for (i, target) in g.blend.RenderTarget.iter_mut().enumerate() {
+            target.BlendEnable = true.into();
+            target.SrcBlend = D3D12_BLEND_SRC_ALPHA;
+            target.DestBlend = D3D12_BLEND_INV_SRC_ALPHA;
+            target.RenderTargetWriteMask = 1 << (i % 4);
+        }
+        g
+    }
+
+    #[test]
+    fn mixed_integer_and_colour_targets_preserve_effective_masks_and_blend_factors() {
+        for independent in [false, true] {
+            let g = mixed_targets(independent);
+            let host = g.host_blend();
+            assert!(host.IndependentBlendEnable.as_bool());
+            assert_eq!(host.AlphaToCoverageEnable, g.blend.AlphaToCoverageEnable);
+            for i in 0..4 {
+                let mut expected = g.blend.RenderTarget[if independent { i } else { 0 }];
+                if i == 0 || i == 2 {
+                    expected.BlendEnable = false.into();
+                }
+                assert_eq!(host.RenderTarget[i], expected, "target {i}, independent {independent}");
+            }
+        }
+    }
+
+    #[test]
+    fn shared_logic_ops_are_preserved() {
+        let mut g = mixed_targets(false);
+        g.blend.RenderTarget[0].BlendEnable = false.into();
+        g.blend.RenderTarget[0].LogicOpEnable = true.into();
+        g.blend.RenderTarget[0].LogicOp = D3D12_LOGIC_OP_XOR;
+        assert_eq!(g.host_blend(), g.blend);
+    }
+
+    #[test]
+    fn pipeline_identity_uses_the_effective_blend_state() {
+        let mut g = mixed_targets(false);
+        let requested = g.describe();
+        g.blend = g.host_blend();
+        assert_eq!(g.describe(), requested);
+        g.blend.RenderTarget[1].RenderTargetWriteMask = 0;
+        assert_ne!(g.describe(), requested);
+    }
+
+    #[test]
+    fn ignores_unused_or_already_unblended_integer_targets() {
+        let mut g = mixed_targets(true);
+        g.blend.RenderTarget[0].BlendEnable = false.into();
+        g.blend.RenderTarget[2].BlendEnable = false.into();
+        assert_eq!(g.host_blend(), g.blend);
+        let mut g = mixed_targets(false);
+        g.targets.RTFormats[0] = DXGI_FORMAT_R8_SNORM;
+        g.targets.NumRenderTargets = 2;
+        assert_eq!(g.host_blend(), g.blend);
+        g.targets.NumRenderTargets = 0;
+        assert_eq!(g.host_blend(), g.blend);
     }
 }
