@@ -1300,12 +1300,14 @@ pub enum View<'a> {
 #[cfg(test)]
 pub fn view_strides(views: &[View]) -> Vec<u32> {
     let kind = |f: DXGI_FORMAT| match f {
-        DXGI_FORMAT_R32G32B32A32_UINT | DXGI_FORMAT_R16G16B16A16_UINT | DXGI_FORMAT_R32G32_UINT
-        | DXGI_FORMAT_R10G10B10A2_UINT | DXGI_FORMAT_R8G8B8A8_UINT | DXGI_FORMAT_R16G16_UINT
-        | DXGI_FORMAT_R32_UINT | DXGI_FORMAT_R8G8_UINT | DXGI_FORMAT_R16_UINT | DXGI_FORMAT_R8_UINT => super::VIEW_INTEGER,
-        DXGI_FORMAT_R32G32B32A32_SINT | DXGI_FORMAT_R16G16B16A16_SINT | DXGI_FORMAT_R32G32_SINT
-        | DXGI_FORMAT_R8G8B8A8_SINT | DXGI_FORMAT_R16G16_SINT | DXGI_FORMAT_R32_SINT
-        | DXGI_FORMAT_R8G8_SINT | DXGI_FORMAT_R16_SINT | DXGI_FORMAT_R8_SINT => super::VIEW_INTEGER | super::VIEW_SIGNED,
+        DXGI_FORMAT_R32G32B32A32_UINT | DXGI_FORMAT_R32G32B32_UINT | DXGI_FORMAT_R16G16B16A16_UINT
+        | DXGI_FORMAT_R32G32_UINT | DXGI_FORMAT_R10G10B10A2_UINT | DXGI_FORMAT_R8G8B8A8_UINT
+        | DXGI_FORMAT_R16G16_UINT | DXGI_FORMAT_R32_UINT | DXGI_FORMAT_R8G8_UINT
+        | DXGI_FORMAT_R16_UINT | DXGI_FORMAT_R8_UINT => super::VIEW_INTEGER,
+        DXGI_FORMAT_R32G32B32A32_SINT | DXGI_FORMAT_R32G32B32_SINT | DXGI_FORMAT_R16G16B16A16_SINT
+        | DXGI_FORMAT_R32G32_SINT | DXGI_FORMAT_R8G8B8A8_SINT | DXGI_FORMAT_R16G16_SINT
+        | DXGI_FORMAT_R32_SINT | DXGI_FORMAT_R8G8_SINT | DXGI_FORMAT_R16_SINT
+        | DXGI_FORMAT_R8_SINT => super::VIEW_INTEGER | super::VIEW_SIGNED,
         _ => 0,
     };
     views
@@ -1319,6 +1321,48 @@ pub fn view_strides(views: &[View]) -> Vec<u32> {
             _ => 0,
         })
         .collect()
+}
+
+#[cfg(test)]
+#[test]
+fn three_channel_integer_view_strides_match_production() {
+    let views = [
+        View::Buffer {
+            data: &[],
+            stride: Stride::Format(DXGI_FORMAT_R32G32B32_FLOAT, 12),
+        },
+        View::Buffer {
+            data: &[],
+            stride: Stride::Format(DXGI_FORMAT_R32G32B32_UINT, 12),
+        },
+        View::Buffer {
+            data: &[],
+            stride: Stride::Format(DXGI_FORMAT_R32G32B32_SINT, 12),
+        },
+        View::Buffer {
+            data: &[],
+            stride: Stride::Format(DXGI_FORMAT_R32G32B32A32_FLOAT, 16),
+        },
+        View::Buffer {
+            data: &[],
+            stride: Stride::Format(DXGI_FORMAT_R32G32B32A32_UINT, 16),
+        },
+        View::Buffer {
+            data: &[],
+            stride: Stride::Format(DXGI_FORMAT_R32G32B32A32_SINT, 16),
+        },
+    ];
+    assert_eq!(
+        view_strides(&views),
+        [
+            12,
+            12 | super::VIEW_INTEGER,
+            12 | super::VIEW_INTEGER | super::VIEW_SIGNED,
+            16,
+            16 | super::VIEW_INTEGER,
+            16 | super::VIEW_INTEGER | super::VIEW_SIGNED,
+        ]
+    );
 }
 
 /// How [`View::Buffer`] is viewed.
