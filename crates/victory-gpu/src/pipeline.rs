@@ -424,6 +424,8 @@ pub(crate) extern "system" fn create_graphics(
     iid: *const Iid,
     out: *mut This,
 ) -> HRESULT {
+    #[cfg(feature = "diagnostics")]
+    tracing::debug!(kind = "graphics", ?desc, "pipeline description submitted");
     // SAFETY: the title passes a description (null is tolerated).
     let Some(desc) = (unsafe { desc.as_ref() }) else {
         return E_INVALIDARG;
@@ -446,6 +448,8 @@ pub(crate) extern "system" fn create_compute(
     iid: *const Iid,
     out: *mut This,
 ) -> HRESULT {
+    #[cfg(feature = "diagnostics")]
+    tracing::debug!(kind = "compute", ?desc, "pipeline description submitted");
     // SAFETY: the title passes a description (null is tolerated).
     let Some(desc) = (unsafe { desc.as_ref() }) else {
         return E_INVALIDARG;
@@ -518,6 +522,8 @@ pub(crate) extern "system" fn create_stream(
     iid: *const Iid,
     out: *mut This,
 ) -> HRESULT {
+    #[cfg(feature = "diagnostics")]
+    tracing::debug!(kind = "stream", ?desc, "pipeline description submitted");
     // SAFETY: the title passes a description (null is tolerated).
     let Some(desc) = (unsafe { desc.as_ref() }) else {
         return E_INVALIDARG;

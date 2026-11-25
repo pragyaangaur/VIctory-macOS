@@ -258,7 +258,8 @@ extern "system" fn create_derived_pipeline_x_probe(
 }
 
 /// DeserializeGraphicsPipelineStateX (0x1c8) and DeserializeComputePipelineStateX
-/// (0x218). Their cache blobs only supply a console-shaped placeholder for now.
+/// (0x218). The probe normally supplies a console-shaped placeholder. Rejecting
+/// one cache kind lets a run observe the title's fallback for that slot.
 extern "system" fn deserialize_pipeline_x_probe<const SLOT: usize>(
     _this: This,
     desc: *const c_void,
@@ -267,11 +268,29 @@ extern "system" fn deserialize_pipeline_x_probe<const SLOT: usize>(
 ) -> HRESULT {
     #[cfg(feature = "diagnostics")]
     if pipeline_probe_enabled() {
+        static REJECT_GRAPHICS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        static REJECT_COMPUTE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let reject_cache = match SLOT {
+            0x1c8 => *REJECT_GRAPHICS
+                .get_or_init(|| crate::switch::on("VICTORY_REJECT_GRAPHICS_PSO_CACHE")),
+            0x218 => *REJECT_COMPUTE
+                .get_or_init(|| crate::switch::on("VICTORY_REJECT_COMPUTE_PSO_CACHE")),
+            _ => unreachable!("unknown pipeline cache slot"),
+        };
         tracing::debug!(
             slot = format_args!("{SLOT:#x}"),
             ?desc,
+            reject_cache,
             "console PSO probe requested"
         );
+        if reject_cache {
+            if !out.is_null() {
+                // SAFETY: the caller supplies writable storage for the result.
+                unsafe { out.write(std::ptr::null()) };
+            }
+            // XCL reports unsupported serialized console PSOs this way.
+            return E_NOTIMPL;
+        }
         return pipeline::create_console_probe(iid, out);
     }
     let _ = (desc, iid, out);
@@ -508,6 +527,37 @@ mod tests {
         let mut device = std::ptr::null();
         let hr = create(std::ptr::null(), &version, iid, &mut device);
         (hr, device)
+    }
+
+    #[cfg(feature = "diagnostics")]
+    #[test]
+    fn console_pso_cache_rejection_is_independent_for_each_device_slot() {
+        type Deserialize = extern "system" fn(This, *const c_void, *const Iid, *mut This) -> HRESULT;
+        type Release = extern "system" fn(This) -> u32;
+        let device = device();
+        for (offset, switch) in [
+            (0x1c8, "VICTORY_REJECT_GRAPHICS_PSO_CACHE"),
+            (0x218, "VICTORY_REJECT_COMPUTE_PSO_CACHE"),
+        ] {
+            let deserialize = slot::<Deserialize>(device, offset);
+            let mut result = device;
+            let hr = deserialize(device, std::ptr::null(), &object::IUNKNOWN, &mut result);
+            if !pipeline_probe_enabled() {
+                assert_eq!(hr, E_NOTIMPL);
+            } else if crate::switch::on(switch) {
+                assert_eq!(hr, E_NOTIMPL);
+                assert!(result.is_null());
+                assert_eq!(
+                    deserialize(device, std::ptr::null(), &object::IUNKNOWN, std::ptr::null_mut()),
+                    E_NOTIMPL
+                );
+            } else {
+                assert_eq!(hr, S_OK);
+                assert!(!result.is_null());
+                assert_ne!(result, device);
+                assert_eq!(slot::<Release>(result, 0x10)(result), 0);
+            }
+        }
     }
 
     #[test]
