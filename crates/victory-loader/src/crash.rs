@@ -1201,7 +1201,10 @@ mod tests {
         assert_eq!(memory_at(base + 0x3008), "no access");
         // SAFETY: releases the reservation made above.
         unsafe { VirtualFree(base as *mut _, 0, MEM_RELEASE) };
-        assert_eq!(memory_at(base + 8), "nothing mapped there");
+        // The released range is not asked about: another test's thread can
+        // reserve or map it again at once, and the answer is then that
+        // thread's memory (#162). Address 0 is free in the same way and
+        // stays free.
         assert_eq!(memory_at(0), "nothing mapped there");
         assert_eq!(memory_at(usize::MAX), "outside the address space");
         // This test's own code: an image page, named by its module.
