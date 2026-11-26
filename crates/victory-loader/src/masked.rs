@@ -922,3 +922,646 @@ mod patch_tests {
         }
     }
 }
+
+/// Patched stores against the stores themselves, in every form the patch
+/// takes (#184: a store the patch redid wrongly would lose or misplace a
+/// write of the title's).
+#[cfg(all(test, windows, target_arch = "x86_64"))]
+mod equivalence_tests {
+    use super::*;
+    use std::mem::offset_of;
+    use windows_sys::Win32::System::Memory::*;
+
+    /// Registers before and after one store.
+    #[repr(C, align(32))]
+    struct Ctx {
+        gpr: [u64; 16],
+        flags: u64,
+        _pad: [u64; 3],
+        ymm: [[u8; 32]; 16],
+        stack: [u8; 128],
+        out_gpr: [u64; 16],
+        out_flags: u64,
+        _pad2: [u64; 3],
+        out_ymm: [[u8; 32]; 16],
+        out_stack: [u8; 128],
+    }
+
+    /// The arithmetic flags and bit 1: no trap, direction or alignment
+    /// check flags.
+    const FLAGS: u64 = 0x8d5;
+    /// Where the harness keeps the context pointer, the trampoline goes
+    /// and RIP-relative stores land, in the code allocation.
+    const SLOT: usize = 0x3000;
+    const TRAMPOLINE: usize = 0x1000;
+    const RIP_AREA: usize = 0x2000;
+    /// The harness's stack frame: a 128-byte area stores relative to rsp
+    /// land in, then xmm6 to xmm15.
+    const FRAME: u32 = 0x128;
+
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+        fn below(&mut self, n: u64) -> u64 {
+            self.next() % n
+        }
+        fn coin(&mut self) -> bool {
+            self.next() & 1 != 0
+        }
+    }
+
+    /// A memory operand, as the generator places it.
+    #[derive(Debug, Clone, Copy)]
+    enum Mem {
+        Rip(i32),
+        /// `[index * scale + disp32]` with no base.
+        Absolute {
+            index: Option<(u8, u8)>,
+            disp: i32,
+        },
+        /// `[base + index * scale + disp]`; `wide_disp` asks for a disp32.
+        Based {
+            base: u8,
+            index: Option<(u8, u8)>,
+            disp: i32,
+            wide_disp: bool,
+        },
+    }
+
+    /// ModRM (with `reg`), SIB, displacement and the REX X and B bits.
+    fn modrm_bytes(reg: u8, m: Mem) -> (Vec<u8>, bool, bool) {
+        let r = (reg & 7) << 3;
+        let sib = |index: Option<(u8, u8)>, base: u8| {
+            let (i, s) = index.map_or((4, 0), |(i, s)| (i & 7, s));
+            s << 6 | i << 3 | base
+        };
+        let x = |index: Option<(u8, u8)>| index.is_some_and(|(i, _)| i >= 8);
+        match m {
+            Mem::Rip(disp) => {
+                let mut v = vec![r | 5];
+                v.extend_from_slice(&disp.to_le_bytes());
+                (v, false, false)
+            }
+            Mem::Absolute { index, disp } => {
+                let mut v = vec![r | 4, sib(index, 5)];
+                v.extend_from_slice(&disp.to_le_bytes());
+                (v, x(index), false)
+            }
+            Mem::Based {
+                base,
+                index,
+                disp,
+                wide_disp,
+            } => {
+                let needs_sib = base & 7 == 4 || index.is_some();
+                let md = if disp == 0 && base & 7 != 5 && !wide_disp {
+                    0
+                } else if i8::try_from(disp).is_ok() && !wide_disp {
+                    1
+                } else {
+                    2
+                };
+                let mut v = vec![md << 6 | r | if needs_sib { 4 } else { base & 7 }];
+                if needs_sib {
+                    v.push(sib(index, base & 7));
+                }
+                match md {
+                    1 => v.push(disp as i8 as u8),
+                    2 => v.extend_from_slice(&disp.to_le_bytes()),
+                    _ => {}
+                }
+                (v, x(index), base >= 8)
+            }
+        }
+    }
+
+    /// A store to generate: its kind, its registers and its operand.
+    #[derive(Debug, Clone, Copy, PartialEq)]
+    enum Kind {
+        Masked { opcode: u8, w: bool },
+        Cvt,
+        Extract(u8),
+        Move { opcode: u8, pp: u8, two_byte: bool },
+    }
+
+    /// The instruction's bytes: `kind` storing `src` (masked by `mask`) to `m`.
+    fn encode(kind: Kind, ymm: bool, mask: u8, src: u8, m: Mem, imm: u8) -> Vec<u8> {
+        let (body, x, b) = modrm_bytes(src, m);
+        let rbar = if src & 8 == 0 { 0x80 } else { 0 };
+        let xb = if x { 0 } else { 0x40 } | if b { 0 } else { 0x20 };
+        let l = if ymm { 4 } else { 0 };
+        let mut v = match kind {
+            Kind::Masked { opcode, w } => vec![
+                0xc4,
+                rbar | xb | 2,
+                if w { 0x80 } else { 0 } | (!mask & 0xf) << 3 | l | 1,
+                opcode,
+            ],
+            Kind::Cvt => vec![0xc4, rbar | xb | 3, 0x78 | l | 1, 0x1d],
+            Kind::Extract(opcode) => vec![0xc4, rbar | xb | 3, 0x78 | 4 | 1, opcode],
+            Kind::Move {
+                opcode,
+                pp,
+                two_byte: true,
+            } => vec![0xc5, rbar | 0x78 | 4 | pp, opcode],
+            Kind::Move {
+                opcode,
+                pp,
+                two_byte: false,
+            } => {
+                vec![0xc4, rbar | xb | 1, 0x78 | 4 | pp, opcode]
+            }
+        };
+        v.extend(body);
+        if matches!(kind, Kind::Cvt | Kind::Extract(_)) {
+            v.push(imm);
+        }
+        v
+    }
+
+    /// A little assembler for the harness: `mov`s between registers and
+    /// `[base + disp32]`, and vector moves.
+    struct Asm(Vec<u8>);
+    impl Asm {
+        /// REX.W `op` /r with `reg` and `[base + disp32]` (base not rsp or r12).
+        fn rm64(&mut self, op: u8, reg: u8, base: u8, disp: usize) {
+            self.0.push(0x48 | (reg >> 3) << 2 | (base >> 3));
+            self.0.push(op);
+            self.0.push(0x80 | (reg & 7) << 3 | (base & 7));
+            self.0.extend_from_slice(&(disp as u32).to_le_bytes());
+        }
+        /// `vmovdqu` (`op` 6f load, 7f store) of `ymm reg` with
+        /// `[base + disp32]`; base 4 is rsp.
+        fn vmov(&mut self, op: u8, reg: u8, base: u8, disp: usize) {
+            let rbar = if reg & 8 == 0 { 0x80 } else { 0 };
+            self.0.extend_from_slice(&[0xc4, rbar | 0x60 | 1, 0x7e, op]);
+            self.0.push(0x80 | (reg & 7) << 3 | (base & 7));
+            if base == 4 {
+                self.0.push(0x24);
+            }
+            self.0.extend_from_slice(&(disp as u32).to_le_bytes());
+        }
+        /// `movdqu` (`op` 6f load, 7f store) of `xmm reg` with `[rsp + disp32]`.
+        fn xmm_rsp(&mut self, op: u8, reg: u8, disp: u32) {
+            self.0.push(0xf3);
+            if reg >= 8 {
+                self.0.push(0x44);
+            }
+            self.0
+                .extend_from_slice(&[0x0f, op, 0x84 | (reg & 7) << 3, 0x24]);
+            self.0.extend_from_slice(&disp.to_le_bytes());
+        }
+        /// `mov [rip + to - next], reg` (89) or `mov reg, [rip + ...]` (8b)
+        /// for code placed at offset 0 of the allocation.
+        fn rip64(&mut self, op: u8, reg: u8, to: usize) {
+            self.0
+                .extend_from_slice(&[0x48 | (reg >> 3) << 2, op, (reg & 7) << 3 | 5]);
+            let next = self.0.len() + 4;
+            self.0
+                .extend_from_slice(&((to as i64 - next as i64) as i32).to_le_bytes());
+        }
+    }
+
+    /// The harness: loads `Ctx` (pointer in rcx), runs `store`, saves the
+    /// registers back, keeping what the Windows ABI asks to keep. Returns
+    /// the code and where the store starts in it.
+    fn harness(store: &[u8]) -> (Vec<u8>, usize) {
+        let mut a = Asm(Vec::new());
+        // push rbx, rbp, rsi, rdi, r12..r15
+        a.0.extend_from_slice(&[
+            0x53, 0x55, 0x56, 0x57, 0x41, 0x54, 0x41, 0x55, 0x41, 0x56, 0x41, 0x57,
+        ]);
+        a.0.extend_from_slice(&[0x48, 0x81, 0xec]); // sub rsp, FRAME
+        a.0.extend_from_slice(&FRAME.to_le_bytes());
+        for i in 0..10 {
+            a.xmm_rsp(0x7f, 6 + i, 0x80 + 16 * u32::from(i));
+        }
+        a.rip64(0x89, 1, SLOT); // mov [rip + slot], rcx
+        for k in 0..4 {
+            a.vmov(0x6f, 0, 1, offset_of!(Ctx, stack) + 32 * k);
+            a.vmov(0x7f, 0, 4, 32 * k);
+        }
+        for i in 0..16 {
+            a.vmov(0x6f, i, 1, offset_of!(Ctx, ymm) + 32 * usize::from(i));
+        }
+        // push qword [rcx + flags]; popfq
+        a.0.extend_from_slice(&[0xff, 0xb1]);
+        a.0.extend_from_slice(&(offset_of!(Ctx, flags) as u32).to_le_bytes());
+        a.0.push(0x9d);
+        for r in (0..16u8).filter(|&r| r != 1 && r != 4) {
+            a.rm64(0x8b, r, 1, offset_of!(Ctx, gpr) + 8 * usize::from(r));
+        }
+        a.rm64(0x8b, 1, 1, offset_of!(Ctx, gpr) + 8);
+        let site = a.0.len();
+        a.0.extend_from_slice(store);
+        a.0.extend_from_slice(&[0x9c, 0x50]); // pushfq; push rax
+        a.rip64(0x8b, 0, SLOT); // mov rax, [rip + slot]
+        for r in (1..16u8).filter(|&r| r != 4) {
+            a.rm64(0x89, r, 0, offset_of!(Ctx, out_gpr) + 8 * usize::from(r));
+        }
+        a.0.push(0x59); // pop rcx: rax as the store left it
+        a.rm64(0x89, 1, 0, offset_of!(Ctx, out_gpr));
+        a.0.push(0x59); // pop rcx: the flags
+        a.rm64(0x89, 1, 0, offset_of!(Ctx, out_flags));
+        for i in 0..16 {
+            a.vmov(0x7f, i, 0, offset_of!(Ctx, out_ymm) + 32 * usize::from(i));
+        }
+        for k in 0..4 {
+            a.vmov(0x6f, 0, 4, 32 * k);
+            a.vmov(0x7f, 0, 0, offset_of!(Ctx, out_stack) + 32 * k);
+        }
+        for i in 0..10 {
+            a.xmm_rsp(0x6f, 6 + i, 0x80 + 16 * u32::from(i));
+        }
+        a.0.extend_from_slice(&[0x48, 0x81, 0xc4]); // add rsp, FRAME
+        a.0.extend_from_slice(&FRAME.to_le_bytes());
+        a.0.extend_from_slice(&[
+            0x41, 0x5f, 0x41, 0x5e, 0x41, 0x5d, 0x41, 0x5c, 0x5f, 0x5e, 0x5d, 0x5b,
+        ]);
+        a.0.extend_from_slice(&[0xfc, 0xc5, 0xf8, 0x77, 0xc3]); // cld; vzeroupper; ret
+        (a.0, site)
+    }
+
+    /// What one run leaves: registers, flags, vector registers, the stack
+    /// area, the data buffer, the RIP area and the low buffer.
+    #[derive(Debug, PartialEq, Eq)]
+    struct After {
+        gpr: Vec<u64>,
+        flags: u64,
+        ymm: Vec<[u8; 32]>,
+        stack: [u8; 128],
+        data: Vec<u8>,
+        rip: Vec<u8>,
+        low: Vec<u8>,
+    }
+
+    /// A 4 KiB buffer below 2 GB for absolute operands, if one can be had.
+    fn low_buffer() -> Option<*mut u8> {
+        (0x1000u64..0x7000).map(|k| k << 16).find_map(|at| {
+            // SAFETY: a plain allocation at a hint; null when refused.
+            let p = unsafe {
+                VirtualAlloc(
+                    at as *const _,
+                    0x1000,
+                    MEM_RESERVE | MEM_COMMIT,
+                    PAGE_READWRITE,
+                )
+            };
+            (!p.is_null() && (p as u64) < 0x7000_0000).then_some(p.cast())
+        })
+    }
+
+    /// Every masked and plain store the patch redoes, in every operand form,
+    /// with random registers, masks and data: the patched store leaves
+    /// memory, registers and flags as the store itself does, the masked
+    /// ones and the moves write exactly what their definition says, and
+    /// each decodes to its own length.
+    #[test]
+    fn patched_stores_match_the_stores_in_every_form() {
+        const CASES: u32 = 4000;
+        let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
+        // SAFETY: our own allocations, freed at the end.
+        let page = unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                0x4000,
+                MEM_RESERVE | MEM_COMMIT,
+                PAGE_EXECUTE_READWRITE,
+            )
+        } as *mut u8;
+        assert!(!page.is_null());
+        let mut data = vec![0u8; 4096];
+        let low = low_buffer();
+        let mut ran = [0u32; 4]; // masked, cvt, extract, move
+        let mut forms = std::collections::BTreeSet::new();
+        for case in 0..CASES {
+            let kind = match rng.below(9) {
+                0 => Kind::Masked {
+                    opcode: 0x8e,
+                    w: false,
+                },
+                1 => Kind::Masked {
+                    opcode: 0x8e,
+                    w: true,
+                },
+                2 => Kind::Masked {
+                    opcode: 0x2e,
+                    w: false,
+                },
+                3 => Kind::Masked {
+                    opcode: 0x2f,
+                    w: false,
+                },
+                4 => Kind::Cvt,
+                5 => Kind::Extract(if rng.coin() { 0x19 } else { 0x39 }),
+                n => {
+                    let (opcode, pp) = [(0x11, 0), (0x11, 1), (0x7f, 2)][rng.below(3) as usize];
+                    Kind::Move {
+                        opcode,
+                        pp,
+                        two_byte: n == 8,
+                    }
+                }
+            };
+            let ymm = matches!(kind, Kind::Extract(_) | Kind::Move { .. }) || rng.coin();
+            let (mask, src) = (rng.below(16) as u8, rng.below(16) as u8);
+            let imm = rng.below(256) as u8;
+            // SAFETY: every field is an integer or bytes, valid as zeros.
+            let mut ctx: Box<Ctx> = Box::new(unsafe { std::mem::zeroed() });
+            for g in ctx.gpr.iter_mut() {
+                *g = rng.next();
+            }
+            ctx.flags = rng.next() & FLAGS | 2;
+            for y in ctx.ymm.iter_mut() {
+                y.iter_mut().for_each(|b| *b = rng.next() as u8);
+            }
+            ctx.stack.iter_mut().for_each(|b| *b = rng.next() as u8);
+            // The operand: a target 64 bytes from the edges of its buffer.
+            let target = 64 + rng.below(4096 - 160) as i64;
+            let scale = rng.below(4) as u8;
+            let pick_index = |rng: &mut Rng, base: Option<u8>| loop {
+                let i = rng.below(16) as u8;
+                if i != 4 && Some(i) != base {
+                    break i;
+                }
+            };
+            let two_byte = matches!(kind, Kind::Move { two_byte: true, .. });
+            let form = rng.below(if two_byte { 2 } else { 6 });
+            let (m, desc) = match form {
+                // A base, maybe an index (a low register for the two-byte
+                // prefix, which has no X or B).
+                0 | 1 => {
+                    let base = loop {
+                        let b = rng.below(16) as u8;
+                        if b != 4 && (!two_byte || b < 8) {
+                            break b;
+                        }
+                    };
+                    let index = (form == 1).then(|| {
+                        loop {
+                            let i = pick_index(&mut rng, Some(base));
+                            if !two_byte || i < 8 {
+                                break (i, scale);
+                            }
+                        }
+                    });
+                    let disp = match rng.below(3) {
+                        0 => 0,
+                        1 => rng.below(256) as i32 - 128,
+                        _ => rng.below(1 << 20) as i32 - (1 << 19),
+                    };
+                    let iv = rng.below(64);
+                    if let Some((i, s)) = index {
+                        ctx.gpr[usize::from(i)] = iv;
+                        let ea = data.as_ptr() as i64 + target;
+                        ctx.gpr[usize::from(base)] =
+                            (ea - (iv << s) as i64 - i64::from(disp)) as u64;
+                    } else {
+                        ctx.gpr[usize::from(base)] =
+                            (data.as_ptr() as i64 + target - i64::from(disp)) as u64;
+                    }
+                    let wide_disp = rng.coin();
+                    (
+                        Mem::Based {
+                            base,
+                            index,
+                            disp,
+                            wide_disp,
+                        },
+                        format!("base {base} index {index:?}"),
+                    )
+                }
+                // The same register as base and index.
+                2 => {
+                    let r = loop {
+                        let r = rng.below(16) as u8;
+                        if r != 4 {
+                            break r;
+                        }
+                    };
+                    let k = 1 + (1i64 << scale);
+                    let v = (data.as_ptr() as i64 + target) / k;
+                    let disp = (data.as_ptr() as i64 + target - v * k) as i32;
+                    ctx.gpr[usize::from(r)] = v as u64;
+                    (
+                        Mem::Based {
+                            base: r,
+                            index: Some((r, scale)),
+                            disp,
+                            wide_disp: false,
+                        },
+                        format!("base and index {r}"),
+                    )
+                }
+                // rsp as the base: into the harness's stack area.
+                3 => {
+                    let index = rng.coin().then(|| (pick_index(&mut rng, Some(4)), scale));
+                    let at = rng.below(128 - 32) as i64;
+                    let iv = rng.below(8) as i64;
+                    let disp = match index {
+                        Some((i, s)) => {
+                            ctx.gpr[usize::from(i)] = iv as u64;
+                            (at - (iv << s)) as i32
+                        }
+                        None => at as i32,
+                    };
+                    (
+                        Mem::Based {
+                            base: 4,
+                            index,
+                            disp,
+                            wide_disp: rng.coin(),
+                        },
+                        "rsp".into(),
+                    )
+                }
+                // RIP-relative, into the RIP area of the code allocation.
+                4 => (Mem::Rip(0), "rip".into()),
+                // No base: an absolute address in the low buffer.
+                _ => match low {
+                    Some(low) => {
+                        let index = rng.coin().then(|| (pick_index(&mut rng, None), scale));
+                        let iv = rng.below(16) as i64;
+                        if let Some((i, _)) = index {
+                            ctx.gpr[usize::from(i)] = iv as u64;
+                        }
+                        let shift = index.map_or(0, |(_, s)| iv << s);
+                        let disp = (low as i64 + target - shift) as i32;
+                        (Mem::Absolute { index, disp }, "absolute".into())
+                    }
+                    None => continue,
+                },
+            };
+            // RIP-relative: the displacement depends on where the store ends.
+            let mut store = encode(kind, ymm, mask, src, m, imm);
+            let (mut code, site) = harness(&store);
+            if let Mem::Rip(_) = m {
+                let next = site + store.len();
+                let disp = (RIP_AREA as i64 + target - next as i64) as i32;
+                store = encode(kind, ymm, mask, src, Mem::Rip(disp), imm);
+                code[site..site + store.len()].copy_from_slice(&store);
+            }
+            forms.insert(desc);
+            let decoded = match kind {
+                Kind::Move { .. } => decode_wide_move(&code, site),
+                _ => decode_store(&code, site),
+            };
+            let Some(s) = decoded else {
+                // Only plain moves too short for the jump may be left alone.
+                assert!(
+                    matches!(kind, Kind::Move { .. }) && store.len() < 5,
+                    "case {case}: {store:02x?} ({kind:?}) did not decode"
+                );
+                continue;
+            };
+            assert_eq!(
+                s.len,
+                store.len(),
+                "case {case}: {store:02x?} decodes to the wrong length"
+            );
+            let run = |patch: bool, ctx: &mut Ctx, data: &mut Vec<u8>| -> After {
+                // SAFETY: our own code allocation, written and then run; the
+                // buffers the operands point at are live.
+                unsafe {
+                    std::ptr::write_bytes(page, 0xcc, 0x4000);
+                    std::ptr::copy_nonoverlapping(code.as_ptr(), page, code.len());
+                    for k in 0..0x1000 {
+                        *page.add(RIP_AREA + k) = (k * 7 + 3) as u8;
+                    }
+                    if patch {
+                        let site_at = page as u64 + site as u64;
+                        let at = page as u64 + TRAMPOLINE as u64;
+                        let t = trampoline(&s, site_at, at).expect("a trampoline");
+                        std::ptr::copy_nonoverlapping(t.as_ptr(), at as *mut u8, t.len());
+                        let j = jump(site_at, s.len, at).expect("a jump");
+                        std::ptr::copy_nonoverlapping(j.as_ptr(), site_at as *mut u8, j.len());
+                    }
+                    data.iter_mut()
+                        .enumerate()
+                        .for_each(|(k, b)| *b = (k * 13 + 5) as u8);
+                    if let Some(low) = low {
+                        for k in 0..0x1000 {
+                            *low.add(k) = (k * 11 + 1) as u8;
+                        }
+                    }
+                    let f: extern "win64" fn(*mut Ctx) = std::mem::transmute(page);
+                    f(ctx);
+                    After {
+                        gpr: ctx
+                            .out_gpr
+                            .iter()
+                            .enumerate()
+                            .filter(|(i, _)| *i != 4)
+                            .map(|(_, g)| *g)
+                            .collect(),
+                        flags: ctx.out_flags & FLAGS,
+                        ymm: ctx.out_ymm.to_vec(),
+                        stack: ctx.out_stack,
+                        data: data.clone(),
+                        rip: std::slice::from_raw_parts(page.add(RIP_AREA), 0x1000).to_vec(),
+                        low: low
+                            .map(|l| std::slice::from_raw_parts(l, 0x1000).to_vec())
+                            .unwrap_or_default(),
+                    }
+                }
+            };
+            let before_regs = (ctx.gpr, ctx.flags, ctx.ymm, ctx.stack);
+            let plain = run(false, &mut ctx, &mut data);
+            (ctx.gpr, ctx.flags, ctx.ymm, ctx.stack) = before_regs;
+            let patched = run(true, &mut ctx, &mut data);
+            let what = format!(
+                "case {case}: {store:02x?} ({kind:?}, ymm {ymm}, mask {mask}, src {src}, {m:?})"
+            );
+            assert_eq!(patched, plain, "{what}: the patched store differs");
+            // The store's own definition, for the masked stores and moves:
+            // only the bytes it stores change, to the stored register's.
+            let lane = match kind {
+                Kind::Masked {
+                    opcode: 0x8e,
+                    w: true,
+                }
+                | Kind::Masked { opcode: 0x2f, .. } => Some(8),
+                Kind::Masked { .. } => Some(4),
+                _ => None,
+            };
+            let (written, region): (Vec<Option<u8>>, &[u8]) = {
+                let reg = &before_regs.2[usize::from(src)];
+                let size = if ymm { 32 } else { 16 };
+                let expect: Vec<Option<u8>> = match kind {
+                    Kind::Masked { .. } => {
+                        let lane = lane.unwrap();
+                        let maskr = &before_regs.2[usize::from(mask)];
+                        (0..size)
+                            .map(|k| {
+                                (maskr[(k / lane) * lane + lane - 1] & 0x80 != 0).then_some(reg[k])
+                            })
+                            .collect()
+                    }
+                    Kind::Extract(_) => (0..16)
+                        .map(|k| Some(reg[(usize::from(imm & 1)) * 16 + k]))
+                        .collect(),
+                    Kind::Move { .. } => (0..32).map(|k| Some(reg[k])).collect(),
+                    Kind::Cvt => Vec::new(),
+                };
+                let region: &[u8] = match m {
+                    Mem::Rip(_) => &plain.rip,
+                    Mem::Absolute { .. } => &plain.low,
+                    Mem::Based { base: 4, .. } => &plain.stack,
+                    Mem::Based { .. } => &plain.data,
+                };
+                (expect, region)
+            };
+            if !written.is_empty() {
+                let at = match m {
+                    Mem::Based {
+                        base: 4,
+                        index,
+                        disp,
+                        ..
+                    } => {
+                        (i64::from(disp)
+                            + index.map_or(0, |(i, s)| (before_regs.0[usize::from(i)] as i64) << s))
+                            as usize
+                    }
+                    _ => target as usize,
+                };
+                for (k, want) in written.iter().enumerate() {
+                    if let Some(want) = want {
+                        assert_eq!(region[at + k], *want, "{what}: byte {k} not the stored one");
+                    }
+                }
+            }
+            ran[match kind {
+                Kind::Masked { .. } => 0,
+                Kind::Cvt => 1,
+                Kind::Extract(_) => 2,
+                Kind::Move { .. } => 3,
+            }] += 1;
+        }
+        // SAFETY: our own allocations.
+        unsafe {
+            VirtualFree(page.cast(), 0, MEM_RELEASE);
+            if let Some(low) = low {
+                VirtualFree(low.cast(), 0, MEM_RELEASE);
+            }
+        }
+        eprintln!(
+            "ran masked {} cvt {} extract {} move {} in {} operand forms; low buffer {}",
+            ran[0],
+            ran[1],
+            ran[2],
+            ran[3],
+            forms.len(),
+            low.is_some()
+        );
+        assert!(ran.iter().all(|&n| n > 100), "every kind ran: {ran:?}");
+        // Base and index registers, the same register as both, rsp, rip and
+        // (where a low buffer could be had) no base at all.
+        assert!(forms.len() > 200, "operand forms: {}", forms.len());
+    }
+}

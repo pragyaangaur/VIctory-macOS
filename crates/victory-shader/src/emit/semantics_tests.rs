@@ -309,6 +309,7 @@ fn lower_program(words: &[u32]) -> Result<HostShader, String> {
         root_cbvs: lowered.root_cbvs,
         root_srvs: lowered.root_srvs,
         root_uavs: lowered.root_uavs,
+        root_srv_bytes: lowered.root_srv_bytes,
         memory: lowered.memory,
         memory_writes: lowered.memory_writes,
         view_addresses: lowered.view_addresses,

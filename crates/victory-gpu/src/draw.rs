@@ -798,7 +798,12 @@ impl State {
                         }
                         None if is_root_view(u) => {
                             let uav = u.dword == victory_shader::emit::ROOT_UAV_VIEW;
-                            match self.root_view(list, compute, u.slot, uav) {
+                            let read_end = t
+                                .host
+                                .root_srv_bytes
+                                .iter()
+                                .find_map(|&(slot, end)| (slot == u.slot).then_some(end));
+                            match self.root_view(list, compute, u.slot, uav, read_end) {
                                 Some((slot, _)) => slot,
                                 None => return false,
                             }
@@ -928,11 +933,19 @@ impl State {
     /// (`victory_shader::emit`, "Root SRVs and root UAVs"). None if the
     /// draw must be dropped: no root view set, or no dynamic slot.
     /// The copy is brought up to date from the root address to its end: a
-    /// shader reaches wherever data its root view leads to lie (a vertex
-    /// fetch's streams sit at offsets in the root view's own header).
+    /// shader can follow offsets the root view itself contains. If the
+    /// translator proves all read offsets, only the corresponding prefix
+    /// needs refreshing. The host view still covers the whole copy.
     /// shortcut: what shaders write through a root UAV goes back to title
     /// memory for 1 MiB from its address, as before the views.
-    fn root_view(&mut self, list: &HostList, compute: bool, slot: u8, uav: bool) -> Option<(u32, u32)> {
+    fn root_view(
+        &mut self,
+        list: &HostList,
+        compute: bool,
+        slot: u8,
+        uav: bool,
+        read_end: Option<u32>,
+    ) -> Option<(u32, u32)> {
         let Some(&Root::View(address)) = self.roots_ref(compute).get(usize::from(slot)) else {
             once!(slot, "a shader reads a root view the title did not set: dropped");
             not_run("a root view the title did not set");
@@ -964,10 +977,16 @@ impl State {
             not_run("a root view 4 GiB or more into its copy");
             return None;
         };
+        let len = shadow.left(address);
         let (refresh_at, refresh_len) = if uav && shadow.marked() {
-            shadow.page_range(address, shadow.left(address))
+            shadow.page_range(address, len)
+        } else if !uav
+            && offset.is_multiple_of(4)
+            && let Some(end) = read_end.filter(|&end| offset.checked_add(end).is_some())
+        {
+            (address, len.min(u64::from(end)))
         } else {
-            (address, shadow.left(address))
+            (address, len)
         };
         shadow.refresh(list, refresh_at, refresh_len);
         if uav {
@@ -2493,7 +2512,7 @@ void main() {
         let mut state = State::default();
         state.set_heaps(&[heap]);
         state.set_view(true, 0, p as u64 + 4096);
-        let (index, offset) = state.root_view(&list, true, 0, true).expect("root uav");
+        let (index, offset) = state.root_view(&list, true, 0, true, None).expect("root uav");
         assert_eq!(offset, 4096);
         dispatch_marked_uav(&list, heap_host, &shader, index, index, offset, 0xBEEF_CAFE);
         list.close();
@@ -3063,7 +3082,7 @@ void main() { dst.Store4(0, asuint(src[0])); }
         let mut state = State::default();
         state.set_heaps(&[heap]);
         state.set_view(true, 0, src_bytes as u64);
-        let (writer_slot, _) = state.root_view(&list, true, 0, true).expect("a root UAV");
+        let (writer_slot, _) = state.root_view(&list, true, 0, true, None).expect("a root UAV");
         // SAFETY: an open list, live objects and descriptors in our heap.
         unsafe {
             list.list.SetDescriptorHeaps(&[Some(heap_host.heap.clone())]);
@@ -3126,6 +3145,9 @@ void main() { dst.Store4(0, asuint(src[0])); }
         let list = host.new_list().unwrap();
         let out = crate::shadow::find(dst_bytes as u64, 256).expect("the output's host copy");
         let src = src_bytes as u64;
+        let source = crate::shadow::find(src, 4 * MIB).expect("the input's host copy");
+        let sentinel = src + 4 * MIB - 0x400;
+        source.write_host(sentinel, &[0x5a; 4]);
         let cases = [
             // Data 1.5 MiB past the root address.
             (src + 0x100, 0x18_0000u32, (0..16).map(|k| 0x5000 + k).collect::<Vec<u32>>()),
@@ -3140,10 +3162,11 @@ void main() { dst.Store4(0, asuint(src[0])); }
             let mut state = State::default();
             state.set_heaps(&[heap]);
             state.set_view(true, 0, address);
-            let (index, at) = state.root_view(&list, true, 0, false).expect("a root view");
+            let read_end = (round == 0).then_some(offset + 15 * 64 + 4);
+            let (index, at) = state.root_view(&list, true, 0, false, read_end).expect("a root view");
             assert_eq!(u64::from(at), address - src, "the root address's offset in the copy");
             state.set_view(true, 1, address - 0x40);
-            let other = state.root_view(&list, true, 1, false).expect("a root view");
+            let other = state.root_view(&list, true, 1, false, Some(4)).expect("a root view");
             assert_eq!(other, (index, at - 0x40), "one view per copy");
             let constants = [at, offset];
             // SAFETY: an open list, live objects of ours.
@@ -3167,6 +3190,7 @@ void main() { dst.Store4(0, asuint(src[0])); }
             }
             host.execute(&[&list]);
             assert_eq!(out.read_host(dst_bytes as u64, 16), want, "round {round}");
+            assert_eq!(source.read_host(sentinel, 1), [0x5a5a_5a5a], "bytes outside the refresh");
         }
 
         // Rebind the same slots to a null SRV, then to a null UAV. The
@@ -3175,11 +3199,11 @@ void main() { dst.Store4(0, asuint(src[0])); }
             list.reset();
             let mut state = State::default();
             state.set_heaps(&[heap]);
-            assert!(state.root_view(&list, true, 0, false).is_none(), "unset root");
+            assert!(state.root_view(&list, true, 0, false, None).is_none(), "unset root");
             state.set_view(true, 0, if null_uav { src + 0x18_0100 } else { 0 });
             state.set_view(true, 1, if null_uav { 0 } else { dst_bytes as u64 });
-            let (input, at) = state.root_view(&list, true, 0, false).unwrap();
-            let (output, out_at) = state.root_view(&list, true, 1, true).unwrap();
+            let (input, at) = state.root_view(&list, true, 0, false, None).unwrap();
+            let (output, out_at) = state.root_view(&list, true, 1, true, None).unwrap();
             assert_ne!(input, output);
             assert_eq!(state.root_slots.len(), 1, "only the real buffer needs a dynamic view");
             assert_eq!(out_at, 0);

@@ -57,6 +57,10 @@ pub(crate) struct Staging {
     /// The memory's pages changed since detiled (none: not the runtime's
     /// memory, compared instead).
     tracked: Option<crate::watch::Tracked>,
+    /// True once real readable title memory has been uploaded at least once.
+    uploaded_once: std::sync::atomic::AtomicBool,
+    /// Last `crate::queue::presented()` frame on which an untracked check ran.
+    checked_frame: std::sync::atomic::AtomicU64,
     /// Per subresource, the bytes of the texture's memory it lies in (from
     /// its start, whole layout blocks); empty where the layout gives none.
     spans: Vec<(usize, usize)>,
@@ -590,6 +594,16 @@ impl Staging {
     /// Returns the bytes of title memory read, and the buffer it detiled
     /// into with the subresources detiled.
     fn refresh_now(&self) -> (usize, Option<Upload>) {
+        if self.tracked.is_none()
+            && once_per_frame()
+            && skip_same_frame(
+                &self.uploaded_once,
+                &self.checked_frame,
+                crate::queue::presented(),
+            )
+        {
+            return (0, None);
+        }
         let all = || (0..self.footprints.len() as u32).collect::<Vec<_>>();
         let size = self.layout.size as usize;
         let start = self.memory as usize;
@@ -738,6 +752,10 @@ impl Staging {
             .map(|i| i as u32)
             .collect();
         let buffer = if fresh.is_empty() { None } else { self.detile(&last.read, &fresh) };
+        if buffer.is_some() {
+            self.uploaded_once
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+        }
         last.uploaded = last.uploaded || buffer.is_some();
         if buffer.is_none() {
             // Read again (and detiled) at the next refresh.
@@ -1062,6 +1080,8 @@ pub(crate) fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<St
         mips: u32::from(d.MipLevels),
         memory,
         tracked: crate::watch::track(memory as usize, layout_size, true),
+        uploaded_once: std::sync::atomic::AtomicBool::new(false),
+        checked_frame: std::sync::atomic::AtomicU64::new(u64::MAX),
         spans,
         last: Mutex::default(),
         uploads: Default::default(),
@@ -1069,6 +1089,25 @@ pub(crate) fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<St
     });
     *held = Some(s.clone());
     Some(s)
+}
+
+/// Opt-in (`VICTORY_TEXTURE_ONCE_PER_FRAME=1`): check already-uploaded
+/// untracked textures at most once per presented frame instead of on every
+/// command-list submission (~35x/frame in GTA VI under Rosetta/Wine where
+/// watch tracking is off). Newly created or not-yet-readable textures are
+/// still checked on every submission until their first real upload lands.
+fn once_per_frame() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::switch::on("VICTORY_TEXTURE_ONCE_PER_FRAME"))
+}
+
+fn skip_same_frame(
+    uploaded_once: &std::sync::atomic::AtomicBool,
+    checked_frame: &std::sync::atomic::AtomicU64,
+    frame: u64,
+) -> bool {
+    use std::sync::atomic::Ordering::Relaxed;
+    uploaded_once.load(Relaxed) && checked_frame.swap(frame, Relaxed) == frame
 }
 
 #[cfg(test)]
@@ -1377,5 +1416,23 @@ mod tests {
         assert!(committed(rw.cast::<u8>(), 4096));
         // SAFETY: freeing the allocation above.
         unsafe { VirtualFree(rw, 0, MEM_RELEASE) };
+    }
+
+    #[test]
+    fn once_per_frame_skips_repeat_checks_only_after_first_upload() {
+        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
+        let uploaded = AtomicBool::new(false);
+        let checked = AtomicU64::new(u64::MAX);
+        // Before the first real upload, every submission checks.
+        assert!(!skip_same_frame(&uploaded, &checked, 10));
+        assert!(!skip_same_frame(&uploaded, &checked, 10));
+        // After the first real upload, check once on frame 10, skip repeats,
+        // and check again once frame advances to 11.
+        uploaded.store(true, Relaxed);
+        assert!(!skip_same_frame(&uploaded, &checked, 10));
+        assert!(skip_same_frame(&uploaded, &checked, 10));
+        assert!(skip_same_frame(&uploaded, &checked, 10));
+        assert!(!skip_same_frame(&uploaded, &checked, 11));
+        assert!(skip_same_frame(&uploaded, &checked, 11));
     }
 }
