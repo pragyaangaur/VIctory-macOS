@@ -318,7 +318,7 @@ fn create() -> windows::core::Result<Host> {
             // D3DMetal reports the test and does not apply it (Metal has
             // none): bounds that should reject a draw leave it whole, as when
             // the host has no test, and the plain pipeline states are safer.
-            && !crate::shader_cache::under_wine();
+            && !crate::under_wine();
         let messages = debug
             .then(|| device.cast::<ID3D12InfoQueue>().ok())
             .flatten();
@@ -1712,7 +1712,7 @@ impl Host {
     /// heap the lists bound (VIctory-macOS issue #31). Nothing on a thread
     /// that holds the submission lock already, nor off Wine.
     pub(crate) fn quiet(&self) -> Option<Quiet<'_>> {
-        if !crate::shader_cache::under_wine() || HOLDS_SUBMISSIONS.with(std::cell::Cell::get) {
+        if !crate::under_wine() || HOLDS_SUBMISSIONS.with(std::cell::Cell::get) {
             return None;
         }
         let held = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
@@ -2595,7 +2595,6 @@ impl HostList {
         // One host texture for the whole move (`crate::resource::evict` may
         // give it up meanwhile; this list then holds it).
         let copy = crate::resource::host_copy(resource)?;
-        let texture = copy.texture.clone();
         // Unordered access through the twin skips `track` below.
         copy.note_state(wanted);
         if let Some(Some(twin)) = copy.twin.get()
@@ -2603,8 +2602,10 @@ impl HostList {
         {
             return None;
         }
-        let wanted = legal_state(&texture, wanted);
-        self.track(&copy, wanted).map(|before| (texture, before))
+        let wanted = copy.legal_state(wanted);
+        // Cloned (two calls into the host) only for a barrier.
+        self.track(&copy, wanted)
+            .map(|before| (copy.texture.clone(), before))
     }
 
     /// The list's state for host texture `copy` becomes `wanted` (a legal
@@ -2636,7 +2637,7 @@ impl HostList {
         copy: &std::sync::Arc<crate::resource::HostTexture>,
         wanted: u32,
     ) -> Option<D3D12_RESOURCE_BARRIER> {
-        let wanted = legal_state(&copy.texture, wanted);
+        let wanted = copy.legal_state(wanted);
         let before = self.track(copy, wanted)?;
         Some(transition(
             &copy.texture,
@@ -2719,7 +2720,7 @@ impl HostList {
         address: usize,
         len: usize,
     ) {
-        if !crate::shader_cache::under_wine() || len == 0 {
+        if !crate::under_wine() || len == 0 {
             return;
         }
         self.widened_pending
@@ -2731,7 +2732,7 @@ impl HostList {
     /// A heap-indexing shader may write through any of this heap's current
     /// UAV views. Its ranges are read at the barrier, not while binding.
     pub(crate) fn mark_widened_heap(&self, heap: &std::sync::Arc<crate::bindless::Viewed>) {
-        if !crate::shader_cache::under_wine() {
+        if !crate::under_wine() {
             return;
         }
         self.widened_pending
@@ -2898,7 +2899,7 @@ impl HostList {
                     let mut back = Vec::new();
                     twin.copy(list, depth, *to_depth, &mut |t, wanted| {
                         let real = t.state.load(Ordering::Relaxed);
-                        let wanted = legal_state(&t.texture, wanted);
+                        let wanted = t.legal_state(wanted);
                         (real != wanted).then(|| {
                             let there = transition(&t.texture, D3D12_RESOURCE_STATES(real as i32), D3D12_RESOURCE_STATES(wanted as i32));
                             back.push(transition(
@@ -5671,7 +5672,7 @@ float4 ps(float4 pos : SV_Position) : SV_Target {
     #[test]
     #[ignore]
     fn work_goes_on_after_macos_stops_the_queue() {
-        if !crate::shader_cache::under_wine() {
+        if !crate::under_wine() {
             return;
         }
         let Some(host) = super::host() else {
