@@ -110,7 +110,6 @@ impl Compositor {
     /// Records the pass. The picture and optional overlay must be in a non-pixel
     /// shader resource state and the output-sized `result` (in `format`) in
     /// the unordered access state; they stay so.
-    #[allow(clippy::too_many_arguments)]
     pub(crate) fn record(
         &self,
         device: &ID3D12Device,

@@ -119,18 +119,8 @@ pub fn read_file(path: &std::path::Path) -> std::io::Result<Vec<u8>> {
     }
 }
 
-/// Makes folder `dir` and its parents unless it is there. Not
-/// `std::fs::create_dir_all` alone, which on a folder that is there asks for
-/// its metadata (`Path::is_dir`): the same mount manager call as in
-/// [`read_file`]. The pipeline library makes its folder at every save, on
-/// the pipeline workers.
-pub fn make_dir(dir: &std::path::Path) -> std::io::Result<()> {
-    match std::fs::create_dir(dir) {
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => std::fs::create_dir_all(dir),
-        made => made,
-    }
-}
+#[cfg(windows)]
+pub use victory_pipeline::make_dir;
 
 #[cfg(test)]
 mod read_file_tests {

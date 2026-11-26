@@ -18,18 +18,13 @@ use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{Interface, PCWSTR, w};
 
-/// Resource states without the console's own bits (compression hints from
-/// bit 25 up), which the host rejects.
-pub(crate) fn pc_state(state: u32) -> u32 {
-    state & 0x01ff_ffff
-}
-
-/// A console state as a host texture state: PC bits only, and none of the
-/// buffer-only ones the console allows on textures (vertex, constant and
-/// index buffer, stream out, indirect arguments, as in "generic read").
+/// A console state as a host texture state: PC bits only (not the console's
+/// own, compression hints from bit 25 up, which the host rejects), and none
+/// of the buffer-only ones the console allows on textures (vertex, constant
+/// and index buffer, stream out, indirect arguments, as in "generic read").
 pub(crate) fn texture_state(state: u32) -> u32 {
     const BUFFER_ONLY: u32 = 0x1 | 0x2 | 0x100 | 0x200;
-    pc_state(state) & !BUFFER_ONLY
+    state & 0x01ff_ffff & !BUFFER_ONLY
 }
 
 /// Render target views live only until their command is recorded, so a
@@ -3582,7 +3577,6 @@ mod title_copies {
 }
 
 impl Host {
-    /// A buffer in the upload heap, mapped for writing.
     /// A GPU-only buffer of `size` bytes in the copy-destination state.
     pub(crate) fn default_buffer(&self, size: u64) -> Option<ID3D12Resource> {
         let heap = D3D12_HEAP_PROPERTIES {
@@ -4526,6 +4520,19 @@ pub(crate) fn transition(
                 Subresource: D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
                 StateBefore: before,
                 StateAfter: after,
+            }),
+        },
+    }
+}
+
+/// A barrier that waits for every unordered-access write so far.
+pub(crate) fn uav_barrier() -> D3D12_RESOURCE_BARRIER {
+    D3D12_RESOURCE_BARRIER {
+        Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
+        Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+        Anonymous: D3D12_RESOURCE_BARRIER_0 {
+            UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER {
+                pResource: std::mem::ManuallyDrop::new(None),
             }),
         },
     }

@@ -5,88 +5,6 @@
 
 use windows::Win32::Graphics::Direct3D12::*;
 
-/// The fields both forms share.
-#[derive(Debug, Clone, Copy, PartialEq)]
-struct Fields {
-    /// Point 0, bilinear 1, anisotropic point 2, anisotropic bilinear 3.
-    mag: u32,
-    min: u32,
-    /// None 0, point 1, linear 2.
-    mip: u32,
-    /// Plain 0, minimum 1, maximum 2.
-    mode: u32,
-    /// Host address modes.
-    address: [u32; 3],
-    anisotropy: u32,
-    /// Host comparison function.
-    compare: u32,
-    min_lod: f32,
-    max_lod: f32,
-    bias: f32,
-    border: [f32; 4],
-}
-
-impl Fields {
-    /// `aniso_point_mip`: the host filters anisotropically with point mips
-    /// ([`aniso_point_mip`]).
-    fn host(&self, aniso_point_mip: bool) -> D3D12_SAMPLER_DESC {
-        let linear = |f: u32| u32::from(f == 1 || f == 3);
-        let aniso = self.mag >= 2 || self.min >= 2;
-        // The console compares when the instruction says so, with the
-        // sampler's function; the host needs a comparison sampler for that.
-        // A sampler given a real test (less ... greater-or-equal) is one;
-        // never, always and none are plain samplers.
-        const LESS: u32 = 2;
-        const GREATER_EQUAL: u32 = 7;
-        let compares = (LESS..=GREATER_EQUAL).contains(&self.compare);
-        let reduction = match self.mode {
-            1 => 2,
-            2 => 3,
-            _ => u32::from(compares),
-        };
-        let filter = if aniso {
-            // Anisotropic with point mips where the host has it, as for
-            // static samplers (`victory_shader::emit::StaticSampler`);
-            // else with linear mips, the nearest.
-            0x54 | u32::from(self.mip == 2 || !aniso_point_mip)
-        } else {
-            linear(self.min) << 4 | linear(self.mag) << 2 | u32::from(self.mip == 2)
-        };
-        let min_lod = finite_lod(self.min_lod, 0.0);
-        // Without a mip filter the console clamps sampling to `min_lod`.
-        let max_lod = if self.mip == 0 {
-            min_lod
-        } else {
-            finite_lod(self.max_lod, min_lod).max(min_lod)
-        };
-        D3D12_SAMPLER_DESC {
-            Filter: D3D12_FILTER((reduction << 7 | filter) as i32),
-            AddressU: address_mode(self.address[0]),
-            AddressV: address_mode(self.address[1]),
-            AddressW: address_mode(self.address[2]),
-            MipLODBias: if self.bias.is_nan() {
-                0.0
-            } else {
-                self.bias
-                    .clamp(D3D12_MIP_LOD_BIAS_MIN, D3D12_MIP_LOD_BIAS_MAX)
-            },
-            MaxAnisotropy: if aniso {
-                self.anisotropy.clamp(1, 16)
-            } else {
-                1
-            },
-            ComparisonFunc: if reduction == 1 {
-                D3D12_COMPARISON_FUNC(self.compare as i32)
-            } else {
-                D3D12_COMPARISON_FUNC_NEVER
-            },
-            BorderColor: self.border,
-            MinLOD: min_lod,
-            MaxLOD: max_lod,
-        }
-    }
-}
-
 /// Whether the host GPU filters anisotropically with point mips
 /// (`D3D12_OPTIONS19`, optional): asked once. Older runtimes do not know
 /// the query, which means no.
@@ -131,20 +49,62 @@ fn finite_lod(value: f32, fallback: f32) -> f32 {
 /// `aniso_point_mip`: as [`aniso_point_mip`] says.
 pub(crate) fn console(words: &[u32; 27], aniso_point_mip: bool) -> D3D12_SAMPLER_DESC {
     let f = |i: usize| f32::from_bits(words[i]);
-    Fields {
-        mag: words[1],
-        min: words[2],
-        mip: words[3],
-        mode: words[5],
-        address: [words[6], words[7], words[8]],
-        min_lod: f(9),
-        max_lod: f(10),
-        bias: f(11),
-        anisotropy: words[13],
-        compare: words[16],
-        border: [f(17), f(18), f(19), f(20)],
+    // Point 0, bilinear 1, anisotropic point 2, anisotropic bilinear 3.
+    let (mag, min) = (words[1], words[2]);
+    // Mip filter: none 0, point 1, linear 2. Mode: plain 0, minimum 1,
+    // maximum 2.
+    let (mip, mode) = (words[3], words[5]);
+    let (anisotropy, compare) = (words[13], words[16]);
+    let bias = f(11);
+    let linear = |x: u32| u32::from(x == 1 || x == 3);
+    let aniso = mag >= 2 || min >= 2;
+    // The console compares when the instruction says so, with the
+    // sampler's function; the host needs a comparison sampler for that.
+    // A sampler given a real test (less ... greater-or-equal) is one;
+    // never, always and none are plain samplers.
+    const LESS: u32 = 2;
+    const GREATER_EQUAL: u32 = 7;
+    let compares = (LESS..=GREATER_EQUAL).contains(&compare);
+    let reduction = match mode {
+        1 => 2,
+        2 => 3,
+        _ => u32::from(compares),
+    };
+    let filter = if aniso {
+        // Anisotropic with point mips where the host has it, as for
+        // static samplers (`victory_shader::emit::StaticSampler`);
+        // else with linear mips, the nearest.
+        0x54 | u32::from(mip == 2 || !aniso_point_mip)
+    } else {
+        linear(min) << 4 | linear(mag) << 2 | u32::from(mip == 2)
+    };
+    let min_lod = finite_lod(f(9), 0.0);
+    // Without a mip filter the console clamps sampling to `min_lod`.
+    let max_lod = if mip == 0 {
+        min_lod
+    } else {
+        finite_lod(f(10), min_lod).max(min_lod)
+    };
+    D3D12_SAMPLER_DESC {
+        Filter: D3D12_FILTER((reduction << 7 | filter) as i32),
+        AddressU: address_mode(words[6]),
+        AddressV: address_mode(words[7]),
+        AddressW: address_mode(words[8]),
+        MipLODBias: if bias.is_nan() {
+            0.0
+        } else {
+            bias.clamp(D3D12_MIP_LOD_BIAS_MIN, D3D12_MIP_LOD_BIAS_MAX)
+        },
+        MaxAnisotropy: if aniso { anisotropy.clamp(1, 16) } else { 1 },
+        ComparisonFunc: if reduction == 1 {
+            D3D12_COMPARISON_FUNC(compare as i32)
+        } else {
+            D3D12_COMPARISON_FUNC_NEVER
+        },
+        BorderColor: [f(17), f(18), f(19), f(20)],
+        MinLOD: min_lod,
+        MaxLOD: max_lod,
     }
-    .host(aniso_point_mip)
 }
 
 #[cfg(test)]

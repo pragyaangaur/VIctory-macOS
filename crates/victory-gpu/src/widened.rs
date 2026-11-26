@@ -12,7 +12,7 @@ use windows::Win32::Graphics::Direct3D12::*;
 use windows::core::{Interface, s};
 
 use crate::compute::{Param, pipeline};
-use crate::host::{HostList, transition};
+use crate::host::{HostList, transition, uav_barrier};
 use crate::shadow::{Shadow, Widened};
 
 const SOURCE: &str = r#"
@@ -509,16 +509,4 @@ fn patch(list: &HostList, copier: &Copier, view: &Widened, prepared: Prepared) {
     }
     #[cfg(feature = "diagnostics")]
     list.note_op(|| format!("patch rgb32 {segments} ranges over {count} elements"));
-}
-
-fn uav_barrier() -> D3D12_RESOURCE_BARRIER {
-    D3D12_RESOURCE_BARRIER {
-        Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
-        Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
-        Anonymous: D3D12_RESOURCE_BARRIER_0 {
-            UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER {
-                pResource: std::mem::ManuallyDrop::new(None),
-            }),
-        },
-    }
 }

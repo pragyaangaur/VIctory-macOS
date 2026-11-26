@@ -1140,13 +1140,8 @@ fn view_stride(view: &View) -> u32 {
         let desc = uav_desc(words);
         // SAFETY: a buffer view's union member.
         let buffer = unsafe { desc.Anonymous.Buffer };
-        if buffer.StructureByteStride > 0 {
-            u64::from(buffer.StructureByteStride)
-        } else if buffer.Flags.0 & D3D12_BUFFER_UAV_FLAG_RAW.0 != 0 {
-            4
-        } else {
-            crate::resource::element(desc.Format.0 as u32).map_or(0, |(bytes, _)| bytes)
-        }
+        let raw = buffer.Flags.0 & D3D12_BUFFER_UAV_FLAG_RAW.0 != 0;
+        buffer_element(buffer.StructureByteStride, raw, desc.Format.0).unwrap_or(0)
     } else {
         element_size(&srv_desc(words))
     };
@@ -1176,12 +1171,14 @@ fn view_kind(view: &View) -> u32 {
         let desc = uav_desc(words);
         // SAFETY: a buffer view's union member.
         let b = unsafe { desc.Anonymous.Buffer };
-        (desc.Format.0 as u32, b.StructureByteStride == 0 && b.Flags.0 & D3D12_BUFFER_UAV_FLAG_RAW.0 == 0)
+        let raw = b.Flags.0 & D3D12_BUFFER_UAV_FLAG_RAW.0 != 0;
+        (desc.Format.0 as u32, typed_buffer(b.StructureByteStride, raw))
     } else {
         let desc = srv_desc(words);
         // SAFETY: a buffer view's union member.
         let b = unsafe { desc.Anonymous.Buffer };
-        (desc.Format.0 as u32, b.StructureByteStride == 0 && b.Flags.0 & D3D12_BUFFER_SRV_FLAG_RAW.0 == 0)
+        let raw = b.Flags.0 & D3D12_BUFFER_SRV_FLAG_RAW.0 != 0;
+        (desc.Format.0 as u32, typed_buffer(b.StructureByteStride, raw))
     };
     match (words[1] == 1 && typed).then(|| integer_format(format)).flatten() {
         Some(true) => VIEW_INTEGER | VIEW_SIGNED,
@@ -1224,10 +1221,10 @@ pub(crate) fn three_channel_srv(view: &View) -> bool {
     let desc = srv_desc(words);
     // SAFETY: a buffer view's union member.
     let buffer = unsafe { desc.Anonymous.Buffer };
+    let raw = buffer.Flags.0 & D3D12_BUFFER_SRV_FLAG_RAW.0 != 0;
     desc.ViewDimension == D3D12_SRV_DIMENSION_BUFFER
         && matches!(desc.Format.0, 6..=8)
-        && buffer.StructureByteStride == 0
-        && buffer.Flags.0 & D3D12_BUFFER_SRV_FLAG_RAW.0 == 0
+        && typed_buffer(buffer.StructureByteStride, raw)
 }
 
 /// Whether a DXGI format is an integer one, and if so whether signed:
@@ -1240,19 +1237,31 @@ fn integer_format(format: u32) -> Option<bool> {
     }
 }
 
-/// A buffer view of title memory at `address` on its host copy: the first
-/// element moves by the copy's offset.
-/// Bytes per element of a buffer view.
+/// Bytes per element of a buffer view: its structure stride if it has one,
+/// 4 for a raw view, else its format's element size (`None` if the format
+/// has none).
+fn buffer_element(stride: u32, raw: bool, format: i32) -> Option<u64> {
+    if stride > 0 {
+        Some(u64::from(stride))
+    } else if raw {
+        Some(4)
+    } else {
+        crate::resource::element(format as u32).map(|(bytes, _)| bytes)
+    }
+}
+
+/// Whether a buffer view is typed: no structure stride, not raw.
+fn typed_buffer(stride: u32, raw: bool) -> bool {
+    stride == 0 && !raw
+}
+
+/// Bytes per element of a shader resource buffer view, 0 for a format with
+/// none.
 fn element_size(desc: &D3D12_SHADER_RESOURCE_VIEW_DESC) -> u64 {
     // SAFETY: a buffer view's union member.
     let buffer = unsafe { desc.Anonymous.Buffer };
-    if buffer.StructureByteStride > 0 {
-        u64::from(buffer.StructureByteStride)
-    } else if buffer.Flags.0 & D3D12_BUFFER_SRV_FLAG_RAW.0 != 0 {
-        4
-    } else {
-        crate::resource::element(desc.Format.0 as u32).map_or(0, |(bytes, _)| bytes)
-    }
+    let raw = buffer.Flags.0 & D3D12_BUFFER_SRV_FLAG_RAW.0 != 0;
+    buffer_element(buffer.StructureByteStride, raw, desc.Format.0).unwrap_or(0)
 }
 
 /// Writes slot `index`'s words into the view addresses at `data` (the
@@ -1381,13 +1390,8 @@ fn unordered_range(base: u64, words: &[u32; 10]) -> Option<(u64, u64)> {
     let desc = uav_desc(words);
     // SAFETY: a buffer view's union member.
     let buffer = unsafe { desc.Anonymous.Buffer };
-    let element = if buffer.StructureByteStride > 0 {
-        u64::from(buffer.StructureByteStride)
-    } else if buffer.Flags.0 & D3D12_BUFFER_UAV_FLAG_RAW.0 != 0 {
-        4
-    } else {
-        crate::resource::element(desc.Format.0 as u32)?.0
-    };
+    let raw = buffer.Flags.0 & D3D12_BUFFER_UAV_FLAG_RAW.0 != 0;
+    let element = buffer_element(buffer.StructureByteStride, raw, desc.Format.0)?;
     Some((
         base + buffer.FirstElement * element,
         u64::from(buffer.NumElements) * element,
@@ -1507,21 +1511,15 @@ fn buffer_uav(
 ) -> Option<Kept> {
     // SAFETY: a buffer view's union member.
     let buffer = unsafe { &mut desc.Anonymous.Buffer };
-    let element = if buffer.StructureByteStride > 0 {
-        u64::from(buffer.StructureByteStride)
-    } else if buffer.Flags.0 & D3D12_BUFFER_UAV_FLAG_RAW.0 != 0 {
-        4
-    } else {
-        crate::resource::element(desc.Format.0 as u32).map_or(0, |(bytes, _)| bytes)
-    };
+    let raw = buffer.Flags.0 & D3D12_BUFFER_UAV_FLAG_RAW.0 != 0;
+    let element = buffer_element(buffer.StructureByteStride, raw, desc.Format.0).unwrap_or(0);
     if element == 0 {
         once!(len, "unordered buffer view of elements without a size");
         return None;
     }
     let format = desc.Format.0;
-    let typed_three_channel = buffer.StructureByteStride == 0
-        && buffer.Flags.0 & D3D12_BUFFER_UAV_FLAG_RAW.0 == 0
-        && matches!(format, 6..=8);
+    let typed_three_channel =
+        typed_buffer(buffer.StructureByteStride, raw) && matches!(format, 6..=8);
     // D3DMetal 3.0 reports typed-UAV support for these formats, then tries
     // to make an unsupported three-channel Metal format and aborts inside the
     // void CreateUnorderedAccessView call. D3D12 exposes no D3DMetal version,

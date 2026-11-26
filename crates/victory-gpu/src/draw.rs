@@ -528,14 +528,9 @@ impl State {
         }
     }
 
-    /// Brings the host list up to date for a draw; false if the draw cannot
-    /// run on the host.
-    fn prepare(&mut self, list: &HostList, indexed: bool) -> bool {
-        self.prepare_for(list, indexed, false)
-    }
-
-    /// As [`State::prepare`], for draws (`mesh` false) or mesh dispatches.
-    fn prepare_for(&mut self, list: &HostList, indexed: bool, mesh: bool) -> bool {
+    /// Brings the host list up to date for a draw (`mesh` false) or a mesh
+    /// dispatch; false if it cannot run on the host.
+    fn prepare(&mut self, list: &HostList, indexed: bool, mesh: bool) -> bool {
         #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
             return false;
@@ -1221,7 +1216,7 @@ impl State {
     pub(crate) fn dispatch_mesh(&mut self, list: &HostList, x: u32) {
         #[cfg(feature = "diagnostics")]
         self.trace("mesh", x, 0);
-        let ran = self.prepare_for(list, false, true)
+        let ran = self.prepare(list, false, true)
             && match list.list.cast::<ID3D12GraphicsCommandList6>() {
                 Ok(l6) => {
                     #[cfg(feature = "diagnostics")]
@@ -1493,15 +1488,8 @@ impl State {
                 const COPY_SOURCE: u32 = 0x800;
                 const UNORDERED: u32 = 0x8;
                 // All UAV writes done before the copy.
-                let all = D3D12_RESOURCE_BARRIER {
-                    Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
-                    Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
-                    Anonymous: D3D12_RESOURCE_BARRIER_0 {
-                        UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER { pResource: std::mem::ManuallyDrop::new(None) }),
-                    },
-                };
                 // SAFETY: an open list.
-                unsafe { list.list.ResourceBarrier(&[all]) };
+                unsafe { list.list.ResourceBarrier(&[crate::host::uav_barrier()]) };
                 crate::list::ensure_state(list, resource as This, COPY_SOURCE);
                 let read = crate::capture::read_back(&host.device, &list.list, &t);
                 crate::list::ensure_state(list, resource as This, UNORDERED);
@@ -1593,7 +1581,7 @@ impl State {
         // Rectangles: completed by the pipeline's geometry shader, else
         // expanded into vertex buffers of their own.
         let rects = self.topology == RECTANGLES && !self.completes_rectangles();
-        let ran = self.prepare(list, false)
+        let ran = self.prepare(list, false, false)
             && (!rects || self.rectangles(list, vertices, first) || {
                 not_run("rectangle vertices outside their buffer");
                 false
@@ -1699,7 +1687,7 @@ impl State {
             once!("indexed rectangles not drawn");
             not_run("indexed rectangles");
         }
-        let ran = !rects && self.prepare(list, true);
+        let ran = !rects && self.prepare(list, true, false);
         if ran {
             #[cfg(feature = "diagnostics")]
             list.note_op(|| self.op_text(format!("indexed {indices}x{instances}"), false));
@@ -1805,14 +1793,14 @@ impl State {
                 (self.topology != RECTANGLES || self.completes_rectangles() || {
                     not_run("rectangles");
                     false
-                }) && self.prepare(list, kind == INDEXED)
+                }) && self.prepare(list, kind == INDEXED, false)
             }
-            MESH => self.prepare_for(list, false, true),
+            MESH => self.prepare(list, false, true),
             DISPATCH => match crate::pipeline::host_pipeline(self.pipeline as This) {
                 Some(p) if p.compute => self.bind(list, p, true),
                 _ => false,
             },
-            _ => false,
+            _ => unreachable!("the signature check above admits only these kinds"),
         };
         if !ran {
             crate::indirect::done(list, &clamped);
@@ -2834,15 +2822,7 @@ void main() { dst.Store4(0, asuint(src[1])); }
             list.list.SetComputeRootDescriptorTable(0, heap_host.gpu(0));
             list.list.SetPipelineState(&writer.1);
             list.list.Dispatch(1, 1, 1);
-            list.list.ResourceBarrier(&[D3D12_RESOURCE_BARRIER {
-                Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
-                Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
-                Anonymous: D3D12_RESOURCE_BARRIER_0 {
-                    UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER {
-                        pResource: std::mem::ManuallyDrop::new(None),
-                    }),
-                },
-            }]);
+            list.list.ResourceBarrier(&[crate::host::uav_barrier()]);
         }
         list.sync_widened();
         // The title makes another RGB32 view after the barrier. Its CPU copy
@@ -2871,15 +2851,7 @@ void main() { dst.Store4(0, asuint(src[1])); }
             list.list.SetComputeRootDescriptorTable(0, heap_host.gpu(0));
             list.list.SetPipelineState(&writer_again.1);
             list.list.Dispatch(1, 1, 1);
-            list.list.ResourceBarrier(&[D3D12_RESOURCE_BARRIER {
-                Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
-                Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
-                Anonymous: D3D12_RESOURCE_BARRIER_0 {
-                    UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER {
-                        pResource: std::mem::ManuallyDrop::new(None),
-                    }),
-                },
-            }]);
+            list.list.ResourceBarrier(&[crate::host::uav_barrier()]);
         }
         list.sync_widened();
         // SAFETY: the second widening copy finished.
@@ -2979,15 +2951,7 @@ void main() { dst.Store4(0, asuint(src[1])); }
         viewed.set(0, Some(&new), true);
         // SAFETY: an open list.
         unsafe {
-            list.list.ResourceBarrier(&[D3D12_RESOURCE_BARRIER {
-                Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
-                Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
-                Anonymous: D3D12_RESOURCE_BARRIER_0 {
-                    UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER {
-                        pResource: std::mem::ManuallyDrop::new(None),
-                    }),
-                },
-            }]);
+            list.list.ResourceBarrier(&[crate::host::uav_barrier()]);
         }
         list.sync_widened();
         // The range must be frozen at the barrier even when no widened view
@@ -3071,15 +3035,7 @@ void main() { dst.Store4(0, asuint(src[0])); }
             list.list.SetComputeRootDescriptorTable(0, heap_host.gpu(writer_slot));
             list.list.SetPipelineState(&writer.1);
             list.list.Dispatch(1, 1, 1);
-            list.list.ResourceBarrier(&[D3D12_RESOURCE_BARRIER {
-                Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
-                Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
-                Anonymous: D3D12_RESOURCE_BARRIER_0 {
-                    UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER {
-                        pResource: std::mem::ManuallyDrop::new(None),
-                    }),
-                },
-            }]);
+            list.list.ResourceBarrier(&[crate::host::uav_barrier()]);
         }
         list.sync_widened();
         readable(&list, &used(ResourceType::Srv), &source_view, false);

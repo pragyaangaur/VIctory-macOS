@@ -27,7 +27,7 @@ use windows::core::s;
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::host::{HostList, host, transition};
+use crate::host::{HostList, host, transition, uav_barrier};
 
 const SOURCE: &str = include_str!("indirect-clamp.hlsl");
 
@@ -340,16 +340,6 @@ pub(crate) fn done(list: &HostList, arguments: &ID3D12Resource) {
             D3D12_RESOURCE_STATE_COMMON,
         )])
     };
-}
-
-fn uav_barrier() -> D3D12_RESOURCE_BARRIER {
-    D3D12_RESOURCE_BARRIER {
-        Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
-        Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
-        Anonymous: D3D12_RESOURCE_BARRIER_0 {
-            UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER { pResource: std::mem::ManuallyDrop::new(None) }),
-        },
-    }
 }
 
 #[cfg(test)]

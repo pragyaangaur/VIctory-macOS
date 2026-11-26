@@ -9,10 +9,10 @@ use crate::Converter;
 
 /// Identifies one conversion result.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct CacheKey(blake3::Hash);
+struct CacheKey(blake3::Hash);
 
 impl CacheKey {
-    pub fn new(converter: &dyn Converter, input: &[u8]) -> Self {
+    fn new(converter: &dyn Converter, input: &[u8]) -> Self {
         let mut h = blake3::Hasher::new();
         h.update(converter.id().as_bytes());
         h.update(&[0]);
@@ -21,7 +21,7 @@ impl CacheKey {
         CacheKey(h.finalize())
     }
 
-    pub fn to_hex(&self) -> String {
+    fn to_hex(self) -> String {
         self.0.to_hex().to_string()
     }
 }
@@ -41,7 +41,7 @@ impl Cache {
         Ok(Cache { root })
     }
 
-    pub fn path_for(&self, key: &CacheKey) -> PathBuf {
+    fn path_for(&self, key: &CacheKey) -> PathBuf {
         let hex = key.to_hex();
         self.root.join(&hex[..2]).join(&hex[2..])
     }
@@ -92,10 +92,13 @@ fn published(path: &Path) -> bool {
     }
 }
 
-/// Makes folder `dir` unless it is there. Not `create_dir_all` alone, which
-/// asks for the metadata of a folder that is there (`Path::is_dir`); the
-/// cache's 256 folders are there after the first few hundred entries.
-fn make_dir(dir: &Path) -> io::Result<()> {
+/// Makes folder `dir` and its parents unless it is there. Not
+/// `create_dir_all` alone, which asks for the metadata of a folder that is
+/// there (`Path::is_dir`): a call to Wine's mount manager, like the ones
+/// [`Cache::get_or_convert`] avoids. The cache's 256 folders are there after
+/// the first few hundred entries, and the GPU pipeline library makes its
+/// folder at every save, on the pipeline workers.
+pub fn make_dir(dir: &Path) -> io::Result<()> {
     match std::fs::create_dir(dir) {
         Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Ok(()),
         Err(e) if e.kind() == io::ErrorKind::NotFound => std::fs::create_dir_all(dir),
