@@ -1446,6 +1446,10 @@ impl Host {
                 if seconds.is_power_of_two() {
                     tracing::warn!(seconds, value, completed, "still waiting for the host GPU");
                 }
+                if seconds == 8 {
+                    let what = WAITING_ON.lock().unwrap_or_else(|e| e.into_inner()).clone();
+                    tracing::error!(%what, value, "host GPU hang: the submission waited on");
+                }
             }
         }
     }
@@ -1677,6 +1681,19 @@ impl Host {
         let groups = [&lists[..]];
         let mut removed_in = None;
         let mark = self.mark();
+        // What a hang would be waiting on (`Host::wait_for` names it after 8 s).
+        *WAITING_ON.lock().unwrap_or_else(|e| e.into_inner()) = {
+            let pipelines: std::collections::BTreeSet<String> = runs
+                .iter()
+                .flat_map(|l| {
+                    l.pipelines
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .clone()
+                })
+                .collect();
+            format!("{} lists, pipelines {pipelines:?}", runs.len())
+        };
         for (i, group) in groups.iter().enumerate() {
             *submitted += 1;
             let started = std::time::Instant::now();
@@ -5278,3 +5295,7 @@ float4 ps(float4 pos : SV_Position) : SV_Target {
         );
     }
 }
+
+/// The pipelines of the lists the last submission ran, for a hang's log line
+/// (`Host::wait_for`): which work the GPU never finished.
+static WAITING_ON: Mutex<String> = Mutex::new(String::new());
