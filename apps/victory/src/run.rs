@@ -165,7 +165,7 @@ pub fn run(
         println!("masked stores  {n} patched to plain stores");
     }
     // Every other 256-bit store of the title split into 128-bit halves, from
-    // a list made offline (`tools/macos/wide-stores`): Rosetta cannot resume
+    // a list made offline (`cargo xtask wide-stores`): Rosetta cannot resume
     // one that faults in its second page.
     #[cfg(windows)]
     if let Some(list) = std::env::var_os("VICTORY_PATCH_WIDE").filter(|v| !v.is_empty() && v != "0")
