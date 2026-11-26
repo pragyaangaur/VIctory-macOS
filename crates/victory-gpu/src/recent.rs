@@ -1,7 +1,8 @@
 //! Scratch memory kept by what recent work needed: the texture staging
-//! chunks ([`Peak`]) and the snapshot buffers ([`Pool`]) give back what the
-//! last [`WINDOW`] did not use, and keep all it did (a pool kept at its
-//! peak for good held 512 MB after one heavy submission).
+//! chunks and big staging buffers ([`Peak`]), the snapshot buffers and the
+//! big textures' read buffers ([`Pool`]) give back what the last [`WINDOW`]
+//! did not use, and keep all it did (a pool kept at its peak for good held
+//! 512 MB after one heavy submission).
 
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
@@ -79,8 +80,14 @@ impl Pool {
     /// Takes `v` back, emptied, at `now`. The pool keeps at most `cap`
     /// bytes, the largest buffers.
     pub(crate) fn give(&mut self, mut v: Vec<u8>, now: Instant, cap: usize) {
+        v.clear();
+        self.keep(v, now, cap);
+    }
+
+    /// As [`Pool::give`], but `v` keeps its length: its bytes stay
+    /// initialised, which [`Pool::filled`] counts on.
+    pub(crate) fn keep(&mut self, v: Vec<u8>, now: Instant, cap: usize) {
         if v.capacity() <= cap {
-            v.clear();
             let i = self
                 .free
                 .partition_point(|(f, _)| f.capacity() < v.capacity());
@@ -93,6 +100,19 @@ impl Pool {
         }) {
             self.free.drain(..=i);
         }
+    }
+
+    /// `taken` (from [`Pool::take`]) or a new buffer, with `n` bytes or more,
+    /// all initialised: a new one is zeroed (exactly `n`, no doubling), a
+    /// [`Pool::keep`]t one gives back the bytes it held and only what it
+    /// lacks of `n` is written, so reuse costs no fill (a fresh 128 MiB is a
+    /// page fault per 4 KiB and the fill). Called outside the pool's lock.
+    pub(crate) fn filled(taken: Option<Vec<u8>>, n: usize) -> Vec<u8> {
+        let mut v = taken.unwrap_or_else(|| Vec::with_capacity(n));
+        if v.len() < n {
+            v.resize(n, 0);
+        }
+        v
     }
 
     /// Releases the largest buffer that was not returned in the last
@@ -328,5 +348,159 @@ mod tests {
             "the spike's buffers went back"
         );
         assert_eq!(s.made, made + 3, "and steady state made none");
+    }
+
+    #[test]
+    fn a_kept_buffer_is_filled_again_only_where_it_grows() {
+        let mut pool = Pool::new();
+        let t = Instant::now();
+        let mut v = Pool::filled(pool.take(1000), 1000);
+        assert!(v.len() == 1000 && v.iter().all(|&b| b == 0));
+        v[999] = 7;
+        let p = v.as_ptr();
+        pool.keep(v, t, usize::MAX);
+        let v = Pool::filled(pool.take(500), 500);
+        assert_eq!(
+            (v.as_ptr(), v.len(), v[999]),
+            (p, 1000, 7),
+            "not written again"
+        );
+        pool.keep(v, t, usize::MAX);
+        let v = Pool::filled(pool.take(1000), 1000);
+        assert_eq!((v.as_ptr(), v[999]), (p, 7));
+        // Past its length it is zeroed, within its capacity or not.
+        pool.keep(v, t, usize::MAX);
+        let big = Pool::filled(pool.take(1 << 20), 1 << 20);
+        assert!(big.len() == 1 << 20 && big.iter().filter(|&&b| b != 0).count() <= 1);
+        // `give` empties, as snapshots need.
+        pool.give(big, t, usize::MAX);
+        assert!(pool.take(1 << 20).unwrap().is_empty());
+    }
+
+    /// Read buffers of big textures as `crate::texture::Scratch` takes and
+    /// returns them: each submission refreshes textures of `sizes` (a buffer
+    /// made if the pool has none that fits), then the next trims.
+    struct Scratches {
+        pool: Pool,
+        made: usize,
+    }
+
+    impl Scratches {
+        fn submit(&mut self, now: Instant, sizes: &[usize]) {
+            drop(self.pool.trim(now));
+            let taken: Vec<Vec<u8>> = sizes
+                .iter()
+                .map(|&n| {
+                    let fits = self.pool.free.iter().any(|(v, _)| v.capacity() >= n);
+                    self.made += usize::from(!fits);
+                    Pool::filled(self.pool.take(n), n)
+                })
+                .collect();
+            for v in taken {
+                self.pool.keep(v, now, 64 * MIB);
+            }
+        }
+    }
+
+    #[test]
+    fn big_textures_keep_their_buffers_while_they_change_and_give_them_back() {
+        let mut s = Scratches {
+            pool: Pool::new(),
+            made: 0,
+        };
+        let mut now = Instant::now();
+        let mut run = |s: &mut Scratches, n, sizes: &[usize]| {
+            for _ in 0..n {
+                now += FRAME;
+                s.submit(now, sizes);
+            }
+        };
+        // A big texture changes every submission: one buffer, made once
+        // (one a submission before).
+        run(&mut s, 300, &[20 * MIB]);
+        assert_eq!((s.pool.bytes(), s.made), (20 * MIB, 1));
+        // A spike: a second one at once.
+        run(&mut s, 30, &[20 * MIB, 24 * MIB]);
+        assert_eq!((s.pool.bytes(), s.made), (44 * MIB, 2));
+        // The spike's buffer goes when no refresh has used it for a window,
+        // and steady state makes none.
+        run(&mut s, 400, &[20 * MIB]);
+        assert_eq!((s.pool.bytes(), s.made), (20 * MIB, 2));
+        // One over the cap is made each time and not kept.
+        run(&mut s, 3, &[65 * MIB]);
+        assert_eq!((s.pool.bytes(), s.made), (20 * MIB, 5));
+    }
+
+    /// Free staging buffers as `crate::texture::recycle` keeps them, counted:
+    /// each submission needs `need` bytes in buffers, made if the free ones
+    /// do not cover them (a model of that function's arithmetic, buffers
+    /// taken by size and the oldest dropped; the policy is `Peak`'s).
+    struct Uploads {
+        /// Free buffers' sizes, oldest first.
+        free: VecDeque<usize>,
+        peak: Peak,
+        last: Vec<usize>,
+        made: usize,
+    }
+
+    impl Uploads {
+        const KEPT: usize = 64 * MIB;
+        const KEPT_MAX: usize = 256 * MIB;
+
+        fn submit(&mut self, now: Instant, need: &[usize]) {
+            // `recycle`: the last submission's buffers are free again.
+            let needed = self.last.iter().sum();
+            let peak = self.peak.begin(now, needed);
+            let kept = peak.clamp(Self::KEPT, Self::KEPT_MAX);
+            self.free.extend(self.last.drain(..));
+            let mut bytes: usize = self.free.iter().sum();
+            while bytes > kept {
+                bytes -= self.free.pop_front().unwrap();
+            }
+            // `staging_buffer` for each.
+            for &n in need {
+                match self.free.iter().position(|&f| f == n) {
+                    Some(i) => drop(self.free.remove(i)),
+                    None => self.made += 1,
+                }
+                self.last.push(n);
+            }
+        }
+    }
+
+    #[test]
+    fn staging_buffers_follow_the_load_and_steady_state_makes_none() {
+        let mut u = Uploads {
+            free: VecDeque::new(),
+            peak: Peak::new(),
+            last: Vec::new(),
+            made: 0,
+        };
+        let mut now = Instant::now();
+        let mut run = |u: &mut Uploads, n, need: &[usize]| {
+            for _ in 0..n {
+                now += FRAME;
+                u.submit(now, need);
+            }
+        };
+        // A 128 MiB texture changing every submission: with the 64 MiB cap
+        // it was made again each one (its class is over the cap).
+        run(&mut u, 300, &[128 * MIB]);
+        assert_eq!(u.made, 1);
+        assert_eq!(u.free.iter().sum::<usize>(), 0, "in use, none free");
+        // A spike of two more: kept while it is in the window, and then not.
+        run(&mut u, 30, &[128 * MIB, 64 * MIB, 32 * MIB]);
+        assert_eq!(u.made, 3);
+        let window = (WINDOW.as_millis() / FRAME.as_millis()) as usize;
+        run(&mut u, window - 5, &[128 * MIB]);
+        assert!(u.free.iter().sum::<usize>() >= 96 * MIB);
+        run(&mut u, 10, &[128 * MIB]);
+        assert!(u.free.is_empty(), "the spike's buffers went");
+        let made = u.made;
+        run(&mut u, 300, &[128 * MIB]);
+        assert_eq!(u.made, made, "steady state makes no buffer");
+        // A texture over the upper bound is made each time.
+        run(&mut u, 3, &[512 * MIB]);
+        assert_eq!(u.made, made + 3);
     }
 }

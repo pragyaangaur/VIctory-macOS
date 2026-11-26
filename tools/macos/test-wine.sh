@@ -10,6 +10,16 @@ ROOT="$PWD"
 # can come first on PATH. That one has no gnullvm standard library, and the
 # first build below fails. victory.sh puts rustup first in the same way.
 export PATH="/opt/homebrew/opt/rustup/bin:$PATH"
+# Unset, WINE is this checkout's own Wine (setup.sh builds it into
+# target/wine-cx), else the one behind the space-free link in the cache
+# folder (a checkout of its own that ran setup, such as a worktree's main
+# checkout), else a wine on PATH. The link names whichever checkout ran
+# setup last, a fleet task's too, so this checkout's own comes first.
+if [ -z "${WINE:-}" ]; then
+    for wine in "$ROOT/target/wine-cx/bin/wine" "$HOME/Library/Caches/victory-macos/target/wine-cx/bin/wine"; do
+        [ -x "$wine" ] && { WINE="$wine"; break; }
+    done
+fi
 WINE="${WINE:-$(command -v wine || true)}"
 [ -x "$WINE" ] || { echo "set WINE to a wine binary" >&2; exit 1; }
 TARGET=x86_64-pc-windows-gnullvm

@@ -15,15 +15,17 @@ use super::shader::{Shader, VIEW_INTEGER, VIEW_SIGNED, VIEW_STRIDE_BITS, VIEW_ST
 use crate::ShaderError;
 use crate::gfx10::{Dpp, Fields, NULL, Operand};
 use crate::io::{Attribute, Barycentric, Elsewhere, Export, Input, Interp, Io, Target};
-use crate::ir::{Block, EXEC, Exit, Inst, Phi, Program, Reg, Value};
+use crate::ir::{Block, EXEC, Exit, Inst, Phi, Program, Reg, VCC, Value};
 use crate::native::{HwStage, NativeProgram, ResourceType, RootType, StageIo, Usage, UsedResource};
 use crate::resource::{Address, CODE, MEMORY, Resources, Role, Site, Source, USER_DATA};
 use crate::structure::{Atom, Bool, LaneExit, Map, Set, Structured};
 
+mod barriers;
 mod atomics;
 mod bvh;
 mod halves;
 mod mesh;
+use barriers::{once_per_lane, split_wave_barriers};
 pub(crate) use mesh::KeptOutputs;
 use mesh::prune_signature;
 
@@ -735,7 +737,7 @@ impl<'a> Lower<'a> {
                 // shortcut: a read in divergent code of what divergent code
                 // wrote gets no barrier (none could be placed there); the
                 // program then runs as before.
-                if let Some(b) = split_wave_barriers(p) {
+                if let Some(b) = split_wave_barriers(p, x.st) {
                     split_barriers = b;
                     synced = true;
                 }
@@ -11784,92 +11786,6 @@ impl<'a> Lower<'a> {
         }
         Ok(())
     }
-}
-
-/// Where a compute group that is one console wave needs group barriers
-/// when the host splits it into narrower waves: (block, instruction) to
-/// sync before, instruction index = the block's length for its end.
-///
-/// The console runs such a group in lockstep, so its compiler leaves out
-/// the barrier between one lane's LDS write and another's read. Here a
-/// read (or atomic) of LDS that a write may have changed since the last
-/// barrier gets one before it. Barriers need every lane of the group, so
-/// they go only in blocks each lane runs exactly once (no cycle through
-/// them, on every path from the entry to an end); such a block still dirty
-/// at its end syncs there when a successor is not one, so divergent code
-/// after it reads clean LDS. `None`: a read in divergent code may see a
-/// write made in divergent code since the last such block.
-pub(crate) fn split_wave_barriers(p: &Program) -> Option<Set<(usize, usize)>> {
-    let n = p.blocks.len();
-    let succ = |b: usize| p.blocks[b].exit.successors();
-    let uniform = once_per_lane(p);
-    let order = crate::ir::reverse_postorder(&p.blocks);
-    let mut dirty_out = vec![false; n];
-    loop {
-        let mut at = Set::default();
-        let mut changed = false;
-        for &b in &order {
-            let mut dirty = p.blocks[b].preds.iter().any(|&q| dirty_out[q]);
-            for (i, inst) in p.blocks[b].insts.iter().enumerate() {
-                let name = inst.name();
-                if name == "s_barrier" {
-                    dirty = false;
-                }
-                if !matches!(inst.fields, Fields::Ds { .. })
-                    || name.starts_with("ds_swizzle")
-                    || name.contains("permute")
-                {
-                    continue;
-                }
-                if dirty && !name.starts_with("ds_write") {
-                    if !uniform[b] {
-                        return None;
-                    }
-                    at.insert((b, i));
-                }
-                dirty = !name.starts_with("ds_read");
-            }
-            if dirty && uniform[b] && succ(b).iter().any(|&s| !uniform[s]) {
-                at.insert((b, p.blocks[b].insts.len()));
-                dirty = false;
-            }
-            changed |= std::mem::replace(&mut dirty_out[b], dirty) != dirty;
-        }
-        if !changed {
-            return Some(at);
-        }
-    }
-}
-
-/// Per block, whether each lane of the group runs it exactly once: no cycle
-/// passes through it, and every path from the entry to an end does. A group
-/// barrier needs every lane of the group, so it can go only in these.
-pub(crate) fn once_per_lane(p: &Program) -> Vec<bool> {
-    let n = p.blocks.len();
-    let succ = |b: usize| p.blocks[b].exit.successors();
-    // Blocks reachable from `from`'s successors (or from `from` itself when
-    // `start`), never entering `avoid`.
-    let reach = |from: usize, start: bool, avoid: Option<usize>| {
-        let mut seen = vec![false; n];
-        let mut stack = if start { vec![from] } else { succ(from) };
-        while let Some(b) = stack.pop() {
-            if Some(b) == avoid || std::mem::replace(&mut seen[b], true) {
-                continue;
-            }
-            stack.extend(succ(b));
-        }
-        seen
-    };
-    (0..n)
-        .map(|b| {
-            let ends_around = b != 0
-                && reach(0, true, Some(b))
-                    .iter()
-                    .enumerate()
-                    .any(|(q, &r)| r && succ(q).is_empty());
-            !reach(b, false, None)[b] && !ends_around
-        })
-        .collect()
 }
 
 #[cfg(test)]

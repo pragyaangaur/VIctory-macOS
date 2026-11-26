@@ -127,6 +127,8 @@ struct Buffers {
     free_bytes: u64,
     /// Taken by the submission being prepared.
     used: Vec<(u64, ID3D12Resource, usize)>,
+    /// The bytes of buffers submissions needed lately.
+    lately: crate::recent::Peak,
 }
 
 // SAFETY: the mappings are persistent mappings of the upload buffers.
@@ -136,20 +138,31 @@ static BUFFERS: Mutex<Buffers> = Mutex::new(Buffers {
     free: std::collections::VecDeque::new(),
     free_bytes: 0,
     used: Vec::new(),
+    lately: crate::recent::Peak::new(),
 });
 
-/// Free staging buffers kept at most.
+/// Free staging buffers kept at least, and at most: between them, what any
+/// submission needed lately. A big texture that changes again has its
+/// buffer back, not a new committed one (~50 ms per 128 MiB if the 5 ms per
+/// 12.7 MB above is linear); a peak does not stay for good.
 const KEPT_BYTES: u64 = 64 << 20;
+const KEPT_BYTES_MAX: u64 = 256 << 20;
 
 /// Called before a submission's uploads: the buffers of the last one are
-/// free again (the oldest dropped past `KEPT_BYTES`), and so are its chunks,
-/// of which the pool keeps what any submission needed lately, at most
-/// `CHUNKS_KEPT` (a peak of 16 held 512 MB for good). Dropping a chunk
-/// from the pool frees it only when the lists using it are done: each keeps
-/// its own reference (`record_upload`).
+/// free again (the oldest dropped past what any submission needed lately,
+/// `KEPT_BYTES` to `KEPT_BYTES_MAX`), and so are its chunks, of which the
+/// pool keeps what any submission needed lately, at most `CHUNKS_KEPT` (a
+/// peak of 16 held 512 MB for good). Dropping a chunk from the pool frees it
+/// only when the lists using it are done: each keeps its own reference
+/// (`record_upload`). The big textures' read buffers that no refresh used
+/// lately go too, one a call.
 pub(crate) fn recycle() {
+    let now = std::time::Instant::now();
+    let mut big = SCRATCH_BIG.lock().unwrap_or_else(|e| e.into_inner());
+    let freed = big.trim(now);
+    drop(big);
+    drop(freed);
     {
-        let now = std::time::Instant::now();
         let mut c = CHUNKS.lock().unwrap_or_else(|e| e.into_inner());
         let c = &mut *c;
         let needed = c.current + usize::from(c.used > 0);
@@ -159,11 +172,13 @@ pub(crate) fn recycle() {
     }
     let mut b = BUFFERS.lock().unwrap_or_else(|e| e.into_inner());
     let b = &mut *b;
+    let needed: u64 = b.used.iter().map(|e| e.0).sum();
+    let kept = (b.lately.begin(now, needed as usize) as u64).clamp(KEPT_BYTES, KEPT_BYTES_MAX);
     for e in b.used.drain(..) {
         b.free_bytes += e.0;
         b.free.push_back(e);
     }
-    while b.free_bytes > KEPT_BYTES
+    while b.free_bytes > kept
         && let Some((n, ..)) = b.free.pop_front()
     {
         b.free_bytes -= n;
@@ -833,11 +848,30 @@ thread_local! {
     static SCRATCH: std::cell::Cell<Vec<u8>> = const { std::cell::Cell::new(Vec::new()) };
 }
 
+/// The read buffers of textures over [`Scratch::KEEP`], shared by the
+/// threads: each refresh of such a texture allocated and zeroed its whole
+/// size again (a page fault per 4 KiB and the fill) though it reads only
+/// the spans that changed. Kept while refreshes of that size are lately
+/// (`recycle` trims), and then without a fill: only growth is zeroed.
+static SCRATCH_BIG: Mutex<crate::recent::Pool> = Mutex::new(crate::recent::Pool::new());
+
+/// [`SCRATCH_BIG`]'s bytes at most (the buffers of several workers' big
+/// textures at once).
+const SCRATCH_BIG_BYTES: usize = 256 << 20;
+
 impl Scratch {
     const KEEP: usize = 32 << 20;
 
     /// The thread's buffer, at least `size` bytes.
     fn take(size: usize) -> Self {
+        if size > Self::KEEP {
+            let taken = SCRATCH_BIG
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .take(size);
+            // Filled without the lock: several workers refresh big textures.
+            return Scratch(crate::recent::Pool::filled(taken, size));
+        }
         let mut v = SCRATCH.take();
         if v.len() < size {
             // Vec can double across the retention limit on an otherwise cacheable request.
@@ -852,9 +886,14 @@ impl Scratch {
 
 impl Drop for Scratch {
     fn drop(&mut self) {
-        // The largest textures' buffers are not kept.
+        // The largest textures' buffers go to the shared pool, which keeps
+        // those lately used.
         if self.0.capacity() <= Self::KEEP {
             SCRATCH.set(std::mem::take(&mut self.0));
+        } else {
+            let now = std::time::Instant::now();
+            let mut pool = SCRATCH_BIG.lock().unwrap_or_else(|e| e.into_inner());
+            pool.keep(std::mem::take(&mut self.0), now, SCRATCH_BIG_BYTES);
         }
     }
 }

@@ -1171,6 +1171,114 @@ fn lds_synced_in_halves_matches_the_console_on_every_gpu() {
     assert!(failed.is_empty(), "{}", failed.join("\n"));
 }
 
+/// Per thread `l` of a one-wave group of 64: four passes of a loop on a
+/// scalar count, each writing the lane's sum to LDS and adding the sum of
+/// the lane 32 away, in the other half (`v_mbcnt` asks for the console's
+/// lanes). The console's lockstep orders the accesses; split, each pass
+/// needs a barrier before its read, and one before its write, which the
+/// other half's read of the last pass must not miss.
+fn lds_in_a_loop() -> Vec<u32> {
+    let body = [
+        0xD834_0000,
+        0x0000_0102, // ds_write_b32 v2, v1
+        S_WAITCNT_LGKM,
+        0xD8D8_0000,
+        0x0300_0004, // ds_read_b32 v3, v4
+        S_WAITCNT_LGKM,
+        0x4A02_0701, // v_add_nc_u32 v1, v1, v3
+    ];
+    let mut w = PROLOGUE.to_vec();
+    w.extend([
+        0x3420_0085, // v_lshlrev_b32 v16, 5, v0
+        0xD765_0005,
+        0x0001_00C1, // v_mbcnt_lo_u32_b32 v5, -1, 0
+        0x3404_0082, // v_lshlrev_b32 v2, 2, v0
+        0x3A08_00A0, // v_xor_b32 v4, 32, v0
+        0x3408_0882, // v_lshlrev_b32 v4, 2, v4
+        0x7E02_0300, // v_mov_b32 v1, v0
+        0xBE94_0380, // s_mov_b32 s20, 0
+    ]);
+    w.extend(body);
+    let back = -(body.len() as i32 + 3);
+    w.extend([
+        0x8014_8114,                          // s_add_u32 s20, s20, 1
+        0xBF0A_8414,                          // s_cmp_lt_u32 s20, 4
+        0xBF85_0000 | (back as u32 & 0xFFFF), // s_cbranch_scc1 (back to the write)
+    ]);
+    w.extend(store(1, 0));
+    w.push(S_ENDPGM);
+    w
+}
+
+/// What the console gives [`lds_in_a_loop`]: each pass, a lane's sum and
+/// that of the lane 32 away both become their total.
+fn console_lds_in_a_loop() -> Vec<u32> {
+    let mut sum: Vec<u32> = (0..64).collect();
+    for _ in 0..4 {
+        sum = (0..64).map(|l| sum[l] + sum[l ^ 32]).collect();
+    }
+    sum
+}
+
+#[test]
+fn the_lds_loop_is_what_its_comments_say() {
+    let code: Vec<u8> = lds_in_a_loop()
+        .iter()
+        .flat_map(|w| w.to_le_bytes())
+        .collect();
+    let all = gfx10::decode(&code)
+        .expect("decodes")
+        .iter()
+        .map(|i| i.text(true))
+        .collect::<Vec<_>>()
+        .join("\n");
+    for want in [
+        "v_mbcnt_lo_u32_b32 v5, -1, 0",
+        "v_xor_b32 v4, 32, v0",
+        "v_mov_b32 v1, v0",
+        "s_mov_b32 s20, 0",
+        "ds_write_b32 v2, v1",
+        "ds_read_b32 v3, v4",
+        "v_add_nc_u32 v1, v1, v3",
+        "s_add_u32 s20, s20, 1",
+        "s_cmp_lt_u32 s20, 4",
+        "s_cbranch_scc1",
+    ] {
+        assert!(all.contains(want), "{want:?} not in:\n{all}");
+    }
+}
+
+/// With narrow host waves (D3DMetal), LDS a one-wave group shares in a loop
+/// on a scalar count gets its barriers inside the loop and runs in halves;
+/// without them it is refused, as before.
+#[test]
+fn lds_of_a_one_wave64_group_in_a_loop_runs_in_halves() {
+    let n = native(&lds_in_a_loop(), true, 64, 256);
+    let synced = lowered_with(&n, true, true).expect("synced, in halves");
+    assert_eq!(synced.wave_size, Some(32));
+    assert_eq!(synced.split_barriers, 2);
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        v.validate(&mut synced.dxil.clone())
+            .expect("DXIL validation failed");
+    }
+    let why = lowered_with(&n, true, false)
+        .err()
+        .expect("refused")
+        .to_string();
+    assert!(
+        why.contains("LDS one console wave64 shares without barriers"),
+        "{why}"
+    );
+}
+
+/// The loop on every hardware adapter, in halves: every pass gives the
+/// console's sums.
+#[test]
+fn lds_in_a_loop_in_halves_matches_the_console_on_every_gpu() {
+    let failed = differences_with(&lds_in_a_loop(), 64, 1, &console_lds_in_a_loop(), 256, true);
+    assert!(failed.is_empty(), "{}", failed.join("\n"));
+}
+
 /// `v_permlanex16_b32 v1, v0, s8, s9` with the FI and BOUND_CTRL bits
 /// (`op_sel` bits 0 and 1, word bits 11 and 12): lane `l` takes the value
 /// of `v0` from the other row of 16 in its 32-lane half, the lane its
