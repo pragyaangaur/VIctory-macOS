@@ -43,6 +43,19 @@ pub(crate) struct TypedBufferCalls {
     pub stores: [Vec<usize>; 2],
 }
 
+/// What the DXIL of a program holds, counted before it is written out.
+#[cfg(test)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Shape {
+    pub blocks: usize,
+    pub instructions: usize,
+    pub branches: usize,
+    /// The blocks of the `atomicBinOp` calls (0 is the entry).
+    pub atomics: Vec<usize>,
+    /// `rawBufferLoad` calls.
+    pub loads: usize,
+}
+
 pub(crate) struct Lowered {
     pub dxil: Vec<u8>,
     /// Bit n: immediate sampler n is a comparison sampler.
@@ -82,6 +95,9 @@ pub(crate) struct Lowered {
     /// Written typed-buffer calls, for structural tests of the dynamic path.
     #[cfg(test)]
     pub typed_buffer_calls: TypedBufferCalls,
+    /// What the written module holds, for structural tests.
+    #[cfg(test)]
+    pub shape: Shape,
     /// Barriers added for narrow host waves ([`split_wave_barriers`]).
     #[cfg(test)]
     pub split_barriers: usize,
@@ -1615,6 +1631,17 @@ impl<'a> Lower<'a> {
                     self.s.m.written_call_blocks("dx.op.bufferStore.f32"),
                     self.s.m.written_call_blocks("dx.op.bufferStore.i32"),
                 ],
+            },
+            #[cfg(test)]
+            shape: {
+                let (blocks, instructions, branches) = self.s.m.written_shape();
+                Shape {
+                    blocks,
+                    instructions,
+                    branches,
+                    atomics: self.s.m.written_call_blocks("dx.op.atomicBinOp.i32"),
+                    loads: self.s.m.written_calls("dx.op.rawBufferLoad.f32"),
+                }
             },
             #[cfg(test)]
             split_barriers: self.split_barriers.len(),
@@ -5114,10 +5141,21 @@ impl<'a> Lower<'a> {
         self.as_int(x)
     }
 
+    /// The dwords at byte `at` and `at + 4` of raw buffer `h`, in one load.
+    fn raw_pair(&mut self, h: V, at: V) -> (V, V) {
+        let c = self.cur;
+        let u = self.s.m.undef(self.s.t.i32);
+        let (mask, al) = (self.s.m.i8(3), self.s.m.i32(4));
+        let r = self.raw_buffer_load(c, &[h, at, u, mask, al]);
+        let (a, b) = (self.s.m.extract(c, r, 0), self.s.m.extract(c, r, 1));
+        (self.as_int(a), self.as_int(b))
+    }
+
     /// Marks the pages a write of `bytes` bytes at byte `x` of the unordered
     /// buffer view `h` touches, in the lanes `guard` lets through (module
-    /// notes, "Write marks"): the bits of its first and last byte, each set
-    /// only where still clear. Nothing for handles that are no heap view, or
+    /// notes, "Write marks"): the bits of its first and last byte, set only
+    /// where still clear (both read in one word when they share it, as they
+    /// nearly always do). Nothing for handles that are no heap view, or
     /// without [`Parts::view_marks`].
     fn mark_view_write(&mut self, h: V, x: V, bytes: V, guard: Option<V>) {
         if !self.x.view_marks {
@@ -5129,11 +5167,9 @@ impl<'a> Lower<'a> {
         let k = |l: &mut Self, v: u32| l.s.m.i32(v);
         let table = self.s.view_marks_handle();
         let c = self.cur;
-        let (eight, four) = (k(self, 8), k(self, 4));
+        let eight = k(self, 8);
         let at = self.s.m.bin(c, Bin::Mul, index, eight);
-        let base = self.raw_dword(table, at);
-        let at = self.s.m.bin(c, Bin::Add, at, four);
-        let phase = self.raw_dword(table, at);
+        let (base, phase) = self.raw_pair(table, at);
         let none = k(self, super::VIEW_MARK_NONE);
         let valid = self.s.m.cmp(c, pred::NE, base, none);
         let active = match guard {
@@ -5147,36 +5183,40 @@ impl<'a> Lower<'a> {
         let span = self.s.m.select(c, nonempty, span, zero);
         let last = self.s.m.bin(c, Bin::Add, first, span);
         let (k16, cap) = (k(self, 16), k(self, super::VIEW_WRITE_BITS - 1));
+        let (k5, k2, k31) = (k(self, 5), k(self, 2), k(self, 31));
+        // Each byte's page bit, and its bitmap dword's byte offset and mask.
         let mut bits = Vec::new();
         for byte in [first, last] {
             let page = self.s.m.bin(c, Bin::LShr, byte, k16);
             let n = self.s.m.bin(c, Bin::Add, base, page);
             let over = self.s.m.cmp(c, pred::IUGT, n, cap);
-            bits.push(self.s.m.select(c, over, cap, n));
-        }
-        let bitmap = self.s.view_writes_handle();
-        let outer = self.begin_guarded(Some(active));
-        for (i, &n) in bits.iter().enumerate() {
-            let c = self.cur;
-            let (k5, k2, k31, one, zero) = (k(self, 5), k(self, 2), k(self, 31), k(self, 1), k(self, 0));
+            let n = self.s.m.select(c, over, cap, n);
             let word = self.s.m.bin(c, Bin::LShr, n, k5);
             let word = self.s.m.bin(c, Bin::Shl, word, k2);
             let bit = self.s.m.bin(c, Bin::And, n, k31);
-            let bit = self.s.m.bin(c, Bin::Shl, one, bit);
-            // Most writes find their page marked: a load, not an atomic.
-            let old = self.raw_dword(bitmap, word);
-            let set = self.s.m.bin(c, Bin::And, old, bit);
-            let mut clear = self.s.m.cmp(c, pred::EQ, set, zero);
-            if i == 1 {
-                let other = self.s.m.cmp(c, pred::NE, n, bits[0]);
-                clear = self.s.m.bin(c, Bin::And, clear, other);
-            }
-            let inner = self.begin_guarded(Some(clear));
-            let iu = self.s.m.undef(self.s.t.i32);
-            // Operation 2 is OR.
-            self.atomic_bin_op(self.cur, &[bitmap, k2, word, iu, iu, bit]);
-            self.end_guarded(inner, &[]);
+            bits.push((word, self.s.m.bin(c, Bin::Shl, one, bit)));
         }
+        let [(word, first_bit), (last_word, last_bit)] = [bits[0], bits[1]];
+        // In bounds for any lane (the bit is capped), so read before the
+        // guard; most writes find their pages marked: a load, not an atomic.
+        let bitmap = self.s.view_writes_handle();
+        let old = self.raw_dword(bitmap, word);
+        let together = self.s.m.cmp(c, pred::EQ, word, last_word);
+        let also = self.s.m.select(c, together, last_bit, zero);
+        let want = self.s.m.bin(c, Bin::Or, first_bit, also);
+        let set = self.s.m.bin(c, Bin::And, old, want);
+        let clear = self.s.m.cmp(c, pred::NE, set, want);
+        let apart = self.s.m.cmp(c, pred::NE, word, last_word);
+        let more = self.s.m.bin(c, Bin::Or, clear, apart);
+        let go = self.s.m.bin(c, Bin::And, active, more);
+        let outer = self.begin_guarded(Some(go));
+        let iu = self.s.m.undef(self.s.t.i32);
+        // Operation 2 is OR; setting a set bit again changes nothing.
+        self.atomic_bin_op(self.cur, &[bitmap, k2, word, iu, iu, want]);
+        // A write across two bitmap dwords: the last byte's is its own.
+        let inner = self.begin_guarded(Some(apart));
+        self.atomic_bin_op(self.cur, &[bitmap, k2, last_word, iu, iu, last_bit]);
+        self.end_guarded(inner, &[]);
         self.end_guarded(outer, &[]);
     }
 
@@ -5315,9 +5355,13 @@ impl<'a> Lower<'a> {
         let missed = self.memory_mark_index(e.entry, e.block, e.l1);
         let first = self.s.m.select(c, e.miss, missed, e.entry);
         let bitmap = self.s.memory_dirty_handle();
-        let at = self.begin_guarded(marks);
-        self.mark_memory_bit(bitmap, first);
-        self.end_guarded(at, &[]);
+        if write {
+            self.mark_memory_bit_if_clear(bitmap, first, marks);
+        } else {
+            let at = self.begin_guarded(marks);
+            self.mark_memory_bit(bitmap, first);
+            self.end_guarded(at, &[]);
+        }
         if write && bytes > 1 {
             // A multi-byte write crossing a 64 KiB boundary can enter another
             // 256 MiB region or cross 4 GiB, so look up its last byte in the
@@ -5357,15 +5401,44 @@ impl<'a> Lower<'a> {
     /// Sets bit `n` in the title-memory dirty bitmap `bitmap`.
     fn mark_memory_bit(&mut self, bitmap: V, n: V) {
         let c = self.cur;
+        let k2 = self.s.m.i32(2);
+        let iu = self.s.m.undef(self.s.t.i32);
+        let (word, bit) = self.memory_bit(n);
+        // Operation 2 is OR.
+        self.atomic_bin_op(c, &[bitmap, k2, word, iu, iu, bit]);
+    }
+
+    /// Sets bit `n` in `bitmap` in the lanes `guard` lets through (`None`:
+    /// all), with an atomic only where a load finds it clear: most stores
+    /// find their page marked. A lane that reads a stale 0 only ORs again.
+    fn mark_memory_bit_if_clear(&mut self, bitmap: V, n: V, guard: Option<V>) {
+        let c = self.cur;
+        let (k2, zero) = (self.s.m.i32(2), self.s.m.i32(0));
+        let (word, bit) = self.memory_bit(n);
+        // Read in every lane: out of the bitmap reads 0, an index the
+        // atomic then drops.
+        let old = self.raw_dword(bitmap, word);
+        let set = self.s.m.bin(c, Bin::And, old, bit);
+        let mut clear = self.s.m.cmp(c, pred::EQ, set, zero);
+        if let Some(g) = guard {
+            clear = self.s.m.bin(c, Bin::And, clear, g);
+        }
+        let at = self.begin_guarded(Some(clear));
+        let iu = self.s.m.undef(self.s.t.i32);
+        self.atomic_bin_op(self.cur, &[bitmap, k2, word, iu, iu, bit]);
+        self.end_guarded(at, &[]);
+    }
+
+    /// The byte offset of the bitmap dword holding bit `n`, and the bit's
+    /// mask in it.
+    fn memory_bit(&mut self, n: V) -> (V, V) {
+        let c = self.cur;
         let k = |l: &mut Self, x: u32| l.s.m.i32(x);
         let (k5, k31, k2, one) = (k(self, 5), k(self, 31), k(self, 2), k(self, 1));
-        let iu = self.s.m.undef(self.s.t.i32);
-        // Byte offset of the bitmap dword; operation 2 is OR.
         let word = self.s.m.bin(c, Bin::LShr, n, k5);
         let word = self.s.m.bin(c, Bin::Shl, word, k2);
         let bit = self.s.m.bin(c, Bin::And, n, k31);
-        let bit = self.s.m.bin(c, Bin::Shl, one, bit);
-        self.atomic_bin_op(c, &[bitmap, k2, word, iu, iu, bit]);
+        (word, self.s.m.bin(c, Bin::Shl, one, bit))
     }
 
     /// The level-2 page-table index, block, and level-1 index of title

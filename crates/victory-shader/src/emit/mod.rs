@@ -248,6 +248,8 @@ pub mod host;
 #[cfg(all(test, windows))]
 mod image_store_tests;
 mod lower;
+#[cfg(test)]
+mod mark_tests;
 mod deltas;
 mod rect;
 pub use container::sign as sign_container;

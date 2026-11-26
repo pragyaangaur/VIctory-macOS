@@ -617,6 +617,21 @@ impl Module {
         self.written_call_blocks(name).len()
     }
 
+    /// The blocks, instructions (phis included) and conditional branches
+    /// [`Module::write`] writes.
+    #[cfg(test)]
+    pub fn written_shape(&self) -> (usize, usize, usize) {
+        let plan = self.plan();
+        let mut shape = (plan.layout.len(), 0, 0);
+        for &b in &plan.layout {
+            let blk = &self.blocks[b];
+            let live = |&&i: &&u32| plan.live[i as usize];
+            shape.1 += blk.phis.iter().chain(&blk.body).filter(live).count();
+            shape.2 += usize::from(matches!(self.term(b), Some(Term::CondBr(..))));
+        }
+        shape
+    }
+
     /// The globals and functions [`Module::write`] declares, each kept
     /// one's new index and their number: functions declared and not called,
     /// and constant globals nothing reads, are left out (the validator

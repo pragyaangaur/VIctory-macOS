@@ -625,7 +625,8 @@ fn root_views_read_their_copy_and_zeros_past_it() {
 /// its first byte 16 bytes before a 64 KiB page ends, so the second store
 /// crosses into the next page), a store through view 1 (not marked) and an
 /// atomic add through view 2 (base bit 200). The stores land; exactly bits
-/// 100, 101 and 200 are set.
+/// 100, 101 and 200 are set (31, 32 and 200 with view 0 at base bit 31,
+/// whose two bits are in two dwords of the bitmap).
 #[test]
 fn writes_through_views_mark_their_pages() {
     /// MUBUF `op` of `vdata` at `byte_off` through `s[srsrc:srsrc+3]`.
@@ -733,33 +734,49 @@ fn writes_through_views_mark_their_pages() {
             continue;
         };
         let (root, pso) = host.compute_pipeline(&shader).expect("pipeline");
-        let mut ud = vec![0u32; shader.user_data_dwords() as usize];
-        for u in &shader.user_data {
-            ud[u.index as usize] = if u.root == RootType::Constants { value } else { 0 };
+        // View 0's second store crosses into the next page: from bit 100 both
+        // bits are in one bitmap dword, from bit 31 in two.
+        for (first, pages) in [(100, [100, 101, 200]), (31, [31, 32, 200])] {
+            let mut ud = vec![0u32; shader.user_data_dwords() as usize];
+            for u in &shader.user_data {
+                ud[u.index as usize] = match u.root {
+                    RootType::Constants => value,
+                    _ => 0,
+                };
+            }
+            let mut marks = marks.clone();
+            marks[0] = first;
+            let out = host
+                .dispatch(
+                    &root,
+                    &pso,
+                    &Dispatch {
+                        roots: vec![
+                            (0, Root::Constants(ud)),
+                            (
+                                1,
+                                Root::View {
+                                    srv: true,
+                                    data: marks,
+                                },
+                            ),
+                            (2, Root::Uav(8)),
+                        ],
+                        views: &[View::RawUav(8), View::RawUav(8), View::RawUav(8)],
+                        samplers: &[],
+                        groups: [1, 1, 1],
+                    },
+                )
+                .unwrap_or_else(|e| panic!("{label}: {e}"));
+            let view_0 = [value, 0, 0, value, value, value, value, 0];
+            assert_eq!(out[0], view_0, "{label}: view 0");
+            assert_eq!(out[1][1], value, "{label}: view 1");
+            assert_eq!(out[2][2], value, "{label}: the atomic");
+            let marked: Vec<usize> = (0..out[3].len() * 32)
+                .filter(|&b| out[3][b / 32] >> (b % 32) & 1 != 0)
+                .collect();
+            assert_eq!(marked, pages, "{label}: pages from bit {first}");
         }
-        let out = host
-            .dispatch(
-                &root,
-                &pso,
-                &Dispatch {
-                    roots: vec![
-                        (0, Root::Constants(ud)),
-                        (1, Root::View { srv: true, data: marks.clone() }),
-                        (2, Root::Uav(8)),
-                    ],
-                    views: &[View::RawUav(8), View::RawUav(8), View::RawUav(8)],
-                    samplers: &[],
-                    groups: [1, 1, 1],
-                },
-            )
-            .unwrap_or_else(|e| panic!("{label}: {e}"));
-        assert_eq!(out[0], [value, 0, 0, value, value, value, value, 0], "{label}: view 0");
-        assert_eq!(out[1][1], value, "{label}: view 1");
-        assert_eq!(out[2][2], value, "{label}: the atomic");
-        let marked: Vec<usize> = (0..out[3].len() * 32)
-            .filter(|&b| out[3][b / 32] >> (b % 32) & 1 != 0)
-            .collect();
-        assert_eq!(marked, [100, 101, 200], "{label}: pages");
         ran += 1;
     }
     assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
