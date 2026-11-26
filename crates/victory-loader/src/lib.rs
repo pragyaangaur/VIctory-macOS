@@ -24,6 +24,7 @@
 #[cfg(windows)]
 mod crash;
 pub mod masked;
+pub mod wide;
 #[cfg(windows)]
 mod patch;
 pub mod prepare;
