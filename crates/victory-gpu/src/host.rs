@@ -2120,7 +2120,7 @@ impl Host {
                 }
             }
             let shadow_ranges: Vec<(u64, u64)> = groups.iter().map(|(s, _)| s.range()).collect();
-            if groups.len() >= 2 && crate::shadow::ranges_disjoint(&shadow_ranges) {
+            if groups.len() >= 2 && crate::shadow::copy_back_ranges_disjoint(&shadow_ranges) {
                 crate::texture::in_parallel(groups.len(), |i| {
                     let (shadow, items) = &groups[i];
                     for &(address, len, goes_back) in items {

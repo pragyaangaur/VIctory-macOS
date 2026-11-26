@@ -18,9 +18,13 @@
 //!   `v_writelane_b32` (the lane named takes the scalar) and the row a DPP
 //!   row mask names (rows 2 and 3 are the upper half's) are decided by the
 //!   console lane ([`Lower::console_lane`]);
-//! * across halves, refused: ballots (a mask read as data holds the other
-//!   half's lanes unless the whole group fits one host wave),
-//!   `v_readlane_b32` of a lane that may be in the other half
+//! * lane masks read as data (ballots) hold the other half's lanes: unless
+//!   the whole group fits one host wave, each host wave's ballot passes to
+//!   the other through group-shared memory between group barriers
+//!   ([`Lower::ballot_across_halves`]). Barriers need the whole group, so
+//!   only for a mask written in a block each lane runs once
+//!   ([`once_per_lane`]); elsewhere refused ([`MASK_ACROSS`]);
+//! * across halves, refused: `v_readlane_b32` of a lane that may be in the other half
 //!   (SGPR spills read back are not lane reads), and whole-wave reductions
 //!   (unless an active reduction fits one host wave) and prefix sums;
 //! * `v_readfirstlane_b32` reads the host wave's first lane, which in the
@@ -128,7 +132,96 @@ impl Lower<'_> {
     pub(super) fn same_half(&self, what: Why) -> Result<(), Why> {
         if self.halves { Err(what) } else { Ok(()) }
     }
+
+    /// Where the halves pass each other a lane mask written in IR block
+    /// `def` (none: a program input, in the entry): there, if each lane of
+    /// the group runs it once ([`once_per_lane`]); in the block being
+    /// lowered, where the reading instruction starts ([`Lower::level`],
+    /// before any guard of its own).
+    pub(super) fn across_at(&self, def: Option<usize>) -> Option<usize> {
+        if !self.once.get(def.unwrap_or(0)).copied().unwrap_or(false) {
+            return None;
+        }
+        match def {
+            None => Some(self.s.entry),
+            Some(b) if b == self.cur_ir => Some(self.level),
+            Some(b) => self.tail[b],
+        }
+    }
+
+    /// Both dwords of the console wave's ballot of `bit`, in halves: each
+    /// host wave stores its own (its half's lanes) in a group-shared dword
+    /// of its own, and reads its console wave's two after a group barrier.
+    /// A barrier before the store keeps it from overwriting what the other
+    /// half has not read of an earlier ballot. A console wave with no upper
+    /// half (a group not a multiple of 64) has a high dword of 0. `at` must
+    /// be run once by every lane of the group ([`Lower::across_at`]).
+    pub(super) fn ballot_across_halves(&mut self, bit: V, at: usize) -> Result<(V, V), Why> {
+        let group: u32 = self.s.threads.map_or(0, |t| t.iter().product());
+        // Two dwords per console wave, so the high dword of the last one is
+        // inside even where the group has no upper half.
+        let dwords = group.div_ceil(2 * HALF) * 2;
+        if self.s.lds_dwords + dwords > GROUP_SHARED_DWORDS {
+            return Err("no group-shared memory left to pass a lane mask between 32-lane halves");
+        }
+        let i32t = self.s.t.i32;
+        let four = self.s.m.named_struct("dx.types.fouri32", vec![i32t; 4]);
+        let r = self
+            .s
+            .op(at, "waveActiveBallot", Attr::NoUnwind, four, 116, &[bit]);
+        self.s.flags |= flags::WAVE_OPS;
+        let own = self.s.m.extract(at, r, 0);
+        let f = self.relabelled_flat();
+        let words = match self.half_masks {
+            Some(g) => g,
+            None => {
+                let arr = self.s.m.array(dwords, i32t);
+                let g = self.s.m.global("half_masks", arr, 3);
+                self.half_masks = Some(g);
+                g
+            }
+        };
+        // Host wave `2w + h` (its flat ids `32 (2w + h)` on) holds console
+        // wave `w`'s half `h`.
+        let five = self.s.m.i32(5);
+        let slot = self.s.m.bin(at, Bin::LShr, f, five);
+        let not_one = self.s.m.i32(!1);
+        let low = self.s.m.bin(at, Bin::And, slot, not_one);
+        let one = self.s.m.i32(1);
+        let high = self.s.m.bin(at, Bin::Or, slot, one);
+        let sync = |l: &mut Self| {
+            // Group sync with a group-shared memory fence.
+            let mode = l.s.m.i32(1 | 8);
+            let void = l.s.t.void;
+            l.s.op(at, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
+        };
+        sync(self);
+        let mine = self.s.m.element(at, words, slot);
+        self.s.m.store(at, mine, own);
+        sync(self);
+        let lo = self.s.m.element(at, words, low);
+        let lo = self.s.m.load(at, lo);
+        let hi = self.s.m.element(at, words, high);
+        let mut hi = self.s.m.load(at, hi);
+        if !group.is_multiple_of(2 * HALF) {
+            let first = self.s.m.bin(at, Bin::Shl, high, five);
+            let n = self.s.m.i32(group);
+            let there = self.s.m.cmp(at, pred::IULT, first, n);
+            let zero = self.s.m.i32(0);
+            hi = self.s.m.select(at, there, hi, zero);
+        }
+        Ok((lo, hi))
+    }
 }
+
+/// Why a lane mask read as data stops in halves: it is written where some
+/// lanes of the group may not be, so no group barrier can pass it between
+/// the halves.
+pub(super) const MASK_ACROSS: Why = "a lane mask read as data (wave64 on a 32-lane host)";
+
+/// The group-shared dwords a D3D12 compute program may declare, at most
+/// (32 KiB).
+const GROUP_SHARED_DWORDS: u32 = 8192;
 
 /// Why a first-lane read stops in halves: the console's first lane may be
 /// in the other half, and the value is not known to be the same there.

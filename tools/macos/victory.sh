@@ -17,6 +17,19 @@ WINE="${WINE:-$HOME/Library/Caches/victory-macos/target/wine-cx/bin/wine}"
     echo "D3DMetal is missing: copy the redist/lib folder of Apple's evaluation environment over $(dirname "$WINE")/../lib" >&2
     exit 1
 }
+# The 64-thread argument clamp is compiled at build time with the DXC that
+# D3DMetal ships: CrossOver's own compiler refuses it, and without it the
+# one-thread form runs instead. A VICTORY_HELPER_DXC already set wins.
+DXC_LIB="$(dirname "$WINE")/../lib/external/D3DMetal.framework/Versions/A/Resources/libdxcompiler.dylib"
+if [ -z "${VICTORY_HELPER_DXC:-}" ] && [ -f "$DXC_LIB" ]; then
+    helper="$HOME/Library/Caches/victory-macos/target/dxc-d3dmetal"
+    if [ ! -x "$helper" ] || [ tools/macos/dxc-d3dmetal.sh -nt "$helper" ]; then
+        sh tools/macos/dxc-d3dmetal.sh "$helper" || helper=
+    fi
+    if [ -n "$helper" ]; then
+        export DXC_LIB VICTORY_HELPER_DXC="$helper"
+    fi
+fi
 if [ "${VICTORY_DIAGNOSTICS:-0}" = 1 ]; then
     cargo build --quiet --release -p victory --features diagnostics --target "$TARGET"
 else

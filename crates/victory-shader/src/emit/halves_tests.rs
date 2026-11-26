@@ -189,7 +189,7 @@ fn refusal(words: &[u32], threads: u32, lds_bytes: u32) -> String {
 /// The hand-encoded words are the instructions their comments name.
 #[test]
 fn the_test_programs_are_what_their_comments_say() {
-    let programs: [(Vec<u32>, &[&str]); 5] = [
+    let programs: [(Vec<u32>, &[&str]); 8] = [
         (
             in_halves(),
             &[
@@ -240,6 +240,31 @@ fn the_test_programs_are_what_their_comments_say() {
                 "buffer_store_dword v1, v16, s[40:43], 0 offen offset:4",
             ],
         ),
+        (
+            first_active_lane(),
+            &["s_ff1_i32_b64 s12, exec", "v_mov_b32 v1, s12"],
+        ),
+        (
+            lanes_below(100),
+            &[
+                "v_cmp_gt_u32 vcc, lit(0x00000064), v0",
+                "s_bcnt1_i32_b64 s12, vcc",
+                "v_mov_b32 v2, vcc_hi",
+                "v_mbcnt_lo_u32_b32 v3, vcc_lo, 0",
+                "v_mbcnt_hi_u32_b32 v3, vcc_hi, v3",
+                "buffer_store_dword v3, v16, s[40:43], 0 offen offset:8",
+            ],
+        ),
+        (
+            lanes_below_in_a_loop(),
+            &[
+                "s_mov_b32 s20, 0",
+                "v_cmp_gt_u32 vcc, 40, v0",
+                "s_add_u32 s20, s20, 1",
+                "s_cmp_lt_u32 s20, 2",
+                "s_cbranch_scc1",
+            ],
+        ),
     ];
     for (words, wants) in programs {
         let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
@@ -272,9 +297,10 @@ fn a_wave64_program_reading_lanes_declares_32_lane_waves_in_halves() {
     assert_eq!(lowered(&n32, true).expect("wave32").wave_size, Some(32));
 }
 
-#[test]
-fn a_lane_mask_fits_in_a_single_host_wave() {
-    let first_active_lane = [
+/// `s_ff1_i32_b64 s12, exec` at the start: the console wave's first active
+/// lane, 0 in every lane.
+fn first_active_lane() -> Vec<u32> {
+    [
         PROLOGUE.as_slice(),
         &[
             0x3420_0085, // v_lshlrev_b32 v16, 5, v0
@@ -284,10 +310,108 @@ fn a_lane_mask_fits_in_a_single_host_wave() {
         &store(1, 0),
         &[S_ENDPGM],
     ]
-    .concat();
-    assert_eq!(refusal(&first_active_lane, 32, 0), "translated");
-    let why = refusal(&first_active_lane, 64, 0);
+    .concat()
+}
+
+/// The lanes below `limit` (`v_cmp_gt_u32 vcc, limit, v0`) as data: per
+/// lane, three dwords at `l * 32`: the console wave's count of them
+/// (`s_bcnt1_i32_b64`), their high dword (`vcc_hi`, lanes 32-63), and how
+/// many are below the lane (`v_mbcnt` of the mask, as a compaction counts
+/// its place).
+fn lanes_below(limit: u32) -> Vec<u32> {
+    let mut w = PROLOGUE.to_vec();
+    w.extend([
+        0x3420_0085, // v_lshlrev_b32 v16, 5, v0
+        0x7D88_00FF,
+        limit, // v_cmp_gt_u32 vcc, limit, v0
+        0xBE8C_106A, // s_bcnt1_i32_b64 s12, vcc
+        0x7E02_020C, // v_mov_b32 v1, s12
+        0x7E04_026B, // v_mov_b32 v2, vcc_hi
+        0xD765_0003,
+        0x0001_006A, // v_mbcnt_lo_u32_b32 v3, vcc_lo, 0
+        0xD766_0003,
+        0x0002_066B, // v_mbcnt_hi_u32_b32 v3, vcc_hi, v3
+    ]);
+    w.extend(store(1, 0));
+    w.extend(store(2, 4));
+    w.extend(store(3, 8));
+    w.push(S_ENDPGM);
+    w
+}
+
+/// What the console gives [`lanes_below`]`(limit)`'s lane `l` in a group of
+/// `threads`.
+fn console_lanes_below(limit: u32, threads: u32, l: u32) -> [u32; 3] {
+    let wave = l & !63;
+    let below = |end: u32| limit.min(threads).min(end).saturating_sub(wave);
+    let high = below(wave + 64).saturating_sub(32);
+    [
+        below(wave + 64),
+        if high == 32 { u32::MAX } else { (1 << high) - 1 },
+        below(l),
+    ]
+}
+
+/// The lanes below 40, as in [`lanes_below`], counted in a scalar loop
+/// that runs twice: the mask is written in a block each lane runs more than
+/// once.
+fn lanes_below_in_a_loop() -> Vec<u32> {
+    let mut w = PROLOGUE.to_vec();
+    w.extend([
+        0x3420_0085, // v_lshlrev_b32 v16, 5, v0
+        0xBE94_0380, // s_mov_b32 s20, 0
+        0x7D88_00A8, // v_cmp_gt_u32 vcc, 40, v0
+        0xBE8C_106A, // s_bcnt1_i32_b64 s12, vcc
+        0x8014_8114, // s_add_u32 s20, s20, 1
+        0xBF0A_8214, // s_cmp_lt_u32 s20, 2
+        0xBF85_FFFB, // s_cbranch_scc1 (back to the v_cmp)
+        0x7E02_020C, // v_mov_b32 v1, s12
+    ]);
+    w.extend(store(1, 0));
+    w.push(S_ENDPGM);
+    w
+}
+
+/// A lane mask read as data in a group of 33 to 64 lanes or more holds
+/// lanes of both host waves: they pass their halves to each other where
+/// each lane of the group runs the block writing it once, and it is refused
+/// in a block that runs more than once. In a group of 32 or fewer, one host
+/// wave holds the whole mask.
+#[test]
+fn lane_masks_read_as_data_pass_between_halves() {
+    assert_eq!(refusal(&first_active_lane(), 32, 0), "translated");
+    assert_eq!(refusal(&first_active_lane(), 64, 0), "translated");
+    for threads in [64, 96, 128] {
+        assert_eq!(refusal(&lanes_below(40), threads, 0), "translated");
+    }
+    let why = refusal(&lanes_below_in_a_loop(), 64, 0);
     assert!(why.contains("a lane mask read as data (wave64 on a 32-lane host)"), "{why}");
+    assert_eq!(refusal(&lanes_below_in_a_loop(), 32, 0), "translated");
+    // For 64-lane hosts it is read in one wave, as before.
+    assert!(lowered(&native(&lanes_below_in_a_loop(), true, 64, 0), false).is_ok());
+
+    let halves = lowered(&native(&lanes_below(40), true, 64, 0), true).expect("halves");
+    assert_eq!(halves.wave_size, Some(32));
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        v.validate(&mut halves.dxil.clone())
+            .expect("DXIL validation failed");
+    }
+}
+
+/// [`lanes_below`] and [`first_active_lane`] on every hardware adapter give
+/// the console's masks: in one console wave of 64 (both halves' lanes), in
+/// two (one mask each), and in a group of 96, whose second console wave has
+/// no upper half (a high dword of 0).
+#[test]
+fn lane_masks_passed_between_halves_match_the_console_on_every_gpu() {
+    let mut failed = differences(&first_active_lane(), 64, 1, &[0; 64]);
+    for (limit, threads) in [(40, 64), (100, 128), (80, 96), (96, 96)] {
+        let want: Vec<u32> = (0..threads)
+            .flat_map(|l| console_lanes_below(limit, threads, l))
+            .collect();
+        failed.extend(differences(&lanes_below(limit), threads, 3, &want));
+    }
+    assert!(failed.is_empty(), "{}", failed.join("\n"));
 }
 
 #[test]

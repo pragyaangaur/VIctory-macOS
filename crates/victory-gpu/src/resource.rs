@@ -1673,7 +1673,99 @@ pub(crate) fn evict_unused() {
         let used = used - crate::placement::free_bytes() as f64 / 1e6;
         if used > BUDGET_HIGH * budget { ((used - BUDGET_LOW * budget) * 1e6) as u64 } else { 0 }
     });
-    evict(frame, now_ms(), over);
+    evict(frame, now_ms(), over.max(ram_over()));
+}
+
+/// Where the card's memory is the computer's own (unified: Apple silicon
+/// under D3DMetal, integrated GPUs), host textures also go while less than
+/// [`RAM_LOW`] of the computer's memory is free, until [`RAM_FREE`] would
+/// be. The card's budget leaves out what the title and the host copies of
+/// title memory take of that same memory: on a Mac with 16 GB the budget
+/// was 12.7 GB, host copies took 5.7 GB, and the system swapped long before
+/// the card's use reached it; each guard's `VirtualProtect` then took about
+/// 2.3 ms instead of 10-60 us, 7-11 s a frame (a clean process under the
+/// same Wine: 2-5 us).
+#[cfg(windows)]
+const RAM_LOW: f64 = 0.10;
+#[cfg(windows)]
+const RAM_FREE: f64 = 0.15;
+
+/// The bytes [`evict_unused`] gives up for the computer's free memory
+/// ([`RAM_LOW`]): none unless the card's memory is unified.
+#[cfg(windows)]
+fn ram_over() -> u64 {
+    if !unified() {
+        return 0;
+    }
+    use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+    // SAFETY: plain data, its length set as the call asks.
+    let mut m: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
+    m.dwLength = size_of::<MEMORYSTATUSEX>() as u32;
+    // SAFETY: a valid out pointer.
+    if unsafe { GlobalMemoryStatusEx(&mut m) } == 0 {
+        return 0;
+    }
+    ram_excess(m.ullAvailPhys, m.ullTotalPhys)
+}
+
+/// With `available` of `total` bytes free: what to give up so that
+/// [`RAM_FREE`] is, once less than [`RAM_LOW`] is.
+#[cfg(windows)]
+fn ram_excess(available: u64, total: u64) -> u64 {
+    let total = total as f64;
+    if (available as f64) < RAM_LOW * total {
+        (RAM_FREE * total) as u64 - available
+    } else {
+        0
+    }
+}
+
+/// Whether the host card's memory is the computer's own, logged once: its
+/// architecture's UMA, or its local and non-local segments offering one
+/// and the same budget (D3DMetal reports no UMA on Apple silicon, and both
+/// segments as the same 12713 MB on a 16 GB Mac).
+#[cfg(windows)]
+fn unified() -> bool {
+    static UNIFIED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if let Some(&unified) = UNIFIED.get() {
+        return unified;
+    }
+    use windows::Win32::Graphics::Direct3D12::{
+        D3D12_FEATURE_ARCHITECTURE, D3D12_FEATURE_DATA_ARCHITECTURE,
+    };
+    // Not decided until the adapter answers.
+    let (Some(host), Some([(_, local), (_, other)])) =
+        (crate::host::host(), crate::host::video_memory())
+    else {
+        return false;
+    };
+    let mut a = D3D12_FEATURE_DATA_ARCHITECTURE::default();
+    // SAFETY: the query writes its own structure of the given size.
+    let uma = unsafe {
+        host.device.CheckFeatureSupport(
+            D3D12_FEATURE_ARCHITECTURE,
+            (&raw mut a).cast(),
+            size_of_val(&a) as u32,
+        )
+    }
+    .is_ok()
+        && a.UMA.as_bool();
+    let unified = *UNIFIED.get_or_init(|| one_memory(uma, local, other));
+    tracing::info!(
+        unified,
+        uma,
+        local_mb = local,
+        non_local_mb = other,
+        "host card memory unified with the computer's: host textures also kept under its free memory"
+    );
+    unified
+}
+
+/// [`unified`]'s rule: the architecture says so, or both segments' budgets
+/// (MB) are one.
+#[cfg(windows)]
+fn one_memory(uma: bool, local: f64, non_local: f64) -> bool {
+    uma || (local > 0.0 && local == non_local)
 }
 
 /// The card's budget in MB that [`evict_unused`] keeps host textures under:
@@ -1765,12 +1857,17 @@ fn candidates() -> Vec<Owned> {
 /// Of textures last used at (frame, ms) taking (bytes) each, those to give
 /// up at (`frame`, `now`): every one idle for [`IDLE_FRAMES`] and
 /// [`IDLE_MS`], then the least recently used others until `over` bytes are
-/// gone (indices).
+/// gone (indices). Past the budget, none used within the last
+/// [`SOON_FRAMES`] frames goes: those are the frames' own textures, made
+/// again at once (on a 16 GB Mac with `VICTORY_GPU_BUDGET_MB=4096`, 53 % of
+/// the textures given up were made again within [`SOON_FRAMES`], and the
+/// picture flickered), and the card's use stays where it was.
 #[cfg(windows)]
 fn choose(uses: &[(u64, u64, u64)], frame: u64, now: u64, over: u64) -> Vec<usize> {
     let idle = |&(f, ms, _): &(u64, u64, u64)| frame.saturating_sub(f) >= IDLE_FRAMES && now.saturating_sub(ms) >= IDLE_MS;
     let (mut gone, mut rest): (Vec<usize>, Vec<usize>) = (0..uses.len()).partition(|&i| idle(&uses[i]));
     let mut over = over.saturating_sub(gone.iter().map(|&i| uses[i].2).sum());
+    rest.retain(|&i| frame.saturating_sub(uses[i].0) > SOON_FRAMES);
     rest.sort_by_key(|&i| uses[i].1);
     for i in rest {
         if over == 0 {
@@ -2588,21 +2685,64 @@ mod tests {
         }
     }
 
+    /// Unified: by the architecture, or by one budget for both segments.
+    #[cfg(windows)]
+    #[test]
+    fn one_budget_for_both_segments_is_one_memory() {
+        assert!(one_memory(true, 8192.0, 16384.0));
+        assert!(
+            one_memory(false, 12713.0, 12713.0),
+            "D3DMetal on a 16 GB Mac"
+        );
+        assert!(!one_memory(false, 8192.0, 16384.0), "a card of its own");
+        assert!(!one_memory(false, 0.0, 0.0));
+    }
+
+    /// Below [`RAM_LOW`] of the computer's memory free, what is given up
+    /// brings it back to [`RAM_FREE`].
+    #[cfg(windows)]
+    #[test]
+    fn free_memory_below_its_share_gives_up_up_to_the_higher_share() {
+        let gb = 1u64 << 30;
+        assert_eq!(ram_excess(4 * gb, 16 * gb), 0);
+        assert_eq!(
+            ram_excess(16 * gb / 10 + 1, 16 * gb),
+            0,
+            "just above the line"
+        );
+        assert_eq!(
+            ram_excess(gb, 16 * gb),
+            (0.15 * (16 * gb) as f64) as u64 - gb
+        );
+        assert_eq!(ram_excess(0, 8 * gb), (0.15 * (8 * gb) as f64) as u64);
+    }
+
     /// Textures idle for the idle time and frames are given up; past the
     /// budget the least recently used others follow until the excess is
-    /// gone.
+    /// gone, but never one used within the last [`SOON_FRAMES`] frames.
     #[cfg(windows)]
     #[test]
     fn idle_textures_go_and_past_the_budget_the_least_recently_used() {
         let (frame, now) = (1_000, 1_000_000);
         let recent = (frame, now - 1_000, 10);
         let idle = (frame - IDLE_FRAMES, now - IDLE_MS, 10);
-        let older = (frame, now - 5_000, 30);
-        let uses = [recent, idle, older];
+        let older = (frame - SOON_FRAMES - 1, now - 5_000, 30);
+        let oldest = (frame - SOON_FRAMES - 2, now - 6_000, 20);
+        let uses = [recent, idle, older, oldest];
         assert_eq!(choose(&uses, frame, now, 0), vec![1], "idle only");
         assert_eq!(choose(&uses, frame, now, 10), vec![1], "the idle one covers the excess");
-        assert_eq!(choose(&uses, frame, now, 11), vec![1, 2], "then the least recently used");
-        assert_eq!(choose(&uses, frame, now, 1 << 20), vec![1, 2, 0], "all of them if need be");
+        assert_eq!(choose(&uses, frame, now, 11), vec![1, 3], "then the least recently used");
+        assert_eq!(choose(&uses, frame, now, 31), vec![1, 3, 2], "and the next");
+        assert_eq!(
+            choose(&uses, frame, now, 1 << 20),
+            vec![1, 3, 2],
+            "all of them if need be, except those of the last frames"
+        );
+        let just = (frame - SOON_FRAMES, now - 5_000, 30);
+        assert!(
+            choose(&[just], frame, now, 1 << 20).is_empty(),
+            "used within the last frames"
+        );
         let early = (frame - 1, now - IDLE_MS, 10);
         assert!(choose(&[early], frame, now, 0).is_empty(), "too few frames ago");
     }

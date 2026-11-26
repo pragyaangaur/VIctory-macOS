@@ -62,6 +62,8 @@ Under Wine, `D3DCompile` is Wine's HLSL compiler (vkd3d-shader). In CrossOver 26
 
 ### Building the indirect argument clamp with DXC
 
+`tools/macos/victory.sh` does this by itself with the DXC that D3DMetal ships (`libdxcompiler.dylib`, x86_64 only, run under Rosetta): it builds a minimal DXC front end (`tools/macos/dxc-d3dmetal.sh`, which holds its C++ source) over that library, and sets `VICTORY_HELPER_DXC` to it unless you already set it. CrossOver's Wine has neither a `d3dcompiler` that takes the 64-thread clamp (E5005 on `RWByteAddressBuffer.Load`) nor `dxcompiler.dll`, so without this VIctory falls back to the one-thread form (`WORDS_SOURCE`), which charges every record in a single thread. D3DMetal's DXC signs its output.
+
 If you have DXC, you can build the 64-thread argument clamp from its HLSL source when cross-compiling VIctory. The compiled shader stays in Cargo’s build output. Set `VICTORY_HELPER_DXC` to a native DXC executable, or use the Wine wrapper with an x64 Microsoft DXC distribution:
 
 ```sh

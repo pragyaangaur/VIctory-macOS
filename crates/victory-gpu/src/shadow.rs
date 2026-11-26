@@ -1338,16 +1338,38 @@ pub(crate) fn parallel_copies_enabled() -> bool {
 }
 
 /// Whether `(start, len)` ranges are pairwise disjoint.
+#[cfg(test)]
 pub(crate) fn ranges_disjoint(ranges: &[(u64, u64)]) -> bool {
-    if ranges.len() < 2 {
-        return true;
-    }
-    let mut spans: Vec<(u64, u64)> = ranges
-        .iter()
-        .map(|&(start, len)| (start, start.saturating_add(len)))
-        .collect();
+    spans_disjoint(
+        ranges
+            .iter()
+            .map(|&(start, len)| (start, start.saturating_add(len)))
+            .collect(),
+    )
+}
+
+fn spans_disjoint(mut spans: Vec<(u64, u64)>) -> bool {
     spans.sort_unstable();
     spans.windows(2).all(|w| w[0].1 <= w[1].0)
+}
+
+/// Copy-back workers must own different watch pages. Distinct virtual pages
+/// may still share backing memory, so ranges with a reported alias stay serial.
+pub(crate) fn copy_back_ranges_disjoint(ranges: &[(u64, u64)]) -> bool {
+    let page = PAGE as u64;
+    let spans = ranges
+        .iter()
+        .filter(|&&(_, len)| len != 0)
+        .map(|&(start, len)| (start / page, start.saturating_add(len).div_ceil(page)));
+    spans_disjoint(spans.collect())
+        && !ranges.iter().any(|&(start, len)| {
+            len != 0 && crate::watch::aliased(start as usize, len as usize)
+        })
+}
+
+#[cfg(test)]
+thread_local! {
+    static MARKED_COPY_BACK_PARALLEL: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
 }
 
 pub(crate) fn copy_back_marks(withheld: &[(Arc<Shadow>, usize, usize)], memory_withheld: bool) {
@@ -1419,11 +1441,13 @@ pub(crate) fn copy_back_marks(withheld: &[(Arc<Shadow>, usize, usize)], memory_w
     }
     let total_bytes: usize = by_copy.iter().map(|(_, list)| list.len() * PAGE).sum();
     let shadow_ranges: Vec<(u64, u64)> = by_copy.iter().map(|(copy, _)| copy.range()).collect();
-    if parallel_copies_enabled()
+    let parallel = parallel_copies_enabled()
         && by_copy.len() >= 2
         && total_bytes >= PARALLEL_COPY_BACK_MIN_BYTES
-        && ranges_disjoint(&shadow_ranges)
-    {
+        && copy_back_ranges_disjoint(&shadow_ranges);
+    #[cfg(test)]
+    MARKED_COPY_BACK_PARALLEL.with(|taken| taken.set(Some(parallel)));
+    if parallel {
         let total_pages: usize = by_copy.iter().map(|(_, list)| list.len()).sum();
         let total_written = std::sync::atomic::AtomicUsize::new(0);
         crate::texture::in_parallel(by_copy.len(), |i| {
@@ -2107,6 +2131,9 @@ pub(crate) fn near(va: u64) -> String {
     }
     text
 }
+
+#[cfg(test)]
+mod parallel_copy_tests;
 
 #[cfg(test)]
 pub(crate) mod tests {

@@ -312,6 +312,15 @@ struct Lower<'a> {
     halves_refused: Option<Why>,
     /// [`Lower::relabelled_flat`], once made.
     relabelled: Option<V>,
+    /// In halves: per IR block, whether each lane runs it once
+    /// ([`once_per_lane`]), where lane masks can pass between the halves.
+    once: Vec<bool>,
+    /// In halves: the group-shared dwords lane masks pass through, once made
+    /// ([`Lower::ballot_across_halves`]).
+    half_masks: Option<V>,
+    /// The DXIL block the instruction being lowered starts in: every lane
+    /// running its IR block runs it (no guard of the instruction's own).
+    level: usize,
     /// In halves: VGPR values the same in every lane of the console wave
     /// ([`halves::lane_uniform`]), whose first lane either half reads.
     alike: HashSet<Value>,
@@ -842,6 +851,9 @@ impl<'a> Lower<'a> {
             halves,
             halves_refused,
             relabelled: None,
+            once: if halves { once_per_lane(p) } else { Vec::new() },
+            half_masks: None,
+            level: 0,
             alike: if halves {
                 halves::lane_uniform(x)
             } else {
@@ -1467,6 +1479,7 @@ impl<'a> Lower<'a> {
             }
         }
         self.cur = self.s.entry;
+        self.level = self.s.entry;
         if let Some(why) = self.halves_refused {
             return Err(unsupported(0, why));
         }
@@ -1520,10 +1533,12 @@ impl<'a> Lower<'a> {
                 if self.split_barriers.contains(&(b, i)) {
                     self.group_barrier();
                 }
+                self.level = self.cur;
                 self.inst(b, i)?;
                 self.mode16 = round16_after(&p.blocks[b].insts[i], self.mode16);
                 if let Some(end) = self.sections.get(&b).and_then(|s| s.get(&i)).map(|s| s.end) {
                     for j in i + 1..end {
+                        self.level = self.cur;
                         self.section_inst(b, j, i);
                     }
                     i = end;
@@ -1536,6 +1551,7 @@ impl<'a> Lower<'a> {
             }
             self.mask_ok = self.mask_data == MaskData::Console;
             self.tail[b] = Some(self.cur);
+            self.level = self.cur;
             self.exit(b)?;
         }
         self.fill_phis()?;
@@ -2079,17 +2095,20 @@ impl<'a> Lower<'a> {
         let (x, y) = match self.ballots.get(&lo) {
             Some(&xy) => xy,
             None => {
-                let at = match self.def_block.get(&lo) {
+                let def = self.def_block.get(&lo).copied();
+                let mut at = match def {
                     // Program inputs (EXEC on entry).
                     None => self.s.entry,
-                    Some(&b) if b == self.cur_ir => self.cur,
-                    Some(&b) => self.tail[b].ok_or("a lane mask written after its use")?,
+                    Some(b) if b == self.cur_ir => self.cur,
+                    Some(b) => self.tail[b].ok_or("a lane mask written after its use")?,
                 };
                 // If the whole group fits, there are no dispatched lanes in
                 // the upper half and the host ballot covers every active lane.
+                // Otherwise the halves pass their ballots to each other.
                 let single_half = self.halves && self.one_host_wave();
-                if !single_half {
-                    self.same_half("a lane mask read as data (wave64 on a 32-lane host)")?;
+                let across = self.halves && !single_half;
+                if across {
+                    at = self.across_at(def).ok_or(halves::MASK_ACROSS)?;
                 }
                 if !self.balloting.insert(lo) {
                     return Err("a lane mask whose lanes depend on its own value");
@@ -2097,19 +2116,23 @@ impl<'a> Lower<'a> {
                 let bit = self.boolean(m, at);
                 self.balloting.remove(&lo);
                 let bit = bit?;
-                let i32t = self.s.t.i32;
-                let four = self.s.m.named_struct("dx.types.fouri32", vec![i32t; 4]);
-                let r = self
-                    .s
-                    .op(at, "waveActiveBallot", Attr::NoUnwind, four, 116, &[bit]);
-                self.s.flags |= flags::WAVE_OPS;
-                let low_word = self.s.m.extract(at, r, 0);
-                let high_word = if single_half {
-                    self.s.m.i32(0)
+                let xy = if across {
+                    self.ballot_across_halves(bit, at)?
                 } else {
-                    self.s.m.extract(at, r, 1)
+                    let i32t = self.s.t.i32;
+                    let four = self.s.m.named_struct("dx.types.fouri32", vec![i32t; 4]);
+                    let r = self
+                        .s
+                        .op(at, "waveActiveBallot", Attr::NoUnwind, four, 116, &[bit]);
+                    self.s.flags |= flags::WAVE_OPS;
+                    let low_word = self.s.m.extract(at, r, 0);
+                    let high_word = if single_half {
+                        self.s.m.i32(0)
+                    } else {
+                        self.s.m.extract(at, r, 1)
+                    };
+                    (low_word, high_word)
                 };
-                let xy = (low_word, high_word);
                 self.ballots.insert(lo, xy);
                 xy
             }
@@ -11834,29 +11857,7 @@ impl<'a> Lower<'a> {
 pub(crate) fn split_wave_barriers(p: &Program) -> Option<Set<(usize, usize)>> {
     let n = p.blocks.len();
     let succ = |b: usize| p.blocks[b].exit.successors();
-    // Blocks reachable from `from`'s successors (or from `from` itself when
-    // `start`), never entering `avoid`.
-    let reach = |from: usize, start: bool, avoid: Option<usize>| {
-        let mut seen = vec![false; n];
-        let mut stack = if start { vec![from] } else { succ(from) };
-        while let Some(b) = stack.pop() {
-            if Some(b) == avoid || std::mem::replace(&mut seen[b], true) {
-                continue;
-            }
-            stack.extend(succ(b));
-        }
-        seen
-    };
-    let uniform: Vec<bool> = (0..n)
-        .map(|b| {
-            let ends_around = b != 0
-                && reach(0, true, Some(b))
-                    .iter()
-                    .enumerate()
-                    .any(|(q, &r)| r && succ(q).is_empty());
-            !reach(b, false, None)[b] && !ends_around
-        })
-        .collect();
+    let uniform = once_per_lane(p);
     let order = crate::ir::reverse_postorder(&p.blocks);
     let mut dirty_out = vec![false; n];
     loop {
@@ -11893,6 +11894,37 @@ pub(crate) fn split_wave_barriers(p: &Program) -> Option<Set<(usize, usize)>> {
             return Some(at);
         }
     }
+}
+
+/// Per block, whether each lane of the group runs it exactly once: no cycle
+/// passes through it, and every path from the entry to an end does. A group
+/// barrier needs every lane of the group, so it can go only in these.
+pub(crate) fn once_per_lane(p: &Program) -> Vec<bool> {
+    let n = p.blocks.len();
+    let succ = |b: usize| p.blocks[b].exit.successors();
+    // Blocks reachable from `from`'s successors (or from `from` itself when
+    // `start`), never entering `avoid`.
+    let reach = |from: usize, start: bool, avoid: Option<usize>| {
+        let mut seen = vec![false; n];
+        let mut stack = if start { vec![from] } else { succ(from) };
+        while let Some(b) = stack.pop() {
+            if Some(b) == avoid || std::mem::replace(&mut seen[b], true) {
+                continue;
+            }
+            stack.extend(succ(b));
+        }
+        seen
+    };
+    (0..n)
+        .map(|b| {
+            let ends_around = b != 0
+                && reach(0, true, Some(b))
+                    .iter()
+                    .enumerate()
+                    .any(|(q, &r)| r && succ(q).is_empty());
+            !reach(b, false, None)[b] && !ends_around
+        })
+        .collect()
 }
 
 #[cfg(test)]
