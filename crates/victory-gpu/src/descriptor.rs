@@ -240,6 +240,7 @@ pub(crate) fn sync_heaps() {
     // while its page is made: `Heap::drop` takes the write lock to leave the
     // list, so a heap still listed under the lock is alive.
     let page_size = crate::watch::PAGE;
+    let mut page_buf = vec![0u8; page_size];
     for (start, at, ranges) in work {
         for (from, to) in ranges {
             for page in (from & !(page_size - 1)..to).step_by(page_size) {
@@ -255,9 +256,10 @@ pub(crate) fn sync_heaps() {
                 };
                 let step = u64::from(step);
                 let (page, end) = (page.max(from), (page + page_size).min(to));
-                // By page: one with nothing mapped (the title unmaps heap
-                // pages too) holds no records.
-                if !crate::host::read_into(page as *const u8, &mut [0u8; 4]) {
+                let len = end - page;
+                // By page: read the whole mapped range once; one with nothing
+                // mapped (the title unmaps heap pages too) holds no records.
+                if !crate::host::read_into(page as *const u8, &mut page_buf[..len]) {
                     continue;
                 }
                 let (first, last) = (
@@ -269,11 +271,13 @@ pub(crate) fn sync_heaps() {
                     crate::copystat::C::SyncSlots,
                     last.min(u64::from(heap.desc.count)).saturating_sub(first),
                 );
-                host.sync_slots(
+                host.sync_slots_bytes(
                     first as u32,
                     last.min(u64::from(heap.desc.count)) as u32,
                     start,
                     step,
+                    page as u64,
+                    &page_buf[..len],
                 );
             }
         }
@@ -631,12 +635,21 @@ fn record(handle: u64, view: View) {
     mirror(handle);
 }
 
+/// Bumped whenever [`forget`] invalidates a recorded view while holding `VIEWS`.
+static VIEWS_FORGOT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+#[cfg(any(windows, test))]
+pub(crate) fn views_forgot() -> u64 {
+    VIEWS_FORGOT.load(std::sync::atomic::Ordering::Acquire)
+}
+
 /// The title released `resource`: the views naming it go stale.
 pub(crate) fn forget(resource: usize) {
     let mut views = VIEWS.write().unwrap_or_else(|e| e.into_inner());
     let Some(entries) = views.by_resource.remove(&resource) else {
         return;
     };
+    let mut removed = false;
     for i in entries {
         let (view, generation) = views.list[i as usize].clone();
         // Entries freed through a view's other resource may hold another
@@ -649,6 +662,10 @@ pub(crate) fn forget(resource: usize) {
         // The view's other resource (a counter) keeps a stale entry, which
         // `forget` of that resource skips.
         views.free.push(i);
+        removed = true;
+    }
+    if removed {
+        VIEWS_FORGOT.fetch_add(1, std::sync::atomic::Ordering::Release);
     }
 }
 
@@ -727,14 +744,12 @@ fn view_at(i: u32, generation: u32) -> Option<ViewPin> {
 
 /// For each record (tag, index, generation): whether it names a view that
 /// is current, as [`view_at`] would find it (one lock for them all).
-fn views_current(records: &[[u32; 3]]) -> Vec<bool> {
+fn views_current_into(records: &[[u32; 3]], out: &mut Vec<bool>) {
+    out.clear();
     let views = VIEWS.read().unwrap_or_else(|e| e.into_inner());
-    records
-        .iter()
-        .map(|&[tag, i, generation]| {
-            tag == VIEW_TAG && views.list.get(i as usize).is_some_and(|(_, current)| *current == generation)
-        })
-        .collect()
+    out.extend(records.iter().map(|&[tag, i, generation]| {
+        tag == VIEW_TAG && views.list.get(i as usize).is_some_and(|(_, current)| *current == generation)
+    }));
 }
 
 /// The view recorded at `handle`, if one is (and its resource is alive),
