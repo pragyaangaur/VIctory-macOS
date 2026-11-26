@@ -105,6 +105,51 @@ const HEAP_CONSTANT_WAVE32: &[u32] = &[
     0xBF81_0000, // s_endpgm
 ];
 
+/// As [`HEAP_CONSTANT_WAVE32`], storing dwords 2-9 of the constant buffer
+/// (`s_buffer_load_dwordx8` at byte 8: two loads of four dwords, the first
+/// at an offset that is not 16-byte aligned) to dwords 0-7 of the UAV.
+fn heap_constants_x8() -> Vec<u32> {
+    let mut w = HEAP_CONSTANT_WAVE32[..10].to_vec();
+    w.extend([
+        0xF42C_0504,
+        0xFA00_0008, // s_buffer_load_dwordx8 s[20:27], s[8:11], 0x8
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+    ]);
+    for k in 0..8 {
+        w.extend([
+            0x7E02_0214 + k, // v_mov_b32 v1, s[20 + k]
+            0xE070_0000 | (4 * k),
+            0x8004_0100, // buffer_store_dword v1, off, s[16:19], 0 offset:4k
+        ]);
+    }
+    w.push(0xBF81_0000); // s_endpgm
+    w
+}
+
+/// User data: s[0:1] a root CBV, s2 a table with a raw UAV. Each lane loads
+/// dwords `lane..lane + 4` of the constant buffer (`buffer_load_dwordx4` at
+/// byte `4 × lane`, all four alignments) to dwords `4 × lane..` of the UAV.
+const ROOT_CONSTANT_ROWS_WAVE32: &[u32] = &[
+    0xBE88_0300, // s_mov_b32 s8, s0
+    0xBE89_0301, // s_mov_b32 s9, s1
+    0xBE8A_03C1, // s_mov_b32 s10, -1
+    0xBE8B_03FF,
+    0x2100_0FAC, // s_mov_b32 s11, 0x21000fac
+    0xBE8C_0302, // s_mov_b32 s12, s2
+    0xBE8D_0380, // s_mov_b32 s13, 0
+    0xF408_0406,
+    0xFA00_0000, // s_load_dwordx4 s[16:19], s[12:13], 0x0
+    0x3402_0082, // v_lshlrev_b32 v1, 2, v0
+    0x340C_0084, // v_lshlrev_b32 v6, 4, v0
+    0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+    0xE038_1000,
+    0x8002_0201, // buffer_load_dwordx4 v[2:5], v1, s[8:11], 0 offen
+    0xBF8C_3F70, // s_waitcnt vmcnt(0)
+    0xE078_1000,
+    0x8004_0206, // buffer_store_dwordx4 v[2:5], v6, s[16:19], 0 offen
+    0xBF81_0000, // s_endpgm
+];
+
 /// User data: s0 a table with a raw SRV, s2 a table with a raw UAV. Each
 /// lane loads the half at byte `2 × lane` and stores it to dword `lane`.
 const HALF_LOAD_WAVE32: &[u32] = &[
@@ -421,6 +466,149 @@ fn a_constant_buffer_through_the_heap_reads_as_a_raw_buffer() {
             )
             .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
         assert_eq!(words[0], vec![9; 32], "{label}");
+        ran += 1;
+    }
+    assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
+}
+
+/// Constants read four dwords a load keep the console's bounds: a load
+/// partly past the view reads its dwords inside it (D3D12 bounds raw loads
+/// per component) and 0 past it, as the one-dword loads it replaces did.
+#[test]
+fn constants_read_four_dwords_a_load_read_zeros_past_the_view() {
+    let shader = build(
+        &heap_constants_x8(),
+        vec![
+            param(RootType::Constants, 0),
+            param(RootType::ResourceHeap, 1),
+            param(RootType::Table, 2),
+        ],
+        vec![entry(ResourceType::Uav, 4, 2)],
+        32,
+    );
+    // Five dwords: the first load reads dwords 2-5, the last past the view.
+    let data: Vec<u32> = vec![7, 8, 9, 10, 11];
+    let views = [
+        View::RawUav(32),
+        View::Buffer {
+            data: &data,
+            stride: Stride::Raw,
+        },
+    ];
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let mut ran = 0;
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else {
+            eprintln!("no SM 6.6 {label} device; skipped");
+            continue;
+        };
+        let (root, pso) = host
+            .compute_pipeline(&shader)
+            .unwrap_or_else(|e| panic!("{label}: compute_pipeline failed: {e}"));
+        let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+        for u in &shader.user_data {
+            ud[u.index as usize] = match u.root {
+                // The constants are at heap index 1, the UAV's table at 0.
+                RootType::Constants => 1,
+                RootType::Table => 0,
+                other => panic!("unexpected user data {other:?}"),
+            };
+        }
+        let words = host
+            .dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    roots: vec![
+                        (0, Root::Constants(ud)),
+                        (
+                            1,
+                            Root::View {
+                                srv: true,
+                                data: vec![4, 4],
+                            },
+                        ),
+                    ],
+                    views: &views,
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                },
+            )
+            .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
+        let mut want = vec![0; 32];
+        want[..3].copy_from_slice(&[9, 10, 11]);
+        assert_eq!(words[0], want, "{label}");
+        ran += 1;
+    }
+    assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
+}
+
+/// Constants at a computed offset of a root CBV, a row per row the four
+/// dwords touch rather than one per dword, at every alignment.
+#[test]
+fn constants_at_a_computed_offset_read_their_rows() {
+    let shader = build(
+        ROOT_CONSTANT_ROWS_WAVE32,
+        vec![
+            RootParam {
+                sgprs: 2,
+                ..param(RootType::Descriptor, 0)
+            },
+            param(RootType::Table, 2),
+        ],
+        vec![
+            UsedResource {
+                root: RootType::Descriptor,
+                ..entry(ResourceType::Cbv, 2, 0)
+            },
+            entry(ResourceType::Uav, 4, 2),
+        ],
+        32,
+    );
+    assert_eq!(shader.root_cbvs, [0]);
+    let constants: Vec<u32> = (0..64).map(|k| 0x100 + k).collect();
+    let views = [View::RawUav(128)];
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let mut ran = 0;
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else {
+            eprintln!("no SM 6.6 {label} device; skipped");
+            continue;
+        };
+        let (root, pso) = host
+            .compute_pipeline(&shader)
+            .unwrap_or_else(|e| panic!("{label}: compute_pipeline failed: {e}"));
+        // The UAV's table at heap index 0.
+        let ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+        let words = host
+            .dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    roots: vec![
+                        (0, Root::Constants(ud)),
+                        (
+                            1,
+                            Root::View {
+                                srv: false,
+                                data: constants.clone(),
+                            },
+                        ),
+                    ],
+                    views: &views,
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                },
+            )
+            .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
+        let want: Vec<u32> = (0..32)
+            .flat_map(|lane| (lane..lane + 4).map(|k| 0x100 + k))
+            .collect();
+        assert_eq!(words[0], want, "{label}");
         ran += 1;
     }
     assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");

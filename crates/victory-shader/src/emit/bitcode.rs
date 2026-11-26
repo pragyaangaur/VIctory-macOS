@@ -650,6 +650,37 @@ impl Module {
         shape
     }
 
+    /// The arguments of each call of a function named `name` that
+    /// [`Module::write`] writes, as integers where they are constants or
+    /// sums of constants (lowering adds offsets up unfolded), else `None`.
+    #[cfg(test)]
+    pub fn written_call_args(&self, name: &str) -> Vec<Vec<Option<i64>>> {
+        fn sum(m: &Module, v: V) -> Option<i64> {
+            match v {
+                V::Inst(i) => match m.insts[i as usize].op {
+                    Op::Bin(Bin::Add, a, b) => Some(i64::from(
+                        (sum(m, a)? as i32).wrapping_add(sum(m, b)? as i32),
+                    )),
+                    _ => None,
+                },
+                v => m.int_value(v),
+            }
+        }
+        let plan = self.plan();
+        let mut calls = Vec::new();
+        for &b in &plan.layout {
+            for &i in &self.blocks[b].body {
+                if let Op::Call(f, args) = &self.insts[i as usize].op
+                    && plan.live[i as usize]
+                    && self.funcs[*f as usize].name == name
+                {
+                    calls.push(args.iter().map(|&a| sum(self, a)).collect());
+                }
+            }
+        }
+        calls
+    }
+
     /// The globals and functions [`Module::write`] declares, each kept
     /// one's new index and their number: functions declared and not called,
     /// and constant globals nothing reads, are left out (the validator
