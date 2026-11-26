@@ -72,6 +72,21 @@ touch -t 202601020101 "$downloads/Game_Porting_Toolkit_4.0.dmg"
 eq "most recently modified toolkit download" "$downloads/Game_Porting_Toolkit_4.0.dmg" "$(pick_gptk)"
 mkdir "$downloads/Game_Porting_Toolkit_5.0.dmg"
 eq "toolkit-looking directories are ignored" "$downloads/Game_Porting_Toolkit_4.0.dmg" "$(pick_gptk)"
+# GPTK_DMG names the download, as for setup.sh; a named folder still wins.
+eq "GPTK_DMG names the toolkit download" "$downloads/Game_Porting_Toolkit_4.0_beta_3.dmg" \
+    "$(GPTK_DMG="$downloads/Game_Porting_Toolkit_4.0_beta_3.dmg" bash -c 'set -- help; . "$0" >/dev/null; gptk_dmg' "$FLEET_DIR/fleet.sh")"
+eq "a GPTK_DMG that is not a file is ignored" "" \
+    "$(HOME="$tmp" GPTK_DMG="$tmp/missing.dmg" bash -c 'set -- help; . "$0" >/dev/null; gptk_dmg' "$FLEET_DIR/fleet.sh")"
+
+# A failed GitHub call must not look like an empty queue.
+pick_with_gh() { # GH_STATUS: the task list as the worker reads it
+    bash -c 'status=$1; set -- help; . "$0" >/dev/null
+        brand() { echo "Apple M3 Max"; }; sw_vers() { echo 15.4; }
+        gh() { return "$status"; }
+        pick_tasks' "$FLEET_DIR/fleet.sh" "$1"
+}
+ok "an empty queue is not an error" pick_with_gh 0
+no "a failed GitHub call is an error" pick_with_gh 1
 
 # --- commands
 eq "claim" claim "$(parse_command "/claim")"
