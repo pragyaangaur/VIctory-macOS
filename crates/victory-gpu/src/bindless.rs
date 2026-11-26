@@ -156,7 +156,7 @@ fn seen(view: &View) -> Option<Seen> {
     if let View::Shader(resource, _) = view
         && let Some(texture) = crate::resource::made_copy(*resource as This)
     {
-        return crate::texture::title_written(&texture.texture).then_some(Seen::Texture(*resource));
+        return texture.title_written().then_some(Seen::Texture(*resource));
     }
     // The copy the host view reads.
     let (shadow, address, len) = match *view {
@@ -346,7 +346,7 @@ pub(crate) fn refresh_slot(
 /// Heap UAV ranges that may need to refresh a widened SRV after a later
 /// buffer barrier. Computed heap indices do not name ordinary write steps.
 pub(crate) fn widened_writes(viewed: &Viewed) -> Vec<(Arc<Shadow>, usize, usize)> {
-    if !crate::shader_cache::under_wine() {
+    if !crate::under_wine() {
         return Vec::new();
     }
     viewed

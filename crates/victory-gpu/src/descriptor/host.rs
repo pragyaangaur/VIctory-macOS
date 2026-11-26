@@ -1552,7 +1552,7 @@ fn buffer_srv(
         return None;
     }
     let host = host()?;
-    if crate::shader_cache::under_wine()
+    if crate::under_wine()
         && matches!(desc.Format.0, 6..=8)
         && let Some(w) = widened_w(desc.Format.0)
         && let Some(widened) = shadow.widened(start, u64::from(count) * 12, w)
@@ -1620,7 +1620,7 @@ fn buffer_uav(
     // void CreateUnorderedAccessView call. D3D12 exposes no D3DMetal version,
     // so keep the Wine-wide guard until 4.0 is characterized. The caller
     // installs a null UAV and keeps no resource or mark.
-    if typed_three_channel && crate::shader_cache::under_wine() {
+    if typed_three_channel && crate::under_wine() {
         once!(format, "three-channel typed unordered buffer view under Wine");
         return None;
     }
@@ -2227,7 +2227,7 @@ mod tests {
     /// supplies w in the source format and follows later title writes.
     #[test]
     fn three_channel_srvs_use_a_widened_refreshed_copy() {
-        if !crate::shader_cache::under_wine() {
+        if !crate::under_wine() {
             return;
         }
         let Some(host) = host() else { return };
@@ -3065,7 +3065,7 @@ mod tests {
     /// exercises the safe fallback instead, because raw creation aborts.
     fn characterize_r32g32b32(format: DXGI_FORMAT, scalar: &str, value: &str, expected: [u32; 3]) {
         eprintln!("typed UAV characterization: {format:?}");
-        if crate::shader_cache::under_wine() {
+        if crate::under_wine() {
             three_channel_uav_falls_back_under_wine(format);
             eprintln!("typed UAV characterization: Wine fallback passed");
             return;
