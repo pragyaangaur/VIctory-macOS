@@ -1751,6 +1751,50 @@ pub(crate) fn log_lookups(frames: f64) {
     }
 }
 
+/// Logs the host buffers the copies of title memory hold, once per report:
+/// one per title buffer and one per window of loose memory, and the
+/// zero-copy aliases, whose host buffers are the title's own memory
+/// (diagnostics).
+#[cfg(feature = "diagnostics")]
+pub(crate) fn log_held() {
+    // SAFETY: live buffers.
+    let size = |s: &Arc<Shadow>| unsafe { s.buffer.GetDesc() }.Width;
+    let held = |sizes: Vec<u64>| (sizes.len(), sizes.iter().sum::<u64>() as f64 / 1e6);
+    let buffers = held(
+        buffers_read()
+            .values()
+            .filter_map(|e| e.shadow.as_ref().map(size))
+            .collect(),
+    );
+    let loose = held(
+        LOOSE
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .values()
+            .map(size)
+            .collect(),
+    );
+    let aliased = held(
+        ALIASED
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .values()
+            .map(size)
+            .collect(),
+    );
+    tracing::info!(
+        "host buffer copies held: {:.0} MB in all: title buffers {} ({:.0} MB), loose windows {} ({:.0} MB); \
+         aliased regions {} ({:.0} MB, the title's own memory, not extra)",
+        buffers.1 + loose.1,
+        buffers.0,
+        buffers.1,
+        loose.0,
+        loose.1,
+        aliased.0,
+        aliased.1,
+    );
+}
+
 /// The copy of the innermost title buffer holding `[address, address +
 /// len)`, made on first use.
 pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {

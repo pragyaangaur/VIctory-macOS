@@ -207,6 +207,8 @@ fn pump(held: &mut Holding, why: Why) {
     let mut run = |_: usize, segments: Vec<std::sync::Arc<crate::host::HostList>>| {
         let lists: Vec<&crate::host::HostList> = segments.iter().map(|s| &**s).collect();
         let at = std::time::Instant::now();
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(crate::copystat::C::PumpExecutes, 1);
         host.execute(&lists);
         ran += at.elapsed();
         drop(lists);

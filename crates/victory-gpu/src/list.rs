@@ -553,6 +553,28 @@ const UAV_BARRIER: Barrier = Barrier {
     last: 0,
 };
 
+/// A transition barrier between two read-only states (diagnostics: such a
+/// barrier on a buffer orders nothing, but still becomes a global UAV
+/// barrier). A transition has the subresource and the state before packed
+/// in `second` (low, high 32 bits) and the state after in `last`. States
+/// are the PC bits (the console's compression hints are higher); common
+/// (none) is not counted, as it may stand for a write the title promoted
+/// from.
+#[cfg(any(all(windows, feature = "diagnostics"), test))]
+fn read_only_transition(b: &Barrier) -> bool {
+    // Vertex and constant buffer, index buffer, depth read, non-pixel and
+    // pixel shader resource, indirect argument, copy source, resolve
+    // source, ray tracing acceleration structure read, shading rate source.
+    const READ_ONLY: u32 =
+        0x1 | 0x2 | 0x20 | 0x40 | 0x80 | 0x200 | 0x800 | 0x2000 | 0x40_0000 | 0x100_0000;
+    const PC: u32 = 0x01ff_ffff;
+    let read_only = |state: u32| {
+        let state = state & PC;
+        state != 0 && state & !READ_ONLY == 0
+    };
+    b.kind == 0 && read_only((b.second >> 32) as u32) && read_only(b.last as u32)
+}
+
 /// Returns the console's barrier "actions" (none).
 extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> u32 {
     #[cfg(windows)]
@@ -569,12 +591,27 @@ extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> 
             .collect();
         // Buffers have host copies, not resources the barrier can name:
         // a barrier on one waits for every shader write before it.
-        let buffer_barrier = barriers.iter().any(|b| {
+        let on_buffer = |b: &Barrier| {
             b.kind != 1 && !b.first.is_null() && crate::resource::buffer_bytes(b.first).is_some()
-        });
+        };
+        let buffer_barrier = barriers.iter().any(on_buffer);
         let global_uav = barriers.iter().any(|b| b.kind == 2 && b.first.is_null());
         if buffer_barrier {
             host.push(UAV_BARRIER);
+            #[cfg(feature = "diagnostics")]
+            {
+                use crate::copystat::{C, add};
+                let (buffers, read_only) = barriers
+                    .iter()
+                    .filter(|b| on_buffer(b))
+                    .fold((0, 0), |(n, r), b| {
+                        (n + 1, r + u64::from(read_only_transition(b)))
+                    });
+                add(C::BufferBarriers, buffers);
+                add(C::BufferReadOnly, read_only);
+                add(C::BufferUav, 1);
+                add(C::BufferUavSkippable, u64::from(buffers == read_only));
+            }
         }
         if !host.is_empty() {
             use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_BARRIER;
@@ -1718,7 +1755,13 @@ extern "system" fn barrier_groups(this: This, count: u32, _groups: *const u8) {
             // SAFETY: the title passes `count` groups of 16 bytes: kind, count, pointer.
             let groups = unsafe { std::slice::from_raw_parts(_groups.cast::<[u32; 4]>(), count as usize) };
             list.note_op(|| format!("barrier groups {:?}", groups.iter().map(|g| (g[0], g[1])).collect::<Vec<_>>()));
+            crate::copystat::add(
+                crate::copystat::C::GroupBarriers,
+                groups.iter().map(|g| u64::from(g[1])).sum(),
+            );
         }
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(crate::copystat::C::GroupCalls, 1);
         // SAFETY: the same layout; no resource named.
         let barrier =
             unsafe { std::mem::transmute::<Barrier, D3D12_RESOURCE_BARRIER>(UAV_BARRIER) };
@@ -2082,5 +2125,38 @@ mod tests {
         for object in [buffer, list, allocator] {
             assert_eq!(release(object), 0);
         }
+    }
+
+    /// Transitions between two read-only states are told from those that
+    /// write, from common, and from other barrier kinds.
+    #[test]
+    fn read_only_transitions_need_both_states_read_only() {
+        const COMMON: u32 = 0;
+        const INDEX: u32 = 0x2;
+        const UNORDERED: u32 = 0x8;
+        const NON_PIXEL: u32 = 0x40;
+        const PIXEL: u32 = 0x80;
+        const COPY_DEST: u32 = 0x400;
+        const GENERIC_READ: u32 = 0xac3;
+        // The console's compression hints live above the PC bits.
+        const HINT: u32 = 1 << 26;
+        let transition = |kind, before: u32, after: u32| Barrier {
+            kind,
+            flags: 0,
+            first: 8 as This,
+            second: 0xffff_ffff | (u64::from(before) << 32),
+            last: u64::from(after),
+        };
+        assert!(read_only_transition(&transition(0, NON_PIXEL, PIXEL)));
+        let both = |before, after| read_only_transition(&transition(0, before, after));
+        assert!(both(GENERIC_READ, INDEX | PIXEL));
+        assert!(both(NON_PIXEL | HINT, PIXEL));
+        assert!(!read_only_transition(&transition(0, UNORDERED, PIXEL)));
+        assert!(!read_only_transition(&transition(0, PIXEL, UNORDERED)));
+        assert!(!read_only_transition(&transition(0, NON_PIXEL, COPY_DEST)));
+        assert!(!read_only_transition(&transition(0, COMMON, PIXEL)));
+        assert!(!read_only_transition(&transition(0, NON_PIXEL, COMMON)));
+        assert!(!read_only_transition(&transition(2, NON_PIXEL, PIXEL)));
+        assert!(!read_only_transition(&UAV_BARRIER));
     }
 }

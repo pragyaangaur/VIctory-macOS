@@ -1730,6 +1730,8 @@ impl Host {
         let faults = crate::copystat::page_faults();
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::Submissions, 1);
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(crate::copystat::C::ExecuteLists, runs.len() as u64);
         // Host textures the title has not used for a while (or past the
         // card's budget) are given up first: the last submission has run.
         crate::resource::evict_unused();
@@ -4256,6 +4258,7 @@ impl Meter {
                         crate::list::UPLOADS[1].load(Ordering::Relaxed) as f64 / 1e6,
                     );
                 }
+                crate::shadow::log_held();
                 let [gpu, title] = crate::resource::texture_census().map(|r| r.map(|b| b as f64 / 1e6));
                 tracing::info!(
                     "host texture MB (used by lists, viewed by heap slots only, neither): GPU-written {:.0} {:.0} {:.0}, \
