@@ -6,7 +6,7 @@ use std::ffi::OsStr;
 ///
 /// A switch used to be on whenever its variable existed, so `VICTORY_D3D12_WARP=0` (typed to switch it off, or left
 /// over from comparing two runs) still selected the software adapter. Any other value keeps the old meaning.
-fn value_is_on(value: Option<&OsStr>) -> bool {
+pub(crate) fn value_is_on(value: Option<&OsStr>) -> bool {
     value.is_some_and(|v| v != "0")
 }
 

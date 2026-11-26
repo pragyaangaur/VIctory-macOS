@@ -332,7 +332,26 @@ fn with_resources(
 #[cfg(windows)]
 fn link_mesh_outputs() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| crate::switch::on("VICTORY_LINK_MESH_OUTPUTS"))
+    // On by default under Wine (D3DMetal): an over-limit mesh pipeline there
+    // is made, draws nothing and its submission never completes (#172).
+    *ON.get_or_init(|| match std::env::var_os("VICTORY_LINK_MESH_OUTPUTS") {
+        Some(v) => crate::switch::value_is_on(Some(&v)),
+        None => crate::shader_cache::under_wine(),
+    })
+}
+
+/// Whether a mesh pipeline whose outputs are still over Metal's 32 KiB after
+/// linking is refused rather than made. On by default under Wine: on
+/// D3DMetal (3.0 and 4.0 beta 3) such a pipeline hangs the queue for good,
+/// and the title's watchdog then ends the run (#172). Its draws are
+/// dropped instead. `VICTORY_MESH_OVER_LIMIT=1` makes it anyway.
+#[cfg(windows)]
+pub(crate) fn refuse_over_limit_mesh() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| match std::env::var_os("VICTORY_MESH_OVER_LIMIT") {
+        Some(v) => !crate::switch::value_is_on(Some(&v)),
+        None => crate::shader_cache::under_wine(),
+    })
 }
 
 #[cfg(windows)]

@@ -64,6 +64,8 @@ pub(crate) struct State {
     /// Bound render target and depth resources, for their host states.
     targets: Vec<usize>,
     depth: usize,
+    /// Last render target and depth keys set on the host list.
+    host_targets: Option<(Vec<TargetKey>, Option<TargetKey>)>,
     /// None leaves the host list's default bounds (0..1) in place.
     depth_bounds: Option<(f32, f32)>,
     /// The title's primitive topology (the host's may differ).
@@ -200,6 +202,19 @@ pub(crate) fn dispatched() -> u64 {
     DISPATCHED.load(Ordering::Relaxed)
 }
 
+/// What a render target or depth view of the host is made from: the host
+/// texture (0 for a null view) and [`crate::descriptor::RtvRecord::key`].
+type TargetKey = (usize, (usize, [u32; 7]));
+
+fn bind_cache_enabled_value(value: Option<&std::ffi::OsStr>) -> bool {
+    value != Some(std::ffi::OsStr::new("0"))
+}
+
+fn bind_cache_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| bind_cache_enabled_value(std::env::var_os("VICTORY_BIND_CACHE").as_deref()))
+}
+
 /// The host address of a root view: its buffer's host copy, or for a
 /// constant buffer not 256-byte aligned there (the console needs 16) a
 /// copy in upload memory. What shaders write through a root UAV goes back
@@ -221,9 +236,7 @@ fn root_view(list: &HostList, address: u64, srv: bool, uav: bool) -> Option<u64>
         }
         return Some(gpu);
     }
-    let (gpu, to) = list.scratch(len)?;
-    list.defer_fill(to, address as *const u8, len as usize);
-    Some(gpu)
+    list.fill_scratch(address as *const u8, len)
 }
 
 macro_rules! once {
@@ -344,6 +357,7 @@ impl State {
     pub(crate) fn host_state_lost(&mut self) {
         // No title heaps (0) differ from what the host list has, too.
         (self.host_pipeline, self.host_roots, self.host_heaps) = (0, [0; 2], [usize::MAX; 2]);
+        self.host_targets = None;
     }
 
     pub(crate) fn set_heaps(&mut self, heaps: &[This]) {
@@ -417,7 +431,8 @@ impl State {
             return;
         };
         self.targets.clear();
-        let mut rtvs = Vec::new();
+        let mut rtv_views = Vec::with_capacity(handles.len());
+        let mut rtv_keys = Vec::with_capacity(handles.len());
         for &h in handles {
             let Some(record) = crate::descriptor::rtv_record(h) else {
                 once!(
@@ -432,16 +447,36 @@ impl State {
             self.targets.push(record.resource as usize);
             #[cfg(feature = "diagnostics")]
             crate::capture::note_target(list, record.resource);
-            rtvs.push(host.rtv(&texture, record.desc().as_ref()));
+            rtv_keys.push((texture.as_raw() as usize, record.key()));
+            rtv_views.push((texture, record.desc()));
         }
         self.depth = 0;
-        let dsv = crate::descriptor::dsv_record(depth).and_then(|record| {
-            let texture = crate::resource::host_resource(record.resource)?;
+        let mut dsv_view = None;
+        let mut dsv_key = None;
+        if let Some(record) = crate::descriptor::dsv_record(depth)
+            && let Some(texture) = crate::resource::host_resource(record.resource)
+        {
             self.depth = record.resource as usize;
             #[cfg(feature = "diagnostics")]
             crate::capture::note_target(list, record.resource);
-            Some(host.dsv(&texture, record.depth_desc().as_ref()))
-        });
+            dsv_key = Some((texture.as_raw() as usize, record.key()));
+            dsv_view = Some((texture, record.depth_desc()));
+        }
+        if bind_cache_enabled()
+            && self
+                .host_targets
+                .as_ref()
+                .is_some_and(|(r, d)| r == &rtv_keys && d == &dsv_key)
+        {
+            return;
+        }
+        let rtvs: Vec<_> = rtv_views
+            .iter()
+            .map(|(texture, desc)| host.rtv(texture, desc.as_ref()))
+            .collect();
+        let dsv = dsv_view
+            .as_ref()
+            .map(|(texture, desc)| host.dsv(texture, desc.as_ref()));
         // SAFETY: an open list; the views were just made.
         unsafe {
             list.list.OMSetRenderTargets(
@@ -451,6 +486,7 @@ impl State {
                 dsv.as_ref().map(std::ptr::from_ref),
             )
         };
+        self.host_targets = Some((rtv_keys, dsv_key));
     }
 
     /// The user-data value of a root argument, as translated shaders read
@@ -656,10 +692,8 @@ impl State {
                 self.apply_depth_bounds(list);
             }
             self.host_pipeline = p.pso.as_raw() as usize;
-            list.used_pipeline(&p.name);
             // The title may release the pipeline before it submits the list.
-            list.keep(&p.pso);
-            list.keep(&p.root);
+            list.bind_pipeline(&p.name, &p.pso, &p.root);
         }
         #[cfg(feature = "diagnostics")]
         crate::capture::binding(&p.name);
@@ -4349,6 +4383,9 @@ void main(uint3 id : SV_DispatchThreadID) {
         }
     }
 
+    #[path = "r16_volume_fixture.rs"]
+    mod r16_volume_fixture;
+
     /// A texture written through an unordered view and copied into a title
     /// buffer (a read back) reaches the buffer's title memory once the
     /// submission has run (#50: the title waited on such a copy).
@@ -4716,5 +4753,28 @@ void main(uint3 id : SV_DispatchThreadID) {
             assert_eq!(host.log_messages(), None, "case {case} D3D12 debug errors");
             let _ = kept_obj;
         }
+    }
+
+    #[test]
+    fn bind_cache_switch_defaults_on_and_disables_with_zero() {
+        use std::ffi::OsStr;
+        assert!(bind_cache_enabled_value(None));
+        assert!(bind_cache_enabled_value(Some(OsStr::new("1"))));
+        assert!(!bind_cache_enabled_value(Some(OsStr::new("0"))));
+    }
+
+    #[test]
+    fn set_targets_caches_keys_and_clears_on_host_state_lost() {
+        let Some(host) = crate::host::host() else { return };
+        let Ok(list) = host.new_list() else { return };
+        let mut state = State::default();
+        state.set_targets(&list, &[], 0);
+        assert!(state.host_targets.is_some());
+        let cached = state.host_targets.clone();
+        state.set_targets(&list, &[], 0);
+        assert_eq!(state.host_targets, cached);
+        state.host_state_lost();
+        assert!(state.host_targets.is_none());
+        list.close();
     }
 }
