@@ -461,6 +461,28 @@ impl HostPipeline {
             }
             None => stages,
         };
+        if super::refuse_over_limit_mesh()
+            && let Some((ms, _)) = stages.iter().find(|(_, v)| *v == D3D12_SHADER_VISIBILITY_MESH)
+            && let Some(t) = ms.translated()
+            // The larger of the packed count and the aligned layout: shaders
+            // the packed count puts under the limit (34,816 bytes aligned,
+            // #172) still hang the queue.
+            && let Some(bytes) = victory_shader::emit::mesh_outputs(&t.host.dxil)
+                .map(|o| o.bytes())
+                .max(metal_mesh_bytes(&t.host.dxil))
+            && bytes > victory_shader::emit::METAL_MESH_OUTPUT_BYTES
+        {
+            tracing::warn!(
+                ?shaders,
+                bytes,
+                "mesh outputs over Metal's 32 KiB after linking: pipeline refused \
+                 (VICTORY_MESH_OVER_LIMIT=1 makes it)"
+            );
+            return refuse(
+                "the mesh shader's outputs take more than the host GPU allows",
+                shaders,
+            );
+        }
         let host = host()?;
         // `SFI0`: 64-bit atomics on typed resources and on heap resources.
         let atomics64 = stages.iter().any(|(s, _)| {
@@ -952,6 +974,63 @@ fn root_signature(
             std::slice::from_raw_parts(blob.GetBufferPointer().cast::<u8>(), blob.GetBufferSize());
         Ok((device.CreateRootSignature(0, bytes)?, bytes.to_vec()))
     }
+}
+
+/// Output bytes as Apple's Metal counts them for a translated mesh shader
+/// (measured on D3DMetal): per vertex, clip/cull distances, position, then
+/// remaining outputs in signature order, aligned to own size; same for
+/// primitives; multiplied by declared max counts.
+pub(crate) fn metal_mesh_bytes(dxil: &[u8]) -> Option<u32> {
+    let u32_at = |b: &[u8], at: usize| {
+        b.get(at..at + 4)
+            .map(|v| u32::from_le_bytes(v.try_into().expect("4 bytes")) as usize)
+    };
+    let part = |name: &[u8; 4]| {
+        (0..u32_at(dxil, 28)?).find_map(|i| {
+            let at = u32_at(dxil, 32 + 4 * i)?;
+            (dxil.get(at..at + 4)? == name)
+                .then(|| dxil.get(at + 8..at + 8 + u32_at(dxil, at + 4)?))
+                .flatten()
+        })
+    };
+    let elements = |name: &[u8; 4]| -> Option<Vec<(usize, u32)>> {
+        let Some(data) = part(name) else {
+            return Some(Vec::new());
+        };
+        (0..u32_at(data, 0)?)
+            .map(|i| {
+                let at = 8 + 32 * i;
+                let mask = *data.get(at + 24)?;
+                Some((u32_at(data, at + 12)?, mask.count_ones()))
+            })
+            .collect()
+    };
+    const POSITION: usize = 1;
+    const DISTANCES: [usize; 2] = [2, 3];
+    let layout = |sizes: &mut dyn Iterator<Item = u32>| {
+        sizes
+            .filter(|&size| size > 0)
+            .fold(0, |end: u32, size| end.next_multiple_of(size) + size)
+    };
+    let vertex = elements(b"OSG1")?;
+    let distances = vertex
+        .iter()
+        .filter(|(kind, _)| DISTANCES.contains(kind))
+        .map(|&(_, n)| n)
+        .sum::<u32>();
+    let vertex_bytes = layout(
+        &mut std::iter::repeat_n(4, distances as usize)
+            .chain([16])
+            .chain(vertex.iter().filter(|e| e.0 != POSITION).map(|e| 4 * e.1)),
+    );
+    let primitive_bytes = layout(&mut elements(b"PSG1")?.iter().map(|e| 4 * e.1));
+    let info = part(b"PSV0")?.get(4..)?;
+    let maximum = |at: usize| {
+        Some(u32::from(u16::from_le_bytes(
+            info.get(at..at + 2)?.try_into().ok()?,
+        )))
+    };
+    Some(maximum(12)? * vertex_bytes + maximum(14)? * primitive_bytes)
 }
 
 #[cfg(test)]
