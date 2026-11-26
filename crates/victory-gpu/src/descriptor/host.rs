@@ -13,8 +13,10 @@ use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 
 use super::paged::Paged;
-use super::{VIEW_TAG, View, ViewPin, view_at, views_current};
+use super::{VIEW_TAG, View, ViewPin, view_at, views_current_into, views_forgot};
 use crate::host::host;
+
+const SYNC_BLOCK_SLOTS: u32 = 128;
 
 pub(crate) struct HostHeap {
     pub(crate) heap: ID3D12DescriptorHeap,
@@ -28,6 +30,11 @@ pub(crate) struct HostHeap {
     sampler: bool,
     /// The record (view index and generation) each slot was last made from.
     made: Mutex<Vec<u64>>,
+    /// One bit per slot: whether `made[index] != 0`, so empty slots skip
+    /// `made` and `VIEWS` locks during `sync_slots`.
+    made_nonzero: Box<[AtomicU64]>,
+    /// Per `SYNC_BLOCK_SLOTS` block, the `views_forgot()` epoch last verified.
+    block_forgot: Box<[AtomicU64]>,
     /// Per title slot, its record once the slot is made from it and holds
     /// what a draw reads (a texture's view not left null), else 0: what
     /// [`HostHeap::mirror`] finds without the `made` lock, which every
@@ -226,6 +233,12 @@ impl HostHeap {
             dynamic: extra,
             sampler,
             made: Mutex::new(vec![0; count as usize]),
+            made_nonzero: (0..(count as usize).div_ceil(64))
+                .map(|_| AtomicU64::new(0))
+                .collect(),
+            block_forgot: (0..(count as usize).div_ceil(SYNC_BLOCK_SLOTS as usize))
+                .map(|_| AtomicU64::new(0))
+                .collect(),
             ready: (0..count).map(|_| AtomicU64::new(0)).collect(),
             kept: Mutex::new(Paged::new((count + extra) as usize)),
             nulled_unordered: Mutex::new(Vec::new()),
@@ -776,31 +789,107 @@ impl HostHeap {
         }
     }
 
+    fn set_made_nonzero(&self, index: u32, nonzero: bool) {
+        let word = &self.made_nonzero[(index / 64) as usize];
+        let mask = 1u64 << (index % 64);
+        if nonzero {
+            word.fetch_or(mask, Ordering::Release);
+        } else {
+            word.fetch_and(!mask, Ordering::Release);
+        }
+    }
+
+    fn made_is_nonzero(&self, index: u32) -> bool {
+        let word = self.made_nonzero[(index / 64) as usize].load(Ordering::Acquire);
+        (word >> (index % 64)) & 1 != 0
+    }
+
     /// A heap sync of slots `first..last`, whose records are at `start` +
     /// index × `step`: [`HostHeap::mirror`] of each slot whose record
-    /// differs from what the slot holds, the rest passed by as `mirror`
-    /// would, with one lock of each kind for them all instead of two per slot
-    /// (a world frame looks at ~700,000 slots, run perf3: ~75 ms).
+    /// differs from what the slot holds, skipping empty and already-verified
+    /// slots locklessly when no views were forgotten.
+    #[cfg(test)]
     pub(crate) fn sync_slots(&self, first: u32, last: u32, start: u64, step: u64) {
+        self.sync_slots_bytes(first, last, start, step, 0, &[]);
+    }
+
+    /// Like [`HostHeap::sync_slots`], reading records that lie inside
+    /// `buf` (`[buf_start, buf_start + buf.len())`) without re-reading title memory.
+    pub(crate) fn sync_slots_bytes(
+        &self,
+        first: u32,
+        last: u32,
+        start: u64,
+        step: u64,
+        buf_start: u64,
+        buf: &[u8],
+    ) {
+        let last = last.min(self.count);
+        if first >= last {
+            return;
+        }
         let at = |i: u32| start + u64::from(i) * step;
-        // SAFETY: records in title heap memory the caller found mapped.
-        let records: Vec<[u32; 3]> =
-            (first..last).map(|i| unsafe { (at(i) as *const [u32; 3]).read_unaligned() }).collect();
-        let current = views_current(&records);
-        let stale: Vec<u32> = {
+        let forgot = views_forgot();
+        let b_first = first / SYNC_BLOCK_SLOTS;
+        let b_last = (last - 1) / SYNC_BLOCK_SLOTS;
+        let blocks_verified = (b_first..=b_last)
+            .all(|b| self.block_forgot[b as usize].load(Ordering::Acquire) == forgot);
+
+        let buf_end = buf_start.saturating_add(buf.len() as u64);
+        let mut stale: Vec<u32> = Vec::new();
+        let mut candidates: Vec<(u32, [u32; 3])> = Vec::new();
+
+        for i in first..last {
+            let addr = at(i);
+            let record = if addr >= buf_start && addr.saturating_add(12) <= buf_end {
+                let off = (addr - buf_start) as usize;
+                // SAFETY: `off + 12 <= buf.len()`, unaligned copy of 12 bytes.
+                unsafe { buf.as_ptr().add(off).cast::<[u32; 3]>().read_unaligned() }
+            } else {
+                // SAFETY: record in title heap memory the caller found mapped.
+                unsafe { (addr as *const [u32; 3]).read_unaligned() }
+            };
+            let [tag, view, generation] = record;
+            if tag != VIEW_TAG {
+                if self.made_is_nonzero(i) {
+                    stale.push(i);
+                }
+                continue;
+            }
+            let key = u64::from(generation) << 32 | u64::from(view);
+            if blocks_verified && self.ready[i as usize].load(Ordering::Acquire) == key {
+                continue;
+            }
+            candidates.push((i, record));
+        }
+
+        if !candidates.is_empty() {
+            let records: Vec<[u32; 3]> = candidates.iter().map(|&(_, r)| r).collect();
+            let mut current = Vec::with_capacity(records.len());
+            views_current_into(&records, &mut current);
             let made = self.made.lock().unwrap_or_else(|e| e.into_inner());
-            (first..last)
-                .zip(records.iter().zip(current))
-                .filter(|&(i, (&[_, view, generation], current))| match made.get(i as usize) {
-                    Some(&m) if current => m != u64::from(generation) << 32 | u64::from(view),
+            for (&(i, [_, view, generation]), is_current) in candidates.iter().zip(current) {
+                let changed = match made.get(i as usize) {
+                    Some(&m) if is_current => m != (u64::from(generation) << 32 | u64::from(view)),
                     Some(&m) => m != 0,
                     None => true,
-                })
-                .map(|(i, _)| i)
-                .collect()
-        };
+                };
+                if changed {
+                    stale.push(i);
+                }
+            }
+        }
+
         for i in stale {
             self.mirror(i, at(i), false);
+        }
+
+        for b in b_first..=b_last {
+            let b_start = b * SYNC_BLOCK_SLOTS;
+            let b_end = ((b + 1) * SYNC_BLOCK_SLOTS).min(self.count);
+            if first <= b_start && last >= b_end {
+                self.block_forgot[b as usize].store(forgot, Ordering::Release);
+            }
         }
     }
 
@@ -886,6 +975,7 @@ impl HostHeap {
             if made[index as usize] != 0 {
                 self.ready[index as usize].store(0, Ordering::Relaxed);
                 made[index as usize] = 0;
+                self.set_made_nonzero(index, false);
                 self.make_null(index);
                 self.note_address(index, None);
             }
@@ -934,6 +1024,7 @@ impl HostHeap {
                 crate::shadow::forget_read(index);
             }
             made[index as usize] = key;
+            self.set_made_nonzero(index, true);
             let (kept, mark) = if later {
                 (None, None)
             } else {
@@ -1031,7 +1122,11 @@ impl HostHeap {
     pub(crate) fn remake_unordered(&self, start: u64, step: u64) -> usize {
         let slots = std::mem::take(&mut *self.nulled_unordered.lock().unwrap_or_else(|e| e.into_inner()));
         for &index in &slots {
-            self.made.lock().unwrap_or_else(|e| e.into_inner())[index as usize] = 0;
+            {
+                let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
+                made[index as usize] = 0;
+                self.set_made_nonzero(index, false);
+            }
             self.mirror(index, start + u64::from(index) * step, true);
         }
         slots.len()
@@ -3114,5 +3209,61 @@ mod tests {
             "-1, -2, -3",
             [(-1i32) as u32, (-2i32) as u32, (-3i32) as u32],
         );
+    }
+
+    #[test]
+    fn sync_slots_skips_empty_and_clears_after_forget() {
+        use crate::object::{HRESULT, S_OK};
+        let Some(host) = HostHeap::new(false, 256) else {
+            return;
+        };
+        let desc: [u32; 14] = [1, 0, 0, 0, 64, 0, 1, 1 | 1 << 16, 0, 1, 0, 0, 0, 0];
+        let properties = [1u32, 0, 0, 0, 0];
+        let mut resource = std::ptr::null();
+        let iid = crate::object::guid(
+            0x696442be,
+            0xa72e,
+            0x4059,
+            [0xbc, 0x79, 0x5b, 0x5c, 0x98, 0x04, 0x0f, 0xad],
+        );
+        let made: HRESULT = crate::resource::create_committed(
+            std::ptr::null(),
+            properties.as_ptr().cast(),
+            0,
+            desc.as_ptr().cast(),
+            0,
+            std::ptr::null(),
+            &iid,
+            &mut resource,
+        );
+        assert_eq!(made, S_OK);
+
+        let mut title_heap = vec![0u8; 256 * 32];
+        let start = title_heap.as_ptr() as u64;
+        crate::descriptor::create_srv(
+            std::ptr::null(),
+            resource,
+            std::ptr::null(),
+            start,
+        );
+        host.sync_slots_bytes(0, 128, start, 32, start, &title_heap[..128 * 32]);
+        assert!(host.made(0));
+        assert!(host.made_is_nonzero(0));
+        assert!(!host.made(1));
+        assert!(!host.made_is_nonzero(1));
+
+        // Second sync over the verified block keeps slot 0 live and skips empty slots.
+        host.sync_slots_bytes(0, 128, start, 32, start, &title_heap[..128 * 32]);
+        assert!(host.made(0));
+
+        // Forgetting the resource bumps VIEWS_FORGOT so the verified block re-checks
+        // and clears slot 0 even though the title memory bytes didn't change.
+        crate::descriptor::forget(resource as usize);
+        host.sync_slots_bytes(0, 128, start, 32, start, &title_heap[..128 * 32]);
+        assert!(!host.made(0));
+        assert!(!host.made_is_nonzero(0));
+
+        crate::object::release(resource);
+        let _ = title_heap.as_mut_ptr();
     }
 }
