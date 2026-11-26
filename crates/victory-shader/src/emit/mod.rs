@@ -3143,4 +3143,185 @@ mod tests {
             }
         }
     }
+
+    /// The pack set is nonempty when the mesh and pixel stages split the
+    /// same row across several elements and hold it alike. The packed element
+    /// is named `VREG` and indexed by its row, so both stages name it the
+    /// same way. The semantics are preserved: the packed element covers the
+    /// same columns the split elements did.
+    #[test]
+    fn pack_rows_returns_nonempty_set_for_split_rows_held_alike() {
+        // The mesh's outputs: row 0 (SV_Position) and row 1 split into
+        // TEXCOORD0 (cols 0-1) and TEXCOORD1 (cols 2-3).
+        let ms_outputs = vec![
+            SigElement {
+                name: "SV_Position".into(),
+                index: 0,
+                kind: 3,
+                comp: 9,
+                interp: 0,
+                row: Some(0),
+                col: 0,
+                cols: 4,
+                usage: 0xF,
+                half: false,
+            },
+            SigElement {
+                name: "TEXCOORD".into(),
+                index: 0,
+                kind: 0,
+                comp: 9,
+                interp: 0,
+                row: Some(1),
+                col: 0,
+                cols: 2,
+                usage: 0x3,
+                half: false,
+            },
+            SigElement {
+                name: "TEXCOORD".into(),
+                index: 1,
+                kind: 0,
+                comp: 9,
+                interp: 0,
+                row: Some(1),
+                col: 2,
+                cols: 2,
+                usage: 0xC,
+                half: false,
+            },
+        ];
+
+        // The pixel's inputs: row 0 (SV_Position) and row 1 split into
+        // TEXCOORD0 (cols 0-1) and TEXCOORD1 (cols 2-3), held alike.
+        let ps_inputs = vec![
+            SigElement {
+                name: "SV_Position".into(),
+                index: 0,
+                kind: 3,
+                comp: 9,
+                interp: 0,
+                row: Some(0),
+                col: 0,
+                cols: 4,
+                usage: 0,
+                half: false,
+            },
+            SigElement {
+                name: "TEXCOORD".into(),
+                index: 0,
+                kind: 0,
+                comp: 9,
+                interp: 0,
+                row: Some(1),
+                col: 0,
+                cols: 2,
+                usage: 0,
+                half: false,
+            },
+            SigElement {
+                name: "TEXCOORD".into(),
+                index: 1,
+                kind: 0,
+                comp: 9,
+                interp: 0,
+                row: Some(1),
+                col: 2,
+                cols: 2,
+                usage: 0,
+                half: false,
+            },
+        ];
+
+        // Build minimal NativePrograms with no 16-bit rows.
+        let ms_native = NativeProgram {
+            stage: HwStage::Ms,
+            wave64: false,
+            vgprs: 0,
+            layout: vec![],
+            used: vec![],
+            io: StageIo::Ms(crate::native::MeshIo {
+                outputs: vec![],
+                clip_cntl: 0,
+                threads: 64,
+                max_vertices: 64,
+                max_primitives: 64,
+                topology: 2,
+                lds_bytes: 0,
+            }),
+            code: vec![],
+        };
+        let ps_native = NativeProgram {
+            stage: HwStage::Ps,
+            wave64: false,
+            vgprs: 0,
+            layout: vec![],
+            used: vec![],
+            io: StageIo::Ps {
+                inputs: vec![],
+                input_addr: 0,
+                db_shader_control: 0,
+                patches: vec![],
+            },
+            code: vec![],
+        };
+
+        // With packing off, the pack set is empty.
+        let pack_off = pack_rows(
+            &ms_outputs,
+            &ps_inputs,
+            &ms_native,
+            &ps_native,
+            Options::default(),
+        );
+        assert!(pack_off.is_empty(), "pack set should be empty when packing is off");
+
+        // With packing on, the pack set contains row 1.
+        let pack_on = pack_rows(
+            &ms_outputs,
+            &ps_inputs,
+            &ms_native,
+            &ps_native,
+            Options {
+                pack_mesh_outputs: true,
+                ..Options::default()
+            },
+        );
+        assert!(
+            pack_on.contains(&1),
+            "row 1 should be in the pack set (split on both stages, same layout)"
+        );
+        assert_eq!(pack_on.len(), 1, "only row 1 should be packed");
+
+        // Now test that coalesce produces the expected VREG element.
+        let mut ms_packed = ms_outputs.clone();
+        pack::coalesce(&mut ms_packed, &pack_on);
+        let ms_row1: Vec<_> = ms_packed.iter().filter(|e| e.row == Some(1)).collect();
+        assert_eq!(
+            ms_row1.len(),
+            1,
+            "mesh row 1 should have 1 element after packing"
+        );
+        assert_eq!(ms_row1[0].name, "VREG");
+        assert_eq!(ms_row1[0].index, 1);
+        assert_eq!(ms_row1[0].col, 0);
+        assert_eq!(ms_row1[0].cols, 4, "packed element should cover cols 0-3");
+        assert_eq!(ms_row1[0].kind, 0);
+        assert_eq!(ms_row1[0].comp, 9);
+
+        let mut ps_packed = ps_inputs.clone();
+        pack::coalesce(&mut ps_packed, &pack_on);
+        let ps_row1: Vec<_> = ps_packed.iter().filter(|e| e.row == Some(1)).collect();
+        assert_eq!(
+            ps_row1.len(),
+            1,
+            "pixel row 1 should have 1 element after packing"
+        );
+        assert_eq!(ps_row1[0].name, "VREG");
+        assert_eq!(ps_row1[0].index, 1);
+        assert_eq!(ps_row1[0].col, 0);
+        assert_eq!(ps_row1[0].cols, 4, "packed element should cover cols 0-3");
+        assert_eq!(ps_row1[0].kind, 0);
+        assert_eq!(ps_row1[0].comp, 9);
+    }
 }
