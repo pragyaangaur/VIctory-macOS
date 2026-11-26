@@ -1835,20 +1835,46 @@ pub mod low_guards {
     mod tests {
         use super::*;
 
-        static TEST: Mutex<()> = Mutex::new(());
+        // retry deliberately releases address space. Other HLE tests allocate in
+        // the same process, so a mutex between these two tests cannot protect it.
+        fn ran_in_child() -> bool {
+            const CHILD: &str = "VICTORY_TEST_LOW_GUARD_CHILD";
+            let thread = std::thread::current();
+            let name = thread.name().expect("named test thread");
+            if std::env::var(CHILD).as_deref() == Ok(name) {
+                return false;
+            }
+            let result = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", name, "--nocapture"])
+                .env(CHILD, name)
+                .output()
+                .expect("run low guard test in a child");
+            let stdout = String::from_utf8_lossy(&result.stdout);
+            assert!(
+                result.status.success() && stdout.contains("1 passed"),
+                "{name}: {}\n{stdout}{}",
+                result.status,
+                String::from_utf8_lossy(&result.stderr)
+            );
+            true
+        }
+
+        fn reserve_test_guard() -> usize {
+            // SAFETY: reserve fresh address space with the same flags as guard().
+            let base =
+                unsafe { VirtualAlloc(std::ptr::null(), 4 * GRANULE, MEM_RESERVE, PAGE_NOACCESS) }
+                    as usize;
+            assert_ne!(base, 0);
+            guards().push((base, 4 * GRANULE));
+            base
+        }
 
         #[test]
         fn a_refused_retry_leaves_the_guards_in_place() {
-            let _one = TEST.lock().unwrap();
-            // SAFETY: a fresh reservation, released at once.
-            let hole =
-                unsafe { VirtualAlloc(std::ptr::null(), 4 * GRANULE, MEM_RESERVE, PAGE_NOACCESS) };
-            assert!(!hole.is_null());
-            let first = hole as usize;
-            // SAFETY: ours.
-            assert_ne!(unsafe { VirtualFree(hole, 0, MEM_RELEASE) }, 0);
-            assert!(guard(first, 4 * GRANULE));
-            guards().push((first, 4 * GRANULE));
+            if ran_in_child() {
+                return;
+            }
+            let first = reserve_test_guard();
             let mut attempts = 0;
             let result = retry(4 * GRANULE, || {
                 attempts += 1;
@@ -1859,23 +1885,16 @@ pub mod low_guards {
             assert!(guards().contains(&(first, 4 * GRANULE)));
             guards().retain(|&(base, _)| base != first);
             // SAFETY: the guard the retry put back, ours.
-            assert_ne!(unsafe { VirtualFree(hole, 0, MEM_RELEASE) }, 0);
+            assert_ne!(unsafe { VirtualFree(first as *mut _, 0, MEM_RELEASE) }, 0);
         }
 
         /// A released guard is guarded again around what took part of it.
         #[test]
         fn a_released_guard_is_guarded_again_around_what_took_it() {
-            let _one = TEST.lock().unwrap();
-            // A known hole of four granules: reserved, then freed.
-            // SAFETY: a fresh reservation, released at once.
-            let hole =
-                unsafe { VirtualAlloc(std::ptr::null(), 4 * GRANULE, MEM_RESERVE, PAGE_NOACCESS) }
-                    as usize;
-            assert_ne!(hole, 0);
-            // SAFETY: ours.
-            unsafe { VirtualFree(hole as *mut _, 0, MEM_RELEASE) };
-            assert!(guard(hole, 4 * GRANULE));
-            guards().push((hole, 4 * GRANULE));
+            if ran_in_child() {
+                return;
+            }
+            let hole = reserve_test_guard();
             let taken = retry(GRANULE, || {
                 // SAFETY: a reservation of the first granule at a known address.
                 unsafe { VirtualAlloc(hole as *const _, GRANULE, MEM_RESERVE, PAGE_NOACCESS) }
