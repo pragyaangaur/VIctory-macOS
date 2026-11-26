@@ -819,9 +819,10 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn list_scratch_grows_to_fit_and_reuses_fenced_chunks() {
+    fn list_scratch_grows_to_fit_and_keeps_what_the_last_cycle_reached() {
         let Some(host) = host() else { return };
         let list = host.new_list().unwrap();
+        let chunks = || list.scratch.lock().unwrap().chunks.len();
         let first = list.scratch(1).unwrap();
         let second = list.scratch(1).unwrap();
         assert_eq!(second.0 - first.0, 256);
@@ -829,17 +830,35 @@ pub(crate) mod tests {
         assert_eq!(list.scratch.lock().unwrap().chunks[0].capacity, FIRST_SCRATCH_CHUNK);
         let large = list.scratch(96 << 10).unwrap();
         assert_eq!(list.scratch.lock().unwrap().chunks[1].capacity, 128 << 10);
+        let wide = list.scratch(200 << 10).unwrap();
+        assert_eq!(list.scratch.lock().unwrap().chunks[2].capacity, 256 << 10);
         assert!(list.scratch(u64::MAX).is_none());
         assert!(list.scratch(SCRATCH_CHUNK + 1).is_some());
         list.close();
         host.execute(&[&list]);
         list.reset();
+        // The cycle reached the third chunk: all kept, at their addresses.
         assert_eq!(list.scratch(96 << 10).unwrap(), large);
-        assert_eq!(list.scratch.lock().unwrap().chunks.len(), 2);
+        assert_eq!(list.scratch(200 << 10).unwrap(), wide);
+        assert_eq!(chunks(), 3);
         list.close();
         host.execute(&[&list]);
         list.reset();
+        // One that reached the second: the third stays (one chunk of slack).
+        assert_eq!(list.scratch(96 << 10).unwrap(), large);
+        list.close();
+        host.execute(&[&list]);
+        list.reset();
+        assert_eq!(chunks(), 3);
+        // One that stayed in the first: the third goes (the old rule kept
+        // every chunk for good), the second stays.
         assert_eq!(list.scratch(512).unwrap(), first);
+        list.close();
+        host.execute(&[&list]);
+        list.reset();
+        assert_eq!(chunks(), 2);
+        assert_eq!(list.scratch(512).unwrap(), first);
+        assert_eq!(list.scratch(96 << 10).unwrap(), large);
         list.close();
     }
 
@@ -989,7 +1008,7 @@ pub(crate) struct HostList {
     /// Work for submission time, in recorded order.
     deferred: Mutex<Deferred>,
     /// Upload memory for data the list's draws make (expanded vertices),
-    /// reused after a reset.
+    /// reused after a reset (`trim_scratch` gives up what a peak grew).
     scratch: Mutex<Scratch>,
     /// Host texture states the list assumes, by host copy: at its start and
     /// at its end. Lists are recorded on many threads and run in submission
@@ -1441,6 +1460,10 @@ impl Host {
                 if seconds.is_power_of_two() {
                     tracing::warn!(seconds, value, completed, "still waiting for the host GPU");
                 }
+                if seconds == 8 {
+                    let what = WAITING_ON.lock().unwrap_or_else(|e| e.into_inner()).clone();
+                    tracing::error!(%what, value, "host GPU hang: the submission waited on");
+                }
             }
         }
     }
@@ -1672,6 +1695,19 @@ impl Host {
         let groups = [&lists[..]];
         let mut removed_in = None;
         let mark = self.mark();
+        // What a hang would be waiting on (`Host::wait_for` names it after 8 s).
+        *WAITING_ON.lock().unwrap_or_else(|e| e.into_inner()) = {
+            let pipelines: std::collections::BTreeSet<String> = runs
+                .iter()
+                .flat_map(|l| {
+                    l.pipelines
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .clone()
+                })
+                .collect();
+            format!("{} lists, pipelines {pipelines:?}", runs.len())
+        };
         for (i, group) in groups.iter().enumerate() {
             *submitted += 1;
             let started = std::time::Instant::now();
@@ -2274,10 +2310,7 @@ impl HostList {
         self.notes.lock().unwrap_or_else(|e| e.into_inner()).clear();
         #[cfg(feature = "diagnostics")]
         self.targets.lock().unwrap_or_else(|e| e.into_inner()).clear();
-        {
-            let mut scratch = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
-            (scratch.current, scratch.used) = (0, 0);
-        }
+        self.trim_scratch();
         // SAFETY: the list is not executing.
         let reset = unsafe {
             self.allocator
@@ -2884,6 +2917,25 @@ impl HostList {
         let result = (chunk.gpu + at, (chunk.mapped + at as usize) as *mut u8);
         s.used += len;
         Some(result)
+    }
+
+    /// Starts the next cycle of scratch at the first chunk and gives up
+    /// the chunks past the one after the last cycle's last (only after the
+    /// list's last submission finished, when the GPU no longer reads them).
+    /// A list so keeps what its last cycle needed, and a cycle a little
+    /// larger does not allocate again, but a rare peak is not kept for good.
+    fn trim_scratch(&self) {
+        let spent = {
+            let mut s = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
+            let kept = (s.current + 2).min(s.chunks.len());
+            let spent = s.chunks.split_off(kept);
+            (s.current, s.used) = (0, 0);
+            spent
+        };
+        // Each release is a kernel call, as in [`release_later`].
+        if !spent.is_empty() {
+            release_later(Box::new(spent));
+        }
     }
 
     /// The host address of the list's indirect-work budget, zeroed at each
@@ -5285,3 +5337,7 @@ float4 ps(float4 pos : SV_Position) : SV_Target {
         );
     }
 }
+
+/// The pipelines of the lists the last submission ran, for a hang's log line
+/// (`Host::wait_for`): which work the GPU never finished.
+static WAITING_ON: Mutex<String> = Mutex::new(String::new());
