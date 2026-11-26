@@ -256,6 +256,7 @@ mod image_store_tests;
 mod lower;
 #[cfg(test)]
 mod mark_tests;
+mod pack;
 mod deltas;
 mod rect;
 pub use container::sign as sign_container;
@@ -281,8 +282,10 @@ mod valu_tests;
 mod waterfall_tests;
 mod wave;
 
+use std::collections::BTreeSet;
+
 use crate::dxbc::{Container, FourCC};
-use crate::native::{HwStage, NativeProgram, RootType};
+use crate::native::{HwStage, NativeProgram, RootType, StageIo};
 use crate::{ShaderError, io, ir, resource, structure};
 
 pub use sampler::StaticSampler;
@@ -461,6 +464,12 @@ pub struct Options {
     /// than 32 lanes gets group barriers where its lanes read LDS other
     /// lanes may have written, which the console's lockstep made safe.
     pub narrow_waves: bool,
+    /// A mesh shader's outputs and the paired pixel shader's inputs pack
+    /// their split rows into one element each, so the host's struct holds
+    /// one member per row (module notes, "Packed mesh outputs"). Only the
+    /// linked pair is packed, as the two stages must name the packed
+    /// element the same way.
+    pub pack_mesh_outputs: bool,
 }
 
 /// Metal's limit on a mesh shader's outputs per thread group, in bytes
@@ -647,6 +656,7 @@ pub fn translate_with(container: &[u8], options: Options) -> Result<HostShader, 
         },
         options,
         None,
+        &BTreeSet::new(),
     )
 }
 
@@ -654,6 +664,10 @@ pub fn translate_with(container: &[u8], options: Options) -> Result<HostShader, 
 /// `None` for depth-only draws), pruning arbitrary mesh outputs the pixel
 /// shader never reads so the mesh shader fits within [`METAL_MESH_OUTPUT_BYTES`]
 /// (32 KiB) while keeping both stages' signatures linked for D3D12.
+///
+/// With [`Options::pack_mesh_outputs`], the rows the two stages split across
+/// several elements are packed into one element each, which the host's struct
+/// holds as one member.
 pub fn translate_linked(
     mesh: &[u8],
     pixel: Option<&[u8]>,
@@ -668,23 +682,10 @@ pub fn translate_linked(
         io: &mp.io,
         res: &mp.res,
     };
-    let emit_mesh = |reads: &lower::KeptOutputs| {
-        let linked = emit_pruned(&ms_in, options, Some(reads))?;
-        let bytes = mesh_outputs(&linked.dxil)
-            .ok_or(ShaderError::Malformed(
-                "linked shader has no mesh output declaration",
-            ))?
-            .bytes();
-        if bytes > METAL_MESH_OUTPUT_BYTES {
-            return Err(ShaderError::Unsupported {
-                offset: 0,
-                what: "mesh outputs required by the next stage exceed 32 KiB",
-            });
-        }
-        Ok(linked)
-    };
     let Some(ps_bytes) = pixel else {
-        return Ok((emit_mesh(&lower::KeptOutputs::new())?, None));
+        // A depth-only draw reads no output, so there is no row to pack.
+        let ms = emit_mesh(&ms_in, options, &BTreeSet::new(), &lower::KeptOutputs::new())?;
+        return Ok((ms, None));
     };
     let pp = prepare(ps_bytes)?;
     if pp.native.stage != HwStage::Ps {
@@ -700,11 +701,100 @@ pub fn translate_linked(
         io: &pp.io,
         res: &pp.res,
     };
-    let full_ps = emit_pruned(&ps_in, options, None)?;
+    let pack = pack_rows(
+        &signature_of(&mp.c, FourCC::OSG1)?,
+        &signature_of(&pp.c, FourCC::ISG1)?,
+        &mp.native,
+        &pp.native,
+        options,
+    );
+    let full_ps = emit_pruned(&ps_in, options, None, &pack)?;
     let reads = pixel_input_reads(&full_ps.dxil)?;
-    let linked_ms = emit_mesh(&reads)?;
-    let linked_ps = emit_pruned(&ps_in, options, Some(&reads))?;
+    let linked_ms = emit_mesh(&ms_in, options, &pack, &reads)?;
+    let linked_ps = emit_pruned(&ps_in, options, Some(&reads), &pack)?;
     Ok((linked_ms, Some(linked_ps)))
+}
+
+/// The elements of a container part's signature, or none when the part is
+/// absent.
+fn signature_of(c: &Container<'_>, fourcc: FourCC) -> Result<Vec<container::SigElement>, ShaderError> {
+    match c.part(fourcc) {
+        Some(part) => signature(part.data),
+        None => Ok(Vec::new()),
+    }
+}
+
+/// The mesh's outputs and the pixel shader's inputs, with the rows both can
+/// pack into one element.
+fn pack_rows(
+    mesh_outputs: &[container::SigElement],
+    pixel_inputs: &[container::SigElement],
+    mesh_native: &NativeProgram,
+    pixel_native: &NativeProgram,
+    options: Options,
+) -> BTreeSet<u32> {
+    if !options.pack_mesh_outputs {
+        return BTreeSet::new();
+    }
+    let mut pack = pack::shared_rows(mesh_outputs, pixel_inputs);
+    // A row of 16-bit values keeps its elements: the values travel packed
+    // on the console, two to a dword.
+    for row in sixteen_bit_rows(mesh_native)
+        .into_iter()
+        .chain(sixteen_bit_rows(pixel_native))
+    {
+        pack.remove(&row);
+    }
+    pack
+}
+
+/// The rows whose values are 16-bit on the console.
+fn sixteen_bit_rows(native: &NativeProgram) -> BTreeSet<u32> {
+    let mut rows = BTreeSet::new();
+    match &native.io {
+        StageIo::Ms(ms) => {
+            for o in &ms.outputs {
+                if o.fp16 || o.pack2 {
+                    rows.insert(u32::from(o.row));
+                }
+            }
+        }
+        StageIo::Ps { inputs, .. } => {
+            for i in inputs {
+                if i.fp16 || i.pack2 {
+                    rows.insert(u32::from(i.row));
+                    if i.pack2 {
+                        rows.insert(u32::from(i.row2));
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+    rows
+}
+
+/// Emits a mesh shader, refusing one whose outputs the next stage needs past
+/// Metal's limit.
+fn emit_mesh(
+    input: &EmitInput<'_>,
+    options: Options,
+    pack: &BTreeSet<u32>,
+    reads: &lower::KeptOutputs,
+) -> Result<HostShader, ShaderError> {
+    let linked = emit_pruned(input, options, Some(reads), pack)?;
+    let bytes = mesh_outputs(&linked.dxil)
+        .ok_or(ShaderError::Malformed(
+            "linked shader has no mesh output declaration",
+        ))?
+        .bytes();
+    if bytes > METAL_MESH_OUTPUT_BYTES {
+        return Err(ShaderError::Unsupported {
+            offset: 0,
+            what: "mesh outputs required by the next stage exceed 32 KiB",
+        });
+    }
+    Ok(linked)
 }
 
 struct EmitInput<'a> {
@@ -749,6 +839,7 @@ pub fn emit_with(
         },
         options,
         None,
+        &BTreeSet::new(),
     )
 }
 
@@ -756,6 +847,7 @@ fn emit_pruned(
     input: &EmitInput<'_>,
     options: Options,
     keep: Option<&lower::KeptOutputs>,
+    pack: &BTreeSet<u32>,
 ) -> Result<HostShader, ShaderError> {
     let EmitInput {
         c,
@@ -797,6 +889,17 @@ fn emit_pruned(
     if pixel && outputs.iter().any(|e| matches!(e.kind, 18 | 19)) {
         for e in inputs.iter_mut().filter(|e| e.kind == 3) {
             e.interp = 5;
+        }
+    }
+    // The rows the two stages hold alike are packed into one element each,
+    // so the host's struct holds one member per row. The mesh's outputs and
+    // the pixel shader's inputs are packed the same way, so the two stages
+    // stay linked.
+    if !pack.is_empty() {
+        if pixel {
+            pack::coalesce(&mut inputs, pack);
+        } else if native.stage == HwStage::Ms {
+            pack::coalesce(&mut outputs, pack);
         }
     }
     // Per-primitive outputs are constant. The console never exports a
@@ -2857,13 +2960,13 @@ mod tests {
             res: &mres,
         };
         // Standalone emission stays over 32 KiB (68 * 4 * 128 = 34,816 B).
-        let standalone = emit_pruned(&ms_in, Options::default(), None).unwrap();
+        let standalone = emit_pruned(&ms_in, Options::default(), None, &BTreeSet::new()).unwrap();
         assert_eq!(mesh_bytes(&standalone.dxil), Some(34_816));
         assert!(mesh_bytes(&standalone.dxil).unwrap() > METAL_MESH_OUTPUT_BYTES);
 
         // Depth-only linking (no pixel shader) drops all arbitrary outputs.
         let empty = lower::KeptOutputs::new();
-        let depth_ms = emit_pruned(&ms_in, Options::default(), Some(&empty)).unwrap();
+        let depth_ms = emit_pruned(&ms_in, Options::default(), Some(&empty), &BTreeSet::new()).unwrap();
         assert_eq!(mesh_bytes(&depth_ms.dxil), Some(4 * 4 * 128));
 
         // Paired pixel shader declaring the same 17 rows, reading only
@@ -2955,14 +3058,14 @@ mod tests {
             io: &pio,
             res: &pres,
         };
-        let full_ps = emit_pruned(&ps_in, Options::default(), None).unwrap();
+        let full_ps = emit_pruned(&ps_in, Options::default(), None, &BTreeSet::new()).unwrap();
         let reads = pixel_input_reads(&full_ps.dxil).unwrap();
         assert_eq!(reads.len(), 2);
         assert_eq!(reads.get(&("TEXCOORD".into(), 0)), Some(&0b0011));
         assert_eq!(reads.get(&("TEXCOORD".into(), 15)), Some(&0b1100));
 
-        let linked_ms = emit_pruned(&ms_in, Options::default(), Some(&reads)).unwrap();
-        let linked_ps = emit_pruned(&ps_in, Options::default(), Some(&reads)).unwrap();
+        let linked_ms = emit_pruned(&ms_in, Options::default(), Some(&reads), &BTreeSet::new()).unwrap();
+        let linked_ps = emit_pruned(&ps_in, Options::default(), Some(&reads), &BTreeSet::new()).unwrap();
         // SV_Position (4) + TEXCOORD0.xy (2) + TEXCOORD15.zw (2) = 8 components.
         assert_eq!(mesh_bytes(&linked_ms.dxil), Some(8 * 4 * 128));
         assert!(!linked_ps.dxil.is_empty());

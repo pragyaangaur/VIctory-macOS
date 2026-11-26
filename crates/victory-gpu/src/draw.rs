@@ -4165,6 +4165,7 @@ void main(uint3 id : SV_DispatchThreadID) {
                 bias_as_gradients: false,
                 host_wave32: false,
                 narrow_waves: false,
+                pack_mesh_outputs: false,
             },
         )
         .unwrap();

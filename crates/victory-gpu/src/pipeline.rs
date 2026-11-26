@@ -362,7 +362,7 @@ struct LinkedPair {
 }
 
 #[cfg(windows)]
-type LinkedKey = ([u8; 32], Option<[u8; 32]>);
+type LinkedKey = ([u8; 32], Option<[u8; 32]>, bool);
 
 #[cfg(windows)]
 impl Shader {
@@ -390,7 +390,11 @@ pub(crate) fn translate_linked(
     ps: Option<&Shader>,
 ) -> Option<(Arc<Shader>, Option<Arc<Shader>>)> {
     static LINKED: Mutex<Option<HashMap<LinkedKey, Option<LinkedPair>>>> = Mutex::new(None);
-    let key = (ms.full_hash, ps.map(|p| p.full_hash));
+    let key = (
+        ms.full_hash,
+        ps.map(|p| p.full_hash),
+        crate::shader_cache::runtime_options().pack_mesh_outputs,
+    );
     if let Some(hit) = LINKED
         .lock()
         .unwrap_or_else(|e| e.into_inner())

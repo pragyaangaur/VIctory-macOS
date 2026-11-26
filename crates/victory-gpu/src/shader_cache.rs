@@ -155,6 +155,15 @@ fn narrow_waves() -> bool {
     })
 }
 
+/// Whether a mesh shader's outputs and the paired pixel shader's inputs pack
+/// the rows they split across several elements into one element each
+/// (`emit`, "Packed mesh outputs"): opt-in while it is measured,
+/// `VICTORY_PACK_MESH_OUTPUTS=1`.
+fn pack_mesh_outputs() -> bool {
+    static PACK: OnceLock<bool> = OnceLock::new();
+    *PACK.get_or_init(|| std::env::var("VICTORY_PACK_MESH_OUTPUTS").as_deref() == Ok("1"))
+}
+
 /// Whether this runs under Wine (on a Mac: D3DMetal's D3D12).
 #[cfg(windows)]
 pub(crate) fn under_wine() -> bool {
@@ -175,23 +184,25 @@ pub(crate) fn under_wine() -> bool {
 }
 
 /// [`build`] for translations with host workarounds (atomic locks, their
-/// rounds and umax reduction, bias as gradients, narrow waves): their own
-/// cache entries, one per combination.
+/// rounds and umax reduction, bias as gradients, narrow waves, packed mesh
+/// outputs): their own cache entries, one per combination.
 pub(crate) fn translation_build(options: victory_shader::emit::Options) -> &'static [u8; 32] {
     let locks = options.atomic_locks;
     let bias = options.bias_as_gradients;
     let narrow = options.narrow_waves;
     let rounds = locks && options.atomic_lock_rounds;
     let umax = rounds && options.atomic_umax;
-    if !locks && !bias && !narrow {
+    let pack = options.pack_mesh_outputs;
+    if !locks && !bias && !narrow && !pack {
         return build();
     }
-    static BUILDS: [OnceLock<[u8; 32]>; 32] = [const { OnceLock::new() }; 32];
+    static BUILDS: [OnceLock<[u8; 32]>; 64] = [const { OnceLock::new() }; 64];
     let n = usize::from(locks)
         | usize::from(bias) << 1
         | usize::from(narrow) << 2
         | usize::from(rounds) << 3
-        | usize::from(umax) << 4;
+        | usize::from(umax) << 4
+        | usize::from(pack) << 5;
     BUILDS[n].get_or_init(|| {
         let mut h = blake3::Hasher::new();
         h.update(build());
@@ -209,6 +220,9 @@ pub(crate) fn translation_build(options: victory_shader::emit::Options) -> &'sta
         }
         if narrow {
             h.update(b"narrow waves");
+        }
+        if pack {
+            h.update(b"pack mesh outputs");
         }
         *h.finalize().as_bytes()
     })
@@ -228,6 +242,7 @@ pub(crate) fn runtime_options() -> victory_shader::emit::Options {
         bias_as_gradients: bias_as_gradients(),
         host_wave32: host_wave32(),
         narrow_waves: narrow_waves(),
+        pack_mesh_outputs: pack_mesh_outputs(),
     }
 }
 
