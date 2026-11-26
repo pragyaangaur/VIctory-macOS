@@ -155,6 +155,7 @@ fn typed_store_program(soffset: u8) -> Result<HostShader, crate::ShaderError> {
         root_cbvs: lowered.root_cbvs,
         root_srvs: lowered.root_srvs,
         root_uavs: lowered.root_uavs,
+        root_srv_bytes: lowered.root_srv_bytes,
         memory: lowered.memory,
         memory_writes: lowered.memory_writes,
         view_addresses: lowered.view_addresses,
@@ -317,6 +318,7 @@ fn program() -> HostShader {
         root_cbvs: l.root_cbvs,
         root_srvs: l.root_srvs,
         root_uavs: l.root_uavs,
+        root_srv_bytes: l.root_srv_bytes,
         memory: l.memory,
         memory_writes: l.memory_writes,
         view_addresses: l.view_addresses,
@@ -463,6 +465,7 @@ fn root_views_read_their_copy_and_zeros_past_it() {
     ];
     w.extend(s_load(2, 8, 4, 0)); // s[8:11]: the result UAV
     w.push(vop2(V_LSHLREV_B32, 1, 128 + 6, 0)); // v1 = lane << 6
+    let load = w.len();
     w.extend(mubuf(0x0C, 2, 1, 0)); // buffer_load_dword v2, v1, s[0:3] offen
     w.push(vop2(V_LSHLREV_B32, 3, 128 + 2, 0)); // v3 = lane << 2
     w.push(S_WAITCNT_ALL);
@@ -518,28 +521,37 @@ fn root_views_read_their_copy_and_zeros_past_it() {
         }),
         code: w.iter().flat_map(|w| w.to_le_bytes()).collect(),
     };
-    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
-    let st = structure::structure(&p).expect("structure");
-    let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("track");
-    let io = io::raise(&p, &native).expect("io::raise");
-    let l = lower::lower(&lower::Parts {
-        native: &native,
-        p: &p,
-        st: &st,
-        io: &io,
-        res: &res,
-        inputs: Vec::new(),
-        outputs: Vec::new(),
-        prims: Vec::new(),
-        mesh_stride: 0,
-        atomic_locks: false,
-        atomic_lock_rounds: false,
-        bias_as_gradients: false,
-        host_wave32: false,
-        narrow_waves: false,
-        view_marks: false,
-    })
-    .expect("lower");
+    let lower_shader = |native: &NativeProgram| {
+        let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+        let st = structure::structure(&p).expect("structure");
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("track");
+        let io = io::raise(&p, native).expect("io::raise");
+        lower::lower(&lower::Parts {
+            native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            prims: Vec::new(),
+            mesh_stride: 0,
+            atomic_locks: false,
+            atomic_lock_rounds: false,
+            bias_as_gradients: false,
+            host_wave32: false,
+            narrow_waves: false,
+            view_marks: false,
+        })
+        .expect("lower")
+    };
+    let mut fixed = native.clone();
+    let [word, registers] = mubuf(0x0C, 2, 0, 0);
+    fixed.code[4 * load..4 * load + 4].copy_from_slice(&((word & !(1 << 12)) | 48).to_le_bytes());
+    fixed.code[4 * load + 4..4 * load + 8].copy_from_slice(&registers.to_le_bytes());
+    assert_eq!(lower_shader(&fixed).root_srv_bytes, [(2, 52)]);
+    let l = lower_shader(&native);
+    assert!(l.root_srv_bytes.is_empty(), "a shader with a dynamic load has no bound");
     assert!(l.root_srvs.is_empty() && !l.memory, "no root descriptor, no title memory");
     let marks: Vec<(u32, u32)> = l
         .user_data
@@ -557,6 +569,7 @@ fn root_views_read_their_copy_and_zeros_past_it() {
         root_cbvs: l.root_cbvs,
         root_srvs: l.root_srvs,
         root_uavs: l.root_uavs,
+        root_srv_bytes: l.root_srv_bytes,
         memory: l.memory,
         memory_writes: l.memory_writes,
         view_addresses: l.view_addresses,
@@ -697,6 +710,7 @@ fn writes_through_views_mark_their_pages() {
         root_cbvs: l.root_cbvs,
         root_srvs: l.root_srvs,
         root_uavs: l.root_uavs,
+        root_srv_bytes: l.root_srv_bytes,
         memory: l.memory,
         memory_writes: l.memory_writes,
         view_addresses: l.view_addresses,
@@ -938,6 +952,7 @@ fn heap_direct_texture_reads_mark_their_heap_index() {
         root_cbvs: l.root_cbvs,
         root_srvs: l.root_srvs,
         root_uavs: l.root_uavs,
+        root_srv_bytes: l.root_srv_bytes,
         memory: l.memory,
         memory_writes: l.memory_writes,
         view_addresses: l.view_addresses,
@@ -1050,6 +1065,7 @@ fn straddling_writes_across_256mib_and_4gib_boundaries_mark_exact_pages() {
         root_cbvs: l.root_cbvs,
         root_srvs: l.root_srvs,
         root_uavs: l.root_uavs,
+        root_srv_bytes: l.root_srv_bytes,
         memory: l.memory,
         memory_writes: l.memory_writes,
         view_addresses: l.view_addresses,
@@ -1249,6 +1265,7 @@ fn early_depth_stencil_skips_occluded_read_mark_pixel_shaders() {
         root_cbvs: vs_lowered.root_cbvs,
         root_srvs: vs_lowered.root_srvs,
         root_uavs: vs_lowered.root_uavs,
+        root_srv_bytes: vs_lowered.root_srv_bytes,
         memory: vs_lowered.memory,
         memory_writes: vs_lowered.memory_writes,
         view_addresses: vs_lowered.view_addresses,
@@ -1324,6 +1341,7 @@ fn early_depth_stencil_skips_occluded_read_mark_pixel_shaders() {
         root_cbvs: ps_lowered.root_cbvs,
         root_srvs: ps_lowered.root_srvs,
         root_uavs: ps_lowered.root_uavs,
+        root_srv_bytes: ps_lowered.root_srv_bytes,
         memory: ps_lowered.memory,
         memory_writes: ps_lowered.memory_writes,
         view_addresses: ps_lowered.view_addresses,
