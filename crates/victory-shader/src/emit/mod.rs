@@ -192,8 +192,12 @@
 //!   that round together, and only the lanes still not done take turns,
 //!   in a branch a wave whose lanes all finished skips. On D3DMetal (M5 Pro)
 //!   a wave's 64-bit `umax` on distinct texels took 29 µs in turns and
-//!   6 µs in rounds. In a pixel program helper lanes skip the lock in
-//!   rounds: their atomics are discarded, so they could never take it. A
+//!   6 µs in rounds. With [`Options::atomic_umax`] (also #240) a
+//!   glc-clear `umax` first reduces each texel's lanes of the wave to
+//!   their maximum key, one representative a group, in registers, so
+//!   only the representatives run the rounds and the turns. In a pixel
+//!   program helper lanes skip the lock in rounds: their atomics are
+//!   discarded, so they could never take it. A
 //!   lane waiting for a lock another wave holds gives up after
 //!   [`ATOMIC_LOCK_SPINS`] tries in compute and mesh programs
 //!   ([`ATOMIC_LOCK_SPINS_DRAWN`] in the others, whose draws macOS ends
@@ -432,6 +436,11 @@ pub struct Options {
     /// take turns (module notes, "Atomic locks"). The translation differs,
     /// so the shader cache keys on it.
     pub atomic_lock_rounds: bool,
+    /// With [`Options::atomic_lock_rounds`]: a glc-clear 64-bit `umax`
+    /// first reduces each texel's lanes of a wave to their maximum key, one
+    /// representative a group locking (module notes, "Atomic locks"). The
+    /// translation differs, so the shader cache keys on it.
+    pub atomic_umax: bool,
     /// Compute-stage biased samples run as gradient samples with the quad
     /// gradients scaled by `2^bias`, for hosts that ignore the bias of a
     /// compute shader's sample (D3DMetal, #30).
@@ -823,6 +832,7 @@ fn emit_pruned(
         view_marks: options.view_marks,
         atomic_locks: options.atomic_locks,
         atomic_lock_rounds: options.atomic_lock_rounds,
+        atomic_umax: options.atomic_umax,
         bias_as_gradients: options.bias_as_gradients,
         host_wave32: options.host_wave32,
         narrow_waves: options.narrow_waves,

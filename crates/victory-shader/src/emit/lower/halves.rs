@@ -7,8 +7,11 @@
 //! thread relabelling ([`Lower::thread_id`]) gives each host wave a 32-aligned
 //! run of flat thread ids, so host wave `2w + h` holds console wave `w`'s
 //! lanes `32h..32h + 31`, host lane `n` being console lane `32h + n`. What
-//! a lane reads of its own half is exact; reads into the other half have no
-//! host form and are refused where they are made:
+//! a lane reads of its own half is exact. Reads into the other half pass
+//! between the two host waves through group-shared memory, between group
+//! barriers ([`Lower::exchange_halves`]); barriers need the whole group, so
+//! only in a block each lane of the group runs once ([`once_per_lane`]).
+//! Elsewhere they are refused where they are made:
 //!
 //! * within a half, exact: DPP (rows of 16, DPP8 groups of 8), `ds_swizzle`
 //!   (groups of 32 or quads), and `ds_bpermute_b32`, which in wave64 permutes
@@ -19,19 +22,23 @@
 //!   row mask names (rows 2 and 3 are the upper half's) are decided by the
 //!   console lane ([`Lower::console_lane`]);
 //! * lane masks read as data (ballots) hold the other half's lanes: unless
-//!   the whole group fits one host wave, each host wave's ballot passes to
-//!   the other through group-shared memory between group barriers
-//!   ([`Lower::ballot_across_halves`]). Barriers need the whole group, so
-//!   only for a mask written in a block each lane runs once
-//!   ([`once_per_lane`]); elsewhere refused ([`MASK_ACROSS`]);
-//! * across halves, refused: `v_readlane_b32` of a lane that may be in the other half
-//!   (SGPR spills read back are not lane reads), and whole-wave reductions
-//!   (unless an active reduction fits one host wave) and prefix sums;
+//!   the whole group fits one host wave, the halves pass each other their
+//!   ballots ([`Lower::ballot_across_halves`]), for a mask written in a block
+//!   each lane runs once; elsewhere refused ([`MASK_ACROSS`]);
+//! * `v_readlane_b32` of a lane that may be in the other half (SGPR spills
+//!   read back are not lane reads): each half passes the value of the lane
+//!   with that index in it, and the console lane's half picks
+//!   ([`Lower::read_lane_across`]);
+//! * whole-wave reductions and prefix sums: each half reduces its own lanes,
+//!   and they pass each other the result; a prefix in the upper half adds
+//!   the lower half's total ([`Lower::reduce_across`]);
 //! * `v_readfirstlane_b32` reads the host wave's first lane, which in the
-//!   upper half is console lane 32 or later: kept for a value the same in
-//!   every lane of the console wave ([`lane_uniform`], what the compiler
-//!   reads first lanes for) and in a group of 32 threads or fewer (one host
-//!   wave holds the whole console wave), refused otherwise ([`FIRST_ACROSS`]).
+//!   upper half is console lane 32 or later: kept as it is for a value the
+//!   same in every lane of the console wave ([`lane_uniform`], what the
+//!   compiler reads first lanes for) and in a group of 32 threads or fewer
+//!   (one host wave holds the whole console wave); otherwise the lower
+//!   half's first lane ([`Lower::first_lane_across`]); refused where no
+//!   exchange can go ([`FIRST_ACROSS`]).
 //!
 //! A refusal in a value no instruction ends up needing costs nothing (the
 //! lowering retries with that value missing), so a program is refused only
@@ -128,11 +135,6 @@ impl Lower<'_> {
             .is_some_and(|t| t.iter().product::<u32>() <= HALF)
     }
 
-    /// Refuses a read into the other half of the console wave in halves.
-    pub(super) fn same_half(&self, what: Why) -> Result<(), Why> {
-        if self.halves { Err(what) } else { Ok(()) }
-    }
-
     /// Where the halves pass each other a lane mask written in IR block
     /// `def` (none: a program input, in the entry): there, if each lane of
     /// the group runs it once ([`once_per_lane`]); in the block being
@@ -149,21 +151,31 @@ impl Lower<'_> {
         }
     }
 
+    /// Whether the halves can pass each other values where the instruction
+    /// being lowered is: in halves, in a group of more than one host wave, in
+    /// a block each lane of the group runs once, before anything of the
+    /// instruction's own split it ([`Lower::level`]).
+    pub(super) fn across_here(&self) -> bool {
+        self.halves
+            && !self.one_host_wave()
+            && self.cur == self.level
+            && self.once.get(self.cur_ir).copied().unwrap_or(false)
+    }
+
+    /// The half of the console wave this lane is in: 0 or 1.
+    fn half(&mut self, at: usize) -> V {
+        let f = self.relabelled_flat();
+        let (five, one) = (self.s.m.i32(5), self.s.m.i32(1));
+        let slot = self.s.m.bin(at, Bin::LShr, f, five);
+        self.s.m.bin(at, Bin::And, slot, one)
+    }
+
     /// Both dwords of the console wave's ballot of `bit`, in halves: each
-    /// host wave stores its own (its half's lanes) in a group-shared dword
-    /// of its own, and reads its console wave's two after a group barrier.
-    /// A barrier before the store keeps it from overwriting what the other
-    /// half has not read of an earlier ballot. A console wave with no upper
-    /// half (a group not a multiple of 64) has a high dword of 0. `at` must
-    /// be run once by every lane of the group ([`Lower::across_at`]).
+    /// host wave's own (its half's lanes), passed between them
+    /// ([`Lower::exchange_halves`]). A console wave with no upper half has a
+    /// high dword of 0. `at` must be run once by every lane of the group
+    /// ([`Lower::across_at`]).
     pub(super) fn ballot_across_halves(&mut self, bit: V, at: usize) -> Result<(V, V), Why> {
-        let group: u32 = self.s.threads.map_or(0, |t| t.iter().product());
-        // Two dwords per console wave, so the high dword of the last one is
-        // inside even where the group has no upper half.
-        let dwords = group.div_ceil(2 * HALF) * 2;
-        if self.s.lds_dwords + dwords > GROUP_SHARED_DWORDS {
-            return Err("no group-shared memory left to pass a lane mask between 32-lane halves");
-        }
         let i32t = self.s.t.i32;
         let four = self.s.m.named_struct("dx.types.fouri32", vec![i32t; 4]);
         let r = self
@@ -171,13 +183,34 @@ impl Lower<'_> {
             .op(at, "waveActiveBallot", Attr::NoUnwind, four, 116, &[bit]);
         self.s.flags |= flags::WAVE_OPS;
         let own = self.s.m.extract(at, r, 0);
+        let zero = self.s.m.i32(0);
+        self.exchange_halves(own, zero, at)
+    }
+
+    /// What each half of this lane's console wave gave as `own` (a dword
+    /// the same in every lane of a host wave): (lower half's, upper half's).
+    /// Each host wave stores its own in a group-shared dword of its own, and
+    /// reads its console wave's two after a group barrier; a barrier before
+    /// the store keeps it from overwriting what the other half has not read
+    /// of an earlier exchange. A console wave with no upper half (a group not
+    /// a multiple of 64) reads `missing` for it. `at` must be run once by
+    /// every lane of the group, in halves.
+    pub(super) fn exchange_halves(&mut self, own: V, missing: V, at: usize) -> Result<(V, V), Why> {
+        let group: u32 = self.s.threads.map_or(0, |t| t.iter().product());
+        // Two dwords per console wave, so the high dword of the last one is
+        // inside even where the group has no upper half.
+        let dwords = group.div_ceil(2 * HALF) * 2;
+        if self.s.lds_dwords + dwords > GROUP_SHARED_DWORDS {
+            return Err("no group-shared memory left to pass values between 32-lane halves");
+        }
+        let i32t = self.s.t.i32;
         let f = self.relabelled_flat();
-        let words = match self.half_masks {
+        let words = match self.half_words {
             Some(g) => g,
             None => {
                 let arr = self.s.m.array(dwords, i32t);
-                let g = self.s.m.global("half_masks", arr, 3);
-                self.half_masks = Some(g);
+                let g = self.s.m.global("half_words", arr, 3);
+                self.half_words = Some(g);
                 g
             }
         };
@@ -207,10 +240,89 @@ impl Lower<'_> {
             let first = self.s.m.bin(at, Bin::Shl, high, five);
             let n = self.s.m.i32(group);
             let there = self.s.m.cmp(at, pred::IULT, first, n);
-            let zero = self.s.m.i32(0);
-            hi = self.s.m.select(at, there, hi, zero);
+            hi = self.s.m.select(at, there, hi, missing);
         }
         Ok((lo, hi))
+    }
+
+    /// `v_readlane_b32` of `x` at console lane `lane` (the low 6 bits), in
+    /// halves ([`Lower::across_here`]): each half reads the lane with that
+    /// index in it, and the lane's own half gives the value.
+    pub(super) fn read_lane_across(&mut self, x: V, lane: V) -> Result<V, Why> {
+        let c = self.cur;
+        let (k31, k32, zero) = (self.s.m.i32(31), self.s.m.i32(32), self.s.m.i32(0));
+        let index = self.s.m.bin(c, Bin::And, lane, k31);
+        self.s.flags |= flags::WAVE_OPS;
+        let own = self.read_lane(x, index);
+        let (lo, hi) = self.exchange_halves(own, zero, c)?;
+        let upper = self.s.m.bin(c, Bin::And, lane, k32);
+        let upper = self.s.m.cmp(c, pred::NE, upper, zero);
+        Ok(self.s.m.select(c, upper, hi, lo))
+    }
+
+    /// `v_readfirstlane_b32` of `x`, in halves ([`Lower::across_here`]): the
+    /// lower half's first lane. Every lane of the group runs the block, so
+    /// the console's first lane is in the lower half.
+    pub(super) fn first_lane_across(&mut self, x: V) -> Result<V, Why> {
+        let c = self.cur;
+        let (i32t, zero) = (self.s.t.i32, self.s.m.i32(0));
+        self.s.flags |= flags::WAVE_OPS;
+        let own = self
+            .s
+            .op(c, "waveReadLaneFirst.i32", Attr::NoUnwind, i32t, 118, &[x]);
+        Ok(self.exchange_halves(own, zero, c)?.0)
+    }
+
+    /// A whole-wave reduction or prefix of `op`, in halves
+    /// ([`Lower::across_here`]): `own` is this host wave's (its half's
+    /// lanes), `total` its half's total (a prefix's; the reduction itself
+    /// otherwise), both as the operation's type. A reduction takes `op` of
+    /// both halves' totals; a prefix in the upper half adds the lower half's
+    /// total. A console wave with no upper half reads `ident` for it.
+    pub(super) fn reduce_across(
+        &mut self,
+        op: super::super::wave::Op,
+        own: V,
+        total: V,
+        prefix: bool,
+        ident: u32,
+    ) -> Result<V, Why> {
+        use super::super::wave::Op;
+        let c = self.cur;
+        let float = matches!(op, Op::AddF | Op::MinF | Op::MaxF);
+        let bits = if float { self.as_int(total) } else { total };
+        let missing = self.s.m.i32(ident);
+        let (lo, hi) = self.exchange_halves(bits, missing, c)?;
+        let (lo, hi) = if float {
+            (self.as_float(lo), self.as_float(hi))
+        } else {
+            (lo, hi)
+        };
+        if prefix {
+            let h = self.half(c);
+            let zero = self.s.m.i32(0);
+            let upper = self.s.m.cmp(c, pred::NE, h, zero);
+            let added = self.s.m.bin(c, Bin::Add, lo, own);
+            return Ok(self.s.m.select(c, upper, added, own));
+        }
+        let unsigned_or_signed = |l: &mut Self, p: u8| {
+            let less = l.s.m.cmp(c, p, lo, hi);
+            l.s.m.select(c, less, lo, hi)
+        };
+        Ok(match op {
+            Op::AddU | Op::AddF => self.s.m.bin(c, Bin::Add, lo, hi),
+            Op::Or => self.s.m.bin(c, Bin::Or, lo, hi),
+            Op::And => self.s.m.bin(c, Bin::And, lo, hi),
+            Op::Xor => self.s.m.bin(c, Bin::Xor, lo, hi),
+            Op::MinU => unsigned_or_signed(self, pred::IULT),
+            Op::MaxU => unsigned_or_signed(self, pred::IUGT),
+            Op::MinI => unsigned_or_signed(self, pred::SLT),
+            Op::MaxI => unsigned_or_signed(self, pred::SGT),
+            // FMin, FMax: as the host's own wave minimum and maximum.
+            Op::MinF => self.binary(36, lo, hi),
+            Op::MaxF => self.binary(35, lo, hi),
+            Op::AddH => return Err("a 16-bit wave reduction over both 32-lane halves"),
+        })
     }
 }
 
