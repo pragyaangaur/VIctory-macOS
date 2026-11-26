@@ -87,6 +87,11 @@
 //!   vertex shader's outputs completes each rectangle with its fourth
 //!   corner opposite the right angle ([`right_angle`]), as the console's
 //!   hardware does.
+//! * **Non-provoking vertex values** (#203): a pixel program's reads of
+//!   P10 and P20 (`v_interp_mov_f32`) are flat inputs of their own
+//!   ([`VERTEX_DELTAS`]), which a geometry shader made from the vertex
+//!   shader computes per triangle ([`vertex_delta_gs`]). The host's
+//!   `GetAttributeAtVertex` makes a pipeline D3DMetal runs as a no-op.
 //! * **Heap indices** (added 2026-11-24) are clamped to [`HEAP_VIEWS`] − 1
 //!   (samplers [`HEAP_SAMPLERS`] − 1): the host's heaps have at least that
 //!   many slots, those past its own null, so an index past the heap (data
@@ -236,8 +241,10 @@ pub mod host;
 #[cfg(all(test, windows))]
 mod image_store_tests;
 mod lower;
+mod deltas;
 mod rect;
 pub use container::sign as sign_container;
+pub use deltas::{VERTEX_DELTA_TOP, VERTEX_DELTAS, needs_vertex_deltas, vertex_delta_gs};
 pub use rect::{rectangle_gs, right_angle};
 #[cfg(all(test, windows))]
 mod memory_tests;

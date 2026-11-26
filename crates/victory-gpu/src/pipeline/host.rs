@@ -694,6 +694,13 @@ impl HostPipeline {
         };
         let state = g.describe();
         let depth_with_bounds = g.depth_with_bounds(host);
+        // A pixel shader reading non-provoking vertex values (#203) takes
+        // them from a geometry shader made for the vertex shader.
+        let ps = stages.get(1).and_then(|(s, _)| s.translated());
+        let deltas = ps.is_some_and(|ps| victory_shader::emit::needs_vertex_deltas(&ps.host.dxil));
+        if mesh.is_some() && deltas {
+            return refuse("non-provoking vertex values in a mesh pipeline", shaders);
+        }
         if mesh.is_some() {
             let name = super::library::name(
                 "mesh",
@@ -740,9 +747,26 @@ impl HostPipeline {
 
         // Rectangle lists: a geometry shader made for the vertex shader adds
         // each rectangle's fourth corner (else rectangles are expanded on
-        // the CPU from vertex inputs, see `draw`).
-        let gs = match (g.topology.0, stages.first().and_then(|(s, _)| s.translated())) {
-            (RECTANGLES, Some(vs)) => match victory_shader::emit::rectangle_gs(&vs.host.dxil) {
+        // the CPU from vertex inputs, see `draw`). Triangles whose pixel
+        // shader reads non-provoking vertex values: one that adds them.
+        let vs = stages.first().and_then(|(s, _)| s.translated());
+        let gs = match (g.topology.0, vs, ps) {
+            (RECTANGLES, ..) if deltas => {
+                return refuse("non-provoking vertex values in a rectangle list", shaders);
+            }
+            (_, Some(vs), Some(ps)) if deltas => {
+                if host_topology(g) != D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE {
+                    return refuse("non-provoking vertex values of points or lines", shaders);
+                }
+                match victory_shader::emit::vertex_delta_gs(&vs.host.dxil, &ps.host.dxil) {
+                    Ok(gs) => gs,
+                    Err(e) => {
+                        tracing::warn!(error = %e, ?shaders, "no vertex value geometry shader");
+                        return None;
+                    }
+                }
+            }
+            (RECTANGLES, Some(vs), _) => match victory_shader::emit::rectangle_gs(&vs.host.dxil) {
                 Ok(gs) => gs,
                 Err(e) => {
                     tracing::warn!(error = %e, ?shaders, "no rectangle geometry shader");
@@ -751,6 +775,7 @@ impl HostPipeline {
             },
             _ => Vec::new(),
         };
+        let rectangles = !gs.is_empty() && !deltas;
         let desc = D3D12_GRAPHICS_PIPELINE_STATE_DESC {
             // SAFETY: a borrowed pointer the description never releases.
             pRootSignature: unsafe { std::mem::transmute_copy(&root) },
@@ -815,7 +840,13 @@ impl HostPipeline {
                 return None;
             }
         };
-        tracing::info!(?shaders, ms = started.elapsed().as_millis(), rectangles = !gs.is_empty(), "host pipeline");
+        tracing::info!(
+            ?shaders,
+            ms = started.elapsed().as_millis(),
+            rectangles,
+            deltas,
+            "host pipeline"
+        );
         crate::host::name(&pso, || format!("{shaders:?}"));
         tracing::debug!(
             ?shaders,
@@ -833,7 +864,7 @@ impl HostPipeline {
             root,
             stages: bound,
             name: format!("{shaders:?}"),
-            rectangles: !gs.is_empty(),
+            rectangles,
             slots: g.slots(),
             inputs: g.elements(),
             marks,

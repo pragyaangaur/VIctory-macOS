@@ -14,7 +14,7 @@ use super::container::SigElement;
 use super::shader::{Shader, VIEW_INTEGER, VIEW_SIGNED, VIEW_STRIDE_BITS, VIEW_STRIDES, flags};
 use crate::ShaderError;
 use crate::gfx10::{Dpp, Fields, NULL, Operand};
-use crate::io::{Barycentric, Elsewhere, Export, Input, Interp, Io, Target};
+use crate::io::{Attribute, Barycentric, Elsewhere, Export, Input, Interp, Io, Target};
 use crate::ir::{Block, EXEC, Exit, Inst, Phi, Program, Reg, Value};
 use crate::native::{HwStage, NativeProgram, ResourceType, RootType, StageIo, Usage, UsedResource};
 use crate::resource::{Address, CODE, MEMORY, Resources, Role, Site, Source, USER_DATA};
@@ -8752,7 +8752,11 @@ impl<'a> Lower<'a> {
                 attribute,
                 vertex: 2,
             } => (attribute, 1),
-            Interp::Vertex { .. } => return Err("a non-provoking vertex value"),
+            Interp::Vertex {
+                attribute,
+                vertex: vertex @ (0 | 1),
+            } => return self.vertex_delta(inst, *attribute, *vertex),
+            Interp::Vertex { .. } => return Err("an interpolation parameter"),
         };
         let dst = match &inst.fields {
             Fields::Vintrp { dst, .. } => *dst,
@@ -8827,6 +8831,93 @@ impl<'a> Lower<'a> {
             }
         };
         // A pixel interpolates in every lane; guards only hide inactive ones.
+        self.write(inst, Reg::V(reg), x, None);
+        Ok(())
+    }
+
+    /// `v_interp_mov_f32` of P10 or P20 (`vertex` 0 or 1): what the console
+    /// keeps for interpolation, the attribute at the second or third vertex
+    /// minus its value at the first (the provoking one). The host has no
+    /// such read that D3DMetal runs (`GetAttributeAtVertex` makes a no-op
+    /// pipeline there, #203), so it is a flat input of its own,
+    /// [`super::VERTEX_DELTAS`] with the attribute's row as its index, which
+    /// a geometry shader made for the vertex shader computes per triangle
+    /// ([`super::vertex_delta_gs`]). Its rows are taken from the top of the
+    /// register space down, so the vertex shader's outputs keep theirs.
+    fn vertex_delta(&mut self, inst: &Inst, attribute: Attribute, vertex: u8) -> Result<(), Why> {
+        let packed = match &self.x.native.io {
+            StageIo::Ps { inputs, .. } => inputs.iter().any(|i| i.row == attribute.row && i.fp16),
+            _ => false,
+        };
+        if packed || attribute.high || inst.name().ends_with("_f16") {
+            return Err("a non-provoking vertex value of a 16-bit input");
+        }
+        let dst = match &inst.fields {
+            Fields::Vintrp { dst, .. } => *dst,
+            Fields::Valu(v) => v.dst.ok_or("an interpolation")?,
+            _ => unreachable!(),
+        };
+        let Operand::Vector { reg, .. } = dst else {
+            return Err("an interpolation");
+        };
+        let (of, _) = self
+            .find_input(attribute.row, attribute.channel)
+            .ok_or("an input the signature lacks")?;
+        let e = &self.s.inputs[of];
+        if e.comp != 9 {
+            return Err("a non-provoking vertex value of an integer input");
+        }
+        let (name, index, col, cols) = (
+            super::VERTEX_DELTAS[usize::from(vertex)],
+            e.row.unwrap_or(0),
+            e.col,
+            e.cols,
+        );
+        let id = match self
+            .s
+            .inputs
+            .iter()
+            .position(|e| e.name == name && e.index == index)
+        {
+            Some(id) => id,
+            None => {
+                let taken = |e: &SigElement| super::VERTEX_DELTAS.contains(&e.name.as_str());
+                let row = self
+                    .s
+                    .inputs
+                    .iter()
+                    .filter(|e| taken(e))
+                    .filter_map(|e| e.row)
+                    .min()
+                    .map_or(Some(super::VERTEX_DELTA_TOP), |r| r.checked_sub(1));
+                let highest = self
+                    .s
+                    .inputs
+                    .iter()
+                    .filter(|e| !taken(e))
+                    .filter_map(|e| e.row)
+                    .max();
+                let row = row
+                    .filter(|&r| highest.is_none_or(|h| r > h))
+                    .ok_or("no input row left for a non-provoking vertex value")?;
+                self.s.inputs.push(SigElement {
+                    name: name.into(),
+                    index,
+                    kind: 0,
+                    comp: 9,
+                    interp: 1,
+                    row: Some(row),
+                    col,
+                    cols,
+                    usage: 0,
+                    half: false,
+                });
+                self.s.inputs.len() - 1
+            }
+        };
+        let Val::I32(x) = self.load_any_input(id, attribute.channel - col) else {
+            return Err("an input");
+        };
         self.write(inst, Reg::V(reg), x, None);
         Ok(())
     }
