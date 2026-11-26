@@ -276,9 +276,14 @@ fn is_host_written(resource: This) -> bool {
 /// Whether `resource`'s host copy takes its contents from title memory:
 /// a texture the host GPU does not render to or write.
 pub(crate) fn title_written(texture: &ID3D12Resource) -> bool {
-    const TARGET_DEPTH_UNORDERED: i32 = 0x7;
     // SAFETY: a live resource.
-    unsafe { texture.GetDesc() }.Flags.0 & TARGET_DEPTH_UNORDERED == 0
+    flags_title_written(unsafe { texture.GetDesc() }.Flags.0 as u32)
+}
+
+/// [`title_written`] for a texture with resource flags `flags`.
+pub(crate) fn flags_title_written(flags: u32) -> bool {
+    const TARGET_DEPTH_UNORDERED: u32 = 0x7;
+    flags & TARGET_DEPTH_UNORDERED == 0
 }
 
 /// Copies [`alias_copy`] recorded since the last frame-rate line.

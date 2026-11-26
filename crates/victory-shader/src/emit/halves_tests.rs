@@ -1,6 +1,8 @@
 //! Console wave64 compute programs translated for a host of 32-lane waves
 //! (`lower::halves`): what reads within a 32-lane half runs exactly in two
-//! host waves of 32, what reads across them is refused with its reason.
+//! host waves of 32; what reads across them passes between the host waves
+//! through group-shared memory where every lane of the group runs it once,
+//! and is refused with its reason elsewhere.
 //!
 //! The GPU test runs one program on every hardware adapter: in halves
 //! everywhere (`WaveSize(32)`), and also as one wave64 (`WaveSize(64)`)
@@ -153,6 +155,7 @@ fn lowered_with(
         view_marks: false,
         atomic_locks: false,
         atomic_lock_rounds: false,
+        atomic_umax: false,
         bias_as_gradients: false,
         narrow_waves,
         host_wave32,
@@ -189,7 +192,7 @@ fn refusal(words: &[u32], threads: u32, lds_bytes: u32) -> String {
 /// The hand-encoded words are the instructions their comments name.
 #[test]
 fn the_test_programs_are_what_their_comments_say() {
-    let programs: [(Vec<u32>, &[&str]); 8] = [
+    let programs: Vec<(Vec<u32>, &[&str])> = vec![
         (
             in_halves(),
             &[
@@ -263,6 +266,67 @@ fn the_test_programs_are_what_their_comments_say() {
                 "s_add_u32 s20, s20, 1",
                 "s_cmp_lt_u32 s20, 2",
                 "s_cbranch_scc1",
+            ],
+        ),
+        (
+            lane_reads(40, 33),
+            &[
+                "v_readlane_b32 s12, v0, 40",
+                "v_readlane_b32 s14, v0, s13",
+                "v_mov_b32 v1, s12",
+                "v_mov_b32 v2, s14",
+                "buffer_store_dword v2, v16, s[40:43], 0 offen offset:4",
+            ],
+        ),
+        (
+            reduction(V_ADD_F32, 0x80, 0x7E06_0D00),
+            &[
+                "v_cvt_f32_u32 v3, v0",
+                "s_or_saveexec_b64 s[12:13], -1",
+                "v_cndmask_b32 v1, 0, v3, s[12:13]",
+                "v_permlanex16_b32 v2, v1, 0, 0",
+                "v_add_f32 v1, v2, v1",
+                "v_readlane_b32 s14, v1, 32",
+                "v_add_f32 v1, s14, v1",
+                "v_readlane_b32 s15, v1, 0",
+                "s_mov_b64 exec, s[12:13]",
+                "v_mov_b32 v1, s15",
+            ],
+        ),
+        (
+            reduction(V_MIN_U32, 0xC1, V_MOV_V3_V0),
+            &[
+                "v_mov_b32 v3, v0",
+                "v_cndmask_b32 v1, -1, v3, s[12:13]",
+                "v_min_u32 v1, v2, v1",
+                "v_min_u32 v1, s14, v1",
+            ],
+        ),
+        (
+            reduction(V_MAX_U32, 0x80, V_MOV_V3_V0),
+            &["v_max_u32 v1, v2, v1", "v_max_u32 v1, s14, v1"],
+        ),
+        (
+            exclusive_prefix(),
+            &[
+                "s_or_saveexec_b64 s[0:1], -1",
+                "v_cndmask_b32 v1, 0, v0, s[0:1]",
+                "v_add_nc_u32 v1, v1, v1 row_shr:8",
+                "v_readlane_b32 s2, v1, 47",
+                "v_mov_b32 v3, v1 row_shr:1",
+                "s_mov_b64 exec, -2",
+                "v_mov_b32 v2, v3",
+                "s_mov_b64 exec, s[0:1]",
+                "buffer_store_dword v2, v16, s[40:43], 0 offen",
+            ],
+        ),
+        (
+            in_a_loop(&[0xD760_000C, 0x0001_5100], 12),
+            &[
+                "v_readlane_b32 s12, v0, 40",
+                "s_add_u32 s20, s20, 1",
+                "s_cbranch_scc1",
+                "v_mov_b32 v1, s12",
             ],
         ),
     ];
@@ -372,6 +436,175 @@ fn lanes_below_in_a_loop() -> Vec<u32> {
     w
 }
 
+/// Per thread `l`, two dwords at `l * 32`: `v_readlane_b32` of the thread
+/// id at console lane `k` (a constant) and at lane `s` (in an SGPR).
+fn lane_reads(k: u32, s: u32) -> Vec<u32> {
+    let mut w = PROLOGUE.to_vec();
+    w.extend([
+        0x3420_0085, // v_lshlrev_b32 v16, 5, v0
+        0xD760_000C,
+        0x0001_0100 | (128 + k) << 9, // v_readlane_b32 s12, v0, k
+        0xBE8D_03FF,
+        s, // s_mov_b32 s13, s
+        0xD760_000E,
+        0x0000_1B00, // v_readlane_b32 s14, v0, s13
+        0x7E02_020C, // v_mov_b32 v1, s12
+        0x7E04_020E, // v_mov_b32 v2, s14
+    ]);
+    w.extend(store(1, 0));
+    w.extend(store(2, 4));
+    w.push(S_ENDPGM);
+    w
+}
+
+/// `body`, run twice by a scalar loop (so each lane runs its block more
+/// than once), then the scalar `s<result>` stored by every lane.
+fn in_a_loop(body: &[u32], result: u32) -> Vec<u32> {
+    let mut w = PROLOGUE.to_vec();
+    w.extend([
+        0x3420_0085, // v_lshlrev_b32 v16, 5, v0
+        0xD765_0001,
+        0x0001_00C1, // v_mbcnt_lo_u32_b32 v1, -1, 0
+        0xBE94_0380, // s_mov_b32 s20, 0
+    ]);
+    w.extend(body);
+    let back = -(body.len() as i32 + 3);
+    w.extend([
+        0x8014_8114,                          // s_add_u32 s20, s20, 1
+        0xBF0A_8214,                          // s_cmp_lt_u32 s20, 2
+        0xBF85_0000 | (back as u32 & 0xFFFF), // s_cbranch_scc1 (back to the body)
+        0x7E02_0200 | result,                 // v_mov_b32 v1, s<result>
+    ]);
+    w.extend(store(1, 0));
+    w.push(S_ENDPGM);
+    w
+}
+
+/// VOP2 opcodes of the operations [`reduction`] takes.
+const V_ADD_F32: u32 = 0x03;
+const V_MIN_U32: u32 = 0x13;
+const V_MAX_U32: u32 = 0x14;
+/// `v_mov_b32 v3, v0`.
+const V_MOV_V3_V0: u32 = 0x7E06_0300;
+
+/// The console compiler's whole-wave reduction of `v3` (`input`, from the
+/// thread id) by the VOP2 operation `op`, with the inline constant `ident`
+/// in inactive lanes: within rows of 16 by DPP, across rows by
+/// `v_permlanex16`, across the halves by `v_readlane` of lane 32, and read
+/// back from lane 0. Per thread, one dword at `l * 32`: its console wave's
+/// result.
+fn reduction(op: u32, ident: u32, input: u32) -> Vec<u32> {
+    let vop2 = |word: u32| word & !(0x3F << 25) | op << 25;
+    let mut w = PROLOGUE.to_vec();
+    w.extend([
+        0x3420_0085, // v_lshlrev_b32 v16, 5, v0
+        input,       // v3 from v0
+        0xBE8C_25C1, // s_or_saveexec_b64 s[12:13], -1
+        0xD501_0001,
+        0x0032_0600 | ident, // v_cndmask_b32 v1, ident, v3, s[12:13]
+    ]);
+    for control in [0x161, 0x162, 0x164, 0x168] {
+        w.extend([
+            vop2(0x0602_02FA),
+            0xFF00_0001 | control << 8, // op v1, v1, v1 row_xmask
+        ]);
+    }
+    w.extend([
+        0xD778_0002,
+        0x0201_0101,       // v_permlanex16_b32 v2, v1, 0, 0
+        vop2(0x0602_0302), // op v1, v2, v1
+        0xD760_000E,
+        0x0001_4101,       // v_readlane_b32 s14, v1, 32
+        vop2(0x0602_020E), // op v1, s14, v1
+        0xD760_000F,
+        0x0001_0101, // v_readlane_b32 s15, v1, 0
+        0xBEFE_040C, // s_mov_b64 exec, s[12:13]
+        0x7E02_020F, // v_mov_b32 v1, s15
+    ]);
+    w.extend(store(1, 0));
+    w.push(S_ENDPGM);
+    w
+}
+
+/// What the console gives [`reduction`] of `f` (folding the inputs of a
+/// console wave's lanes) in lane `l` of a group of `threads`.
+fn console_reduction(
+    threads: u32,
+    l: u32,
+    f: impl Fn(u32, u32) -> u32,
+    input: impl Fn(u32) -> u32,
+) -> u32 {
+    let wave = l & !63;
+    (wave + 1..(wave + 64).min(threads)).fold(input(wave), |a, t| f(a, input(t)))
+}
+
+/// The console compiler's exclusive prefix sum of the thread id over the
+/// wave64 (`WavePrefixSum`): inclusive within rows of 16 by DPP, rows
+/// joined by `v_readlane` of each row's last lane under EXEC of the rows
+/// after it, shifted one lane on (the first lane of each row from the
+/// previous row's last), lane 0 the identity. One dword per thread at
+/// `l * 32`.
+fn exclusive_prefix() -> Vec<u32> {
+    const EXEC: u32 = 126;
+    let sop1 = |sdst: u32, op: u32, ssrc0: u32| 0xBE80_0000 | sdst << 16 | op << 8 | ssrc0;
+    let vop1 = |vdst: u32, src0: u32| 0x7E00_0200 | vdst << 17 | src0;
+    let add = |src0: u32| 0x4A02_0200 | src0; // v_add_nc_u32 v1, src0, v1
+    let dpp = |ctrl: u32| 0xFF00_0001 | ctrl << 8; // of v1, row and bank masks 0xf
+    let readlane = |lane: u32| [0xD760_0002, 0x0000_0101 | (128 + lane) << 9]; // s2, v1
+    let mut w = PROLOGUE.to_vec();
+    w.extend([
+        0x3420_0085,        // v_lshlrev_b32 v16, 5, v0
+        sop1(0, 0x25, 193), // s_or_saveexec_b64 s[0:1], -1
+        0xD501_0001,
+        0x0002_0080, // v_cndmask_b32 v1, 0, v0, s[0:1]
+    ]);
+    for shift in [1, 2, 4, 8] {
+        w.extend([add(0xFA), dpp(0x110 + shift)]); // v_add_nc_u32 v1, v1, v1 row_shr
+    }
+    // Each row's sum so far into the rows after it.
+    for (last, exec_lo, exec_hi) in [
+        (15, 0xFFFF_0000, 0),
+        (31, 0, 0x0000_FFFF),
+        (47, 0, 0xFFFF_0000),
+    ] {
+        w.extend(readlane(last));
+        w.extend([
+            sop1(EXEC, 0x03, 255),
+            exec_lo,
+            sop1(EXEC + 1, 0x03, 255),
+            exec_hi,
+        ]);
+        w.push(add(2)); // v_add_nc_u32 v1, s2, v1
+    }
+    w.extend([
+        sop1(EXEC, 0x04, 193), // s_mov_b64 exec, -1
+        vop1(3, 257),          // v_mov_b32 v3, v1
+        vop1(3, 0xFA),
+        dpp(0x111), // v_mov_b32 v3, v1 row_shr:1
+    ]);
+    // The first lane of each row from the last of the row before.
+    for (last, exec_lo, exec_hi) in [(15, 0x0001_0000, 0), (31, 0, 1), (47, 0, 0x0001_0000)] {
+        w.extend(readlane(last));
+        w.extend([
+            sop1(EXEC, 0x03, 255),
+            exec_lo,
+            sop1(EXEC + 1, 0x03, 255),
+            exec_hi,
+        ]);
+        w.push(vop1(3, 2)); // v_mov_b32 v3, s2
+    }
+    w.extend([
+        sop1(EXEC, 0x04, 193), // s_mov_b64 exec, -1
+        vop1(2, 128),          // v_mov_b32 v2, 0
+        sop1(EXEC, 0x04, 194), // s_mov_b64 exec, -2
+        vop1(2, 259),          // v_mov_b32 v2, v3
+        sop1(EXEC, 0x04, 0),   // s_mov_b64 exec, s[0:1]
+    ]);
+    w.extend(store(2, 0));
+    w.push(S_ENDPGM);
+    w
+}
+
 /// A lane mask read as data in a group of 33 to 64 lanes or more holds
 /// lanes of both host waves: they pass their halves to each other where
 /// each lane of the group runs the block writing it once, and it is refused
@@ -414,67 +647,125 @@ fn lane_masks_passed_between_halves_match_the_console_on_every_gpu() {
     assert!(failed.is_empty(), "{}", failed.join("\n"));
 }
 
+/// Whole-wave reductions and prefix sums pass between the halves where
+/// every lane of the group runs them once; in a group of 32 or fewer, one
+/// host wave holds the whole console wave.
 #[test]
-fn an_active_reduction_fits_in_a_single_host_wave() {
-    let mut sum = PROLOGUE.to_vec();
-    sum.extend([
-        0x3420_0085, // v_lshlrev_b32 v16, 5, v0
-        0x7E06_0D00, // v_cvt_f32_u32 v3, v0
-        0xBE8C_25C1, // s_or_saveexec_b64 s[12:13], -1
-        0xD501_0001,
-        0x0032_0680, // v_cndmask_b32 v1, 0, v3, s[12:13]
-    ]);
-    for control in [0x161, 0x162, 0x164, 0x168] {
-        sum.extend([
-            0x0602_02FA,
-            0xFF00_0001 | control << 8, // v_add_f32 v1, v1, v1 row_xmask
-        ]);
+fn reductions_and_prefixes_pass_between_halves() {
+    let sum = reduction(V_ADD_F32, 0x80, 0x7E06_0D00);
+    for threads in [32, 64, 96, 128] {
+        assert_eq!(refusal(&sum, threads, 0), "translated");
+        assert_eq!(refusal(&exclusive_prefix(), threads, 0), "translated");
     }
-    sum.extend([
-        0xD778_0002,
-        0x0201_0101, // v_permlanex16_b32 v2, v1, 0, 0
-        0x0602_0302, // v_add_f32 v1, v2, v1
-        0xD760_000E,
-        0x0001_4101, // v_readlane_b32 s14, v1, 32
-        0x0602_020E, // v_add_f32 v1, s14, v1
-        0xD760_000F,
-        0x0001_0101, // v_readlane_b32 s15, v1, 0
-        0xBEFE_040C, // s_mov_b64 exec, s[12:13]
-        0x7E02_020F, // v_mov_b32 v1, s15
-    ]);
-    sum.extend(store(1, 0));
-    sum.push(S_ENDPGM);
+    let looped = in_a_loop(&sum[PROLOGUE.len() + 1..sum.len() - 3], 15);
+    let why = refusal(&looped, 64, 0);
+    assert!(
+        why.contains("a wave reduction over both 32-lane halves"),
+        "{why}"
+    );
+    assert_eq!(refusal(&looped, 32, 0), "translated");
 
-    let why = refusal(&sum, 64, 0);
-    assert!(why.contains("a wave reduction over both 32-lane halves"), "{why}");
-    let failed = differences(&sum, 32, 1, &[496.0_f32.to_bits(); 32]);
+    for words in [sum, exclusive_prefix()] {
+        let halves = lowered(&native(&words, true, 96, 0), true).expect("halves");
+        assert_eq!(halves.wave_size, Some(32));
+        if let Ok(mut v) =
+            validator::Validator::load(validator::Validator::default_path().as_deref())
+        {
+            v.validate(&mut halves.dxil.clone())
+                .expect("DXIL validation failed");
+        }
+    }
+}
+
+/// [`reduction`]s and [`exclusive_prefix`] on every hardware adapter give
+/// the console's results: in a group of 32 (one host wave), of 64 (one
+/// console wave in two halves), of 128 (two), and of 96, whose second
+/// console wave has no upper half.
+#[test]
+fn reductions_and_prefixes_across_halves_match_the_console_on_every_gpu() {
+    let mut failed = Vec::new();
+    for threads in [32, 64, 96, 128] {
+        let want: Vec<u32> = (0..threads)
+            .map(|l| {
+                let sum = console_reduction(threads, l, |a, b| a + b, |t| t);
+                (sum as f32).to_bits()
+            })
+            .collect();
+        failed.extend(differences(
+            &reduction(V_ADD_F32, 0x80, 0x7E06_0D00),
+            threads,
+            1,
+            &want,
+        ));
+        let want: Vec<u32> = (0..threads)
+            .map(|l| console_reduction(threads, l, u32::min, |t| t ^ 0x2A))
+            .collect();
+        let xor = 0x3A06_00AA; // v_xor_b32 v3, 42, v0
+        failed.extend(differences(
+            &reduction(V_MIN_U32, 0xC1, xor),
+            threads,
+            1,
+            &want,
+        ));
+        let want: Vec<u32> = (0..threads)
+            .map(|l| console_reduction(threads, l, u32::max, |t| t ^ 0x2A))
+            .collect();
+        failed.extend(differences(
+            &reduction(V_MAX_U32, 0x80, xor),
+            threads,
+            1,
+            &want,
+        ));
+        let want: Vec<u32> = (0..threads)
+            .map(|l| {
+                let (wave, k) = (l & !63, l & 63);
+                wave * k + k * k.saturating_sub(1) / 2
+            })
+            .collect();
+        failed.extend(differences(&exclusive_prefix(), threads, 1, &want));
+    }
     assert!(failed.is_empty(), "{}", failed.join("\n"));
 }
 
-/// Reads across the halves are refused where they are made, with a reason
-/// naming the host's waves; the same programs translate for 64-lane hosts.
+/// Lane reads and first-lane reads that may be in the other half pass
+/// between the halves where every lane of the group runs them once, and are
+/// refused with a reason naming the host's waves in a block that runs more
+/// than once; the same programs translate for 64-lane hosts.
 #[test]
-fn reads_across_32_lane_halves_are_refused_with_their_reason() {
-    let readlane = [
-        PROLOGUE.as_slice(),
-        &[
-            0x3420_0085, // v_lshlrev_b32 v16, 5, v0
-            0xD760_000C,
-            0x0001_5100, // v_readlane_b32 s12, v0, 40
-            0x7E02_020C, // v_mov_b32 v1, s12
-        ],
-        &store(1, 0),
-        &[S_ENDPGM],
-    ]
-    .concat();
-    assert!(
-        refusal(&readlane, 64, 0).contains("a lane read that may cross 32-lane halves"),
-        "{}",
-        refusal(&readlane, 64, 0)
+fn lane_reads_pass_between_halves() {
+    for threads in [32, 64, 96, 128] {
+        assert_eq!(refusal(&lane_reads(40, 33), threads, 0), "translated");
+        assert_eq!(
+            refusal(&first_lane_of_the_thread_id(), threads, 0),
+            "translated"
+        );
+    }
+    assert_eq!(
+        refusal(&first_lane_of_a_buffer_load(0), 64, 0),
+        "translated"
     );
+
+    let readlane = in_a_loop(&[0xD760_000C, 0x0001_5100], 12); // v_readlane_b32 s12, v0, 40
+    let why = refusal(&readlane, 64, 0);
+    assert!(
+        why.contains("a lane read that may cross 32-lane halves (wave64 on a 32-lane host)"),
+        "{why}"
+    );
+    assert_eq!(refusal(&readlane, 32, 0), "translated");
     assert!(lowered(&native(&readlane, true, 64, 0), false).is_ok());
 
-    let first = [
+    let first = in_a_loop(&[0x7E18_0500], 12); // v_readfirstlane_b32 s12, v0
+    let why = refusal(&first, 64, 0);
+    assert!(
+        why.contains("a first-lane read of a value that may differ between 32-lane halves"),
+        "{why}"
+    );
+    assert_eq!(refusal(&first, 32, 0), "translated");
+    assert!(lowered(&native(&first, true, 64, 0), false).is_ok());
+
+    // A first-lane read alone needs no console lanes: the host wave's
+    // first lane, in halves or not.
+    let first_alone = [
         PROLOGUE.as_slice(),
         &[
             0x3420_0085, // v_lshlrev_b32 v16, 5, v0
@@ -485,58 +776,54 @@ fn reads_across_32_lane_halves_are_refused_with_their_reason() {
         &[S_ENDPGM],
     ]
     .concat();
-    // A first-lane read alone needs no console lanes: the host wave's
-    // first lane, in halves or not.
-    assert_eq!(refusal(&first, 64, 0), "translated");
-
-    // With console lanes the program runs in halves, where lane 32 is the
-    // upper host wave's first lane: a value that differs between the halves
-    // (the thread id) would read 32 there, the console 0. In a group of 32
-    // there is no upper half.
-    let why = refusal(&first_lane_of_the_thread_id(), 64, 0);
-    assert!(
-        why.contains("a first-lane read of a value that may differ between 32-lane halves"),
-        "{why}"
-    );
-    assert_eq!(refusal(&first_lane_of_the_thread_id(), 32, 0), "translated");
-    // A first-lane read nothing uses costs nothing.
-    let unused_first = [
-        PROLOGUE.as_slice(),
-        &[
-            0x3420_0085, // v_lshlrev_b32 v16, 5, v0
-            0xD765_0001,
-            0x0001_00C1, // v_mbcnt_lo_u32_b32 v1, -1, 0
-            0x7E18_0500, // v_readfirstlane_b32 s12, v0
-        ],
-        &store(1, 0),
-        &[S_ENDPGM],
-    ]
-    .concat();
-    assert_eq!(refusal(&unused_first, 64, 0), "translated");
-    // A buffer dword loaded at an offset the same in every lane, through a
-    // scalar descriptor, is one value: its first lane is the console's.
-    assert_eq!(refusal(&first_lane_of_a_buffer_load(3), 64, 0), "translated");
-    let why = refusal(&first_lane_of_a_buffer_load(0), 64, 0);
-    assert!(
-        why.contains("a first-lane read of a value that may differ between 32-lane halves"),
-        "{why}"
+    assert_eq!(refusal(&first_alone, 64, 0), "translated");
+    // Nor does a value the same in every lane: a buffer dword loaded at an
+    // offset the same in every lane, through a scalar descriptor.
+    assert_eq!(
+        refusal(&first_lane_of_a_buffer_load(3), 64, 0),
+        "translated"
     );
 
-    // A value read across halves that nothing uses costs nothing.
-    let unused = [
-        PROLOGUE.as_slice(),
-        &[
-            0x3420_0085, // v_lshlrev_b32 v16, 5, v0
-            0xD760_000C,
-            0x0001_5100, // v_readlane_b32 s12, v0, 40
-            0xD765_0001,
-            0x0001_00C1, // v_mbcnt_lo_u32_b32 v1, -1, 0
-        ],
-        &store(1, 0),
-        &[S_ENDPGM],
-    ]
-    .concat();
-    assert_eq!(refusal(&unused, 64, 0), "translated");
+    for words in [lane_reads(20, 5), first_lane_of_the_thread_id()] {
+        let halves = lowered(&native(&words, true, 96, 0), true).expect("halves");
+        assert_eq!(halves.wave_size, Some(32));
+        if let Ok(mut v) =
+            validator::Validator::load(validator::Validator::default_path().as_deref())
+        {
+            v.validate(&mut halves.dxil.clone())
+                .expect("DXIL validation failed");
+        }
+    }
+}
+
+/// [`lane_reads`] and [`first_lane_of_the_thread_id`] on every hardware
+/// adapter give the console's lanes: in a group of one console wave, of
+/// two, of 96 (the second console wave has no upper half), and of 32.
+#[test]
+fn lane_reads_across_halves_match_the_console_on_every_gpu() {
+    let mut failed = Vec::new();
+    for (k, s, threads) in [
+        (40, 33, 64),
+        (40, 63, 128),
+        (7, 50, 128),
+        (20, 5, 96),
+        (20, 5, 32),
+    ] {
+        let want: Vec<u32> = (0..threads)
+            .flat_map(|l| [(l & !63) + k, (l & !63) + s])
+            .collect();
+        failed.extend(differences(&lane_reads(k, s), threads, 2, &want));
+    }
+    for threads in [64, 96, 128] {
+        let want: Vec<u32> = (0..threads).map(|l| l & !63).collect();
+        failed.extend(differences(
+            &first_lane_of_the_thread_id(),
+            threads,
+            1,
+            &want,
+        ));
+    }
+    assert!(failed.is_empty(), "{}", failed.join("\n"));
 }
 
 /// LDS shared by a group that is one console wave64 (no barriers between

@@ -89,9 +89,15 @@ pub const fn atomic_lock_spins(stage: HwStage) -> u32 {
 /// Where the lock words start in the buffer bound at `u`[`VIEW_WRITES`], in
 /// bytes: after the written pages and the read marks.
 pub const ATOMIC_LOCKS_AT: u32 = (VIEW_READS + HEAP_VIEWS) / 8;
+/// Where the count of lanes that gave up waiting for a lock is, in bytes
+/// of the buffer bound at `u`[`VIEW_WRITES`]: the dword after the lock
+/// words. Each lane that waits out its bound adds one before it goes on
+/// without the lock (`emit`, "Atomic locks"); the host reads and clears it
+/// after a submission.
+pub const ATOMIC_LOCKS_GAVE_UP_AT: u32 = ATOMIC_LOCKS_AT + 4 * ATOMIC_LOCKS;
 /// The bytes of the buffer bound at `u`[`VIEW_WRITES`]: the written pages,
-/// the read marks, then the lock words.
-pub const VIEW_WRITES_BYTES: u32 = ATOMIC_LOCKS_AT + 4 * ATOMIC_LOCKS;
+/// the read marks, the lock words, then the count of lanes that gave up.
+pub const VIEW_WRITES_BYTES: u32 = ATOMIC_LOCKS_GAVE_UP_AT + 4;
 
 /// `ShaderFlags` bits (metadata) and their `SFI0` feature bits.
 pub(crate) mod flags {

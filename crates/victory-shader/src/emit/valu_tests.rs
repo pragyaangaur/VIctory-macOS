@@ -152,6 +152,7 @@ fn lower_valu_cs(native: &NativeProgram) -> Result<HostShader, crate::ShaderErro
         mesh_stride: 0,
         atomic_locks: false,
         atomic_lock_rounds: false,
+        atomic_umax: false,
         bias_as_gradients: false,
         host_wave32: false,
         narrow_waves: false,
@@ -1679,17 +1680,19 @@ fn bfe_signed_and_unsigned_match_rdna2() {
 /// tables at s4 and s6 (slots 1 and 2); `used` lists (table user SGPR,
 /// kind, table offset in dwords, descriptor dwords).
 fn lower_cs32(words: &[u32], used: &[(u8, ResourceType, u32, u8)], validate: bool) -> HostShader {
-    lower_cs32_with(words, used, validate, false, false)
+    lower_cs32_with(words, used, validate, false, false, false)
 }
 
 /// [`lower_cs32`], with 64-bit image atomics under locks if `atomic_locks`,
-/// tried first in rounds if `atomic_lock_rounds`.
+/// tried first in rounds if `atomic_lock_rounds`, and a glc-clear umax
+/// reduced a texel a representative if `atomic_umax`.
 fn lower_cs32_with(
     words: &[u32],
     used: &[(u8, ResourceType, u32, u8)],
     validate: bool,
     atomic_locks: bool,
     atomic_lock_rounds: bool,
+    atomic_umax: bool,
 ) -> HostShader {
     let param = |root, user_data, slot| RootParam {
         root,
@@ -1745,6 +1748,7 @@ fn lower_cs32_with(
         mesh_stride: 0,
         atomic_locks,
         atomic_lock_rounds,
+        atomic_umax,
         bias_as_gradients: super::host::under_wine(),
         host_wave32: false,
         narrow_waves: false,
@@ -2000,7 +2004,7 @@ fn image_atomics_of_64_bits() {
     // rounds first. Texel (0, 0) puts all 32 lanes on one lock.
     for (locks, rounds) in [(false, false), (true, false), (true, true)] {
         let used = &[(4, ResourceType::Uav, 0, 8)];
-        let shader = lower_cs32_with(&words, used, true, locks, rounds);
+        let shader = lower_cs32_with(&words, used, true, locks, rounds, false);
         assert_eq!(shader.view_marks, locks, "the lock words' buffer");
         for (label, warp) in [("hardware", false), ("warp", true)] {
             let Ok(host) = Host::new(warp) else {
@@ -2055,18 +2059,20 @@ fn image_atomics_of_64_bits() {
 }
 
 /// The shader `words` with its 64-bit image atomics under locks (in rounds
-/// first if `rounds`), run as `groups` groups of 32 lanes on the hardware
-/// device or else WARP, over one R32G32_UINT texture UAV `width` x
-/// `height`: its texels as 64-bit values, the lock words' buffer, and the
-/// device's label, and how long the dispatch took (the pipeline made
-/// before). `None` with no SM 6.6 device.
+/// first if `rounds`, and a glc-clear umax reduced if `umax`), run as
+/// `groups` groups of 32 lanes on the hardware device or else WARP, over
+/// one R32G32_UINT texture UAV `width` x `height`: its texels as 64-bit
+/// values, the lock words' buffer, and the device's label, and how long
+/// the dispatch took (the pipeline made before). `None` with no SM 6.6
+/// device.
 fn locked_atomics64(
     words: &[u32],
     rounds: bool,
+    umax: bool,
     (width, height): (u32, u32),
     groups: u32,
 ) -> Option<(Vec<u64>, Vec<u32>, &'static str, std::time::Duration)> {
-    let shader = lower_cs32_with(words, &[(4, ResourceType::Uav, 0, 8)], true, true, rounds);
+    let shader = lower_cs32_with(words, &[(4, ResourceType::Uav, 0, 8)], true, true, rounds, umax);
     let (host, label) = [("hardware", false), ("warp", true)]
         .into_iter()
         .find_map(|(label, warp)| Host::new(warp).ok().map(|h| (h, label)))?;
@@ -2168,14 +2174,19 @@ fn image_atomics_of_64_bits_in_rounds_match_the_turns() {
         }
         for groups in [1, 8] {
             let mut rows = Vec::new();
-            for rounds in [false, true] {
+            for (rounds, umax) in [(false, false), (true, false), (true, true)] {
                 let Some((got, locks, label, _)) =
-                    locked_atomics64(&words, rounds, (32, 2), groups)
+                    locked_atomics64(&words, rounds, umax, (32, 2), groups)
                 else {
                     eprintln!("no SM 6.6 device; skipped");
                     return;
                 };
-                let form = if rounds { "rounds" } else { "turns" };
+                // The umax form must not take this glc-set umax.
+                let form = match (rounds, umax) {
+                    (false, _) => "turns",
+                    (true, false) => "rounds",
+                    (true, true) => "reduced",
+                };
                 let label = format!(
                     "{label}, {form}, {groups} groups, keys {a:#x} {b:#x} {c:#x} {d:#x} {e:#x}"
                 );
@@ -2195,6 +2206,80 @@ fn image_atomics_of_64_bits_in_rounds_match_the_turns() {
                 rows.push(got);
             }
             assert_eq!(rows[0][..32], rows[1][..32], "row 0 in turns and in rounds");
+            assert_eq!(rows[0][..32], rows[2][..32], "row 0 in turns and reduced");
+        }
+    }
+}
+
+/// A glc-clear 64-bit `umax` of random keys, reduced a texel a
+/// representative (#240): each of 32 lanes takes the maximum of its key
+/// into one of the 8 texels of row 0, with high dwords of 0 to 3, so
+/// keys often tie on the high dword and the low one decides — the tie
+/// case the issue's thread set for any faster form. With the reduction
+/// the wave folds each texel's lanes to one representative before
+/// anything locks. As one group and as 8 groups of the same lanes: row
+/// 0 holds each texel's largest key with and without the reduction, and
+/// no lock is left taken.
+#[test]
+fn image_atomics_of_64_bits_umax_matches_the_locks() {
+    let (v0, v1, v2, v6) = (vgpr(0), vgpr(1), vgpr(2), vgpr(6));
+    let mut state = 0x2545_F491_4F6C_DD1Du64;
+    let mut random = || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        (state >> 32) as u32
+    };
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    for _ in 0..6 {
+        let [a, b, c, d, e] = [random() | 1, random(), random(), random(), random()];
+        let mut words = atomics64_prologue();
+        for (s, x) in [(16, a), (17, b), (18, c), (19, d), (20, e)] {
+            words.extend([s_mov_b32(s, 255), x]);
+        }
+        words.extend(vop3(0x169, 6, sgpr(16), v0, 0)); // v_mul_lo_u32 v6, s16, v0
+        words.extend(vop3(0x169, 1, sgpr(17), v0, 0)); // v_mul_lo_u32 v1, s17, v0
+        words.extend(vop3(0x169, 2, sgpr(19), v0, 0)); // v_mul_lo_u32 v2, s19, v0
+        words.extend([
+            0x16 << 25 | 6 << 17 | (v6 as u32 & 0xFF) << 9 | 157, // v_lshrrev_b32 v6, 29, v6
+            vop1(0x001, 7, 128),                                  // v_mov_b32 v7, 0
+            0x25 << 25 | 1 << 17 | (v1 as u32 & 0xFF) << 9 | 18,  // v_add_nc_u32 v1, s18, v1
+            0x25 << 25 | 2 << 17 | (v2 as u32 & 0xFF) << 9 | 20,  // v_add_nc_u32 v2, s20, v2
+            0x16 << 25 | 2 << 17 | (v2 as u32 & 0xFF) << 9 | 158, // v_lshrrev_b32 v2, 30, v2
+        ]);
+        // umax v[1:2] into (x, 0): glc clear, the reduction's gate.
+        words.extend(image_atomic(0x17, 1, 6, 8, 3, false));
+        words.push(S_ENDPGM);
+        let texel = |l: u32| (l.wrapping_mul(a) >> 29) as usize;
+        let key = |l: u32| {
+            let hi = l.wrapping_mul(d).wrapping_add(e) >> 30;
+            u64::from(l.wrapping_mul(b).wrapping_add(c)) | u64::from(hi) << 32
+        };
+        let mut want = [0u64; 32];
+        for l in 0..32 {
+            want[texel(l)] = want[texel(l)].max(key(l));
+        }
+        for groups in [1, 8] {
+            let mut rows = Vec::new();
+            for umax in [false, true] {
+                let Some((got, locks, label, _)) =
+                    locked_atomics64(&words, true, umax, (32, 2), groups)
+                else {
+                    eprintln!("no SM 6.6 device; skipped");
+                    return;
+                };
+                let form = if umax { "reduced" } else { "in rounds" };
+                let label = format!(
+                    "{label}, {form}, {groups} groups, keys {a:#x} {b:#x} {c:#x} {d:#x} {e:#x}"
+                );
+                assert_eq!(got[..32], want, "{label}: row 0");
+                assert!(
+                    locks.iter().all(|&w| w == 0),
+                    "{label}: a lock left taken or a page marked"
+                );
+                rows.push(got);
+            }
+            assert_eq!(rows[0][..32], rows[1][..32], "row 0 reduced and in rounds");
         }
     }
 }
@@ -2221,11 +2306,12 @@ fn image_atomic_adds_of_64_bits_apply_once() {
 
 /// The adds of [`image_atomic_adds_of_64_bits_apply_once`] where 2,048
 /// groups meet on one lock, 20 times in each form. A lane that waits out
-/// its bound goes on without the lock and loses its add: with a bound of
+/// its bound goes on without the lock and can lose its add: with a bound of
 /// 2^16 tries this lost adds on an M5 Pro (2 of 100 runs in turns, 1 of 40
 /// in rounds) and with 8 groups on an M2 Max (patcliftongc, #240); see
-/// [`super::ATOMIC_LOCK_SPINS`]. Slow on WARP; run with `--ignored` on a
-/// Mac.
+/// [`super::ATOMIC_LOCK_SPINS`]. Every lost add must have a lane that gave
+/// up behind it ([`super::ATOMIC_LOCKS_GAVE_UP_AT`]): a loss without one
+/// would be another fault. Slow on WARP; run with `--ignored` on a Mac.
 #[test]
 #[ignore = "a stress under contention, for D3DMetal (#240)"]
 fn image_atomic_adds_of_64_bits_apply_once_under_contention() {
@@ -2266,14 +2352,29 @@ fn adds64_words() -> Vec<u32> {
 /// `rounds`) and checks that every add applied once and no lock is left
 /// taken. `false` with no SM 6.6 device.
 fn adds64_apply_once(words: &[u32], groups: u64, rounds: bool) -> bool {
-    let Some((got, locks, label, _)) = locked_atomics64(words, rounds, (32, 2), groups as u32)
+    let Some((got, locks, label, _)) = locked_atomics64(words, rounds, false, (32, 2), groups as u32)
     else {
         return false;
     };
     let form = if rounds { "rounds" } else { "turns" };
     let label = format!("{label}, {form}, {groups} groups");
     let add = u64::from(u32::MAX);
-    assert_eq!(got[0], 32 * groups * add, "{label}: the shared texel");
+    // Lanes that waited out their bound and went on without the lock: the
+    // only way an add may be lost.
+    let (count, locks) = locks.split_last().expect("the give-up count");
+    let gave_up = u64::from(*count);
+    let short = |t: u64, want: u64| want.saturating_sub(t) / add;
+    let own: u64 = got[32..].iter().map(|&t| short(t, groups * add)).sum();
+    let lost = short(got[0], 32 * groups * add) + own;
+    assert!(
+        lost <= gave_up,
+        "{label}: {lost} adds lost but {gave_up} lanes gave up their lock"
+    );
+    assert_eq!(
+        got[0],
+        32 * groups * add,
+        "{label}: the shared texel ({gave_up} lanes gave up their lock)"
+    );
     assert!(
         got[1..32].iter().all(|&t| t == 0),
         "{label}: the rest of row 0"
@@ -2286,6 +2387,7 @@ fn adds64_apply_once(words: &[u32], groups: u64, rounds: bool) -> bool {
         locks.iter().all(|&w| w == 0),
         "{label}: a lock left taken or a page marked"
     );
+    assert_eq!(gave_up, 0, "{label}: lanes that gave up their lock");
     true
 }
 
@@ -2332,7 +2434,7 @@ fn atomic_lock_rounds_timing() {
             let want: Vec<u64> = (0..n).flat_map(|_| (0..32).map(|l| l | 1 << 32)).collect();
             let mut warm = None;
             for _ in 0..2 {
-                let Some((got, _, label, took)) = locked_atomics64(&words, rounds, (32, n), 1)
+                let Some((got, _, label, took)) = locked_atomics64(&words, rounds, false, (32, n), 1)
                 else {
                     eprintln!("no SM 6.6 device; skipped");
                     return;

@@ -835,6 +835,10 @@ pub(crate) struct HostTexture {
     /// A depth texture's writable twin (`crate::twin`), made with its first
     /// unordered access view; `None` inside if it has none.
     pub(crate) twin: std::sync::OnceLock<Option<crate::twin::Twin>>,
+    /// Its resource flags, read when it was made: a desc never changes, and
+    /// a draw asks for them per texture it reads or renders to (a `GetDesc`
+    /// into the host each time).
+    flags: u32,
     /// Bytes it takes on the host GPU.
     bytes: u64,
     /// A list used it (counted once).
@@ -859,9 +863,11 @@ impl HostTexture {
         state: u32,
         castable: Vec<u32>,
     ) -> Self {
+        // SAFETY: a plain query on a live resource.
+        let desc = unsafe { texture.GetDesc() };
         let bytes = crate::host::host().map_or(0, |h| {
-            // SAFETY: plain queries on a live resource.
-            unsafe { h.device.GetResourceAllocationInfo(0, &[texture.GetDesc()]) }.SizeInBytes
+            // SAFETY: a plain query.
+            unsafe { h.device.GetResourceAllocationInfo(0, &[desc]) }.SizeInBytes
         });
         TEXTURES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         TEXTURE_BYTES.fetch_add(bytes, std::sync::atomic::Ordering::Relaxed);
@@ -874,6 +880,7 @@ impl HostTexture {
             heap_writable: false.into(),
             staging: std::sync::Mutex::new(None),
             twin: std::sync::OnceLock::new(),
+            flags: desc.Flags.0 as u32,
             bytes,
             used: false.into(),
             viewed: false.into(),
@@ -881,6 +888,17 @@ impl HostTexture {
             placement: None,
             last: [crate::queue::presented().into(), now_ms().into()],
         }
+    }
+
+    /// Whether its contents come from title memory: the host GPU does not
+    /// render to or write it (`crate::texture::title_written`).
+    pub(crate) fn title_written(&self) -> bool {
+        crate::texture::flags_title_written(self.flags)
+    }
+
+    /// `state` without the bits its flags forbid (`crate::host::legal_state`).
+    pub(crate) fn legal_state(&self, state: u32) -> u32 {
+        crate::host::legal_for(self.flags, state)
     }
 
     /// The title used it now: a list of the title's names it, or a shader
@@ -982,7 +1000,7 @@ pub(crate) fn texture_census() -> [[u64; 3]; 2] {
     let mut bytes = [[0; 3]; 2];
     let map = MEMORY.lock().unwrap_or_else(|e| e.into_inner());
     for t in map.iter().flat_map(|m| m.values()).filter_map(std::sync::Weak::upgrade) {
-        let gpu = usize::from(!crate::texture::title_written(&t.texture));
+        let gpu = usize::from(!t.title_written());
         let reach = if t.used.load(Relaxed) { 0 } else if t.viewed.load(Relaxed) { 1 } else { 2 };
         bytes[1 - gpu][reach] += t.bytes;
     }
@@ -2007,17 +2025,21 @@ pub(crate) fn alias_source(placed: This) -> Option<This> {
         let rows = u64::from(d.height).div_ceil(block);
         Some((d.dimension, d.width.div_ceil(block) * size, rows, d.depth_or_array_size, d.sample_count, swizzle))
     };
-    let want = bytes(&b.desc)?;
-    map.get(&(b.data() as u64))?
+    // Most views have no such sibling: look for one before laying `placed`
+    // out (every texture read of a draw comes here, under the lock).
+    let mut written = map
+        .get(&(b.data() as u64))?
         .iter()
         .map(|&r| r as This)
-        .filter(|&r| r != placed)
-        .find(|&r| {
-            let a = resource(r);
-            a.desc.flags & WRITTEN != 0
-                && bytes(&a.desc) == Some(want)
-                && matches!((made(a), made(b)), (Some(x), Some(y)) if !std::sync::Arc::ptr_eq(&x, &y))
-        })
+        .filter(|&r| r != placed && resource(r).desc.flags & WRITTEN != 0)
+        .peekable();
+    written.peek()?;
+    let want = bytes(&b.desc)?;
+    written.find(|&r| {
+        let a = resource(r);
+        bytes(&a.desc) == Some(want)
+            && matches!((made(a), made(b)), (Some(x), Some(y)) if !std::sync::Arc::ptr_eq(&x, &y))
+    })
 }
 
 #[cfg(windows)]
