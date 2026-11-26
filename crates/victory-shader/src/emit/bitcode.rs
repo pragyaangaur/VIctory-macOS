@@ -611,6 +611,24 @@ impl Module {
         blocks
     }
 
+    /// [`Module::written_call_blocks`] of the calls whose first operand
+    /// after the `dx.op` opcode is `x`.
+    #[cfg(test)]
+    pub fn written_call_blocks_on(&self, name: &str, x: V) -> Vec<usize> {
+        let plan = self.plan();
+        let mut blocks = Vec::new();
+        for &b in &plan.layout {
+            for &i in &self.blocks[b].body {
+                if plan.live[i as usize]
+                    && matches!(&self.insts[i as usize].op, Op::Call(f, args) if self.funcs[*f as usize].name == name && args.get(1) == Some(&x))
+                {
+                    blocks.push(b);
+                }
+            }
+        }
+        blocks
+    }
+
     /// Calls of functions named `name` that [`Module::write`] writes.
     #[cfg(test)]
     pub fn written_calls(&self, name: &str) -> usize {

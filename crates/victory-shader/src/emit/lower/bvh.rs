@@ -62,6 +62,15 @@ enum Nodes {
     Raw(V),
 }
 
+/// A title-memory lookup of a node's byte: the raw buffer, the byte's
+/// offset in it, its address's low dword.
+#[derive(Clone, Copy)]
+struct Lookup {
+    h: V,
+    at: V,
+    lo: V,
+}
+
 /// A ray: extent, origin, direction, inverse direction (f32).
 struct Ray {
     extent: V,
@@ -190,7 +199,7 @@ impl Lower<'_> {
 
     /// The four result dwords of `ray` against the node `node` points to.
     fn bvh_lanes(&mut self, nodes: &Nodes, node: V, ray: &Ray) -> Result<[V; 4], Why> {
-        let w = self.node_dwords(nodes, 0, 16)?;
+        let (w, head) = self.node_dwords(nodes, 0, 16, None)?;
         let c = self.cur;
         let seven = self.s.m.i32(7);
         let ty = self.s.m.bin(c, Bin::And, node, seven);
@@ -198,8 +207,8 @@ impl Lower<'_> {
         let five = self.s.m.i32(5);
         let is32 = self.s.m.cmp(c, pred::EQ, ty, five);
         let at = self.begin_guarded(Some(is32));
-        let tail = match self.node_dwords(nodes, 16, 12) {
-            Ok(t) => t,
+        let tail = match self.node_dwords(nodes, 16, 12, head) {
+            Ok((t, _)) => t,
             Err(why) => {
                 self.end_guarded(at, &[]);
                 return Err(why);
@@ -224,11 +233,25 @@ impl Lower<'_> {
         }))
     }
 
-    /// `n` dwords of the node from dword `from`.
-    fn node_dwords(&mut self, nodes: &Nodes, from: u32, n: u32) -> Result<Vec<V>, Why> {
-        let (h, at) = match *nodes {
-            Nodes::Buffer(h, at) => (h, at),
-            Nodes::Raw(address) => return self.raw_load(address, 4 * from, n),
+    /// `n` dwords of the node from dword `from`, and in title memory the
+    /// lookup they were read through, which reads past the first 64 bytes
+    /// may reuse (`head`, [`Self::raw_load_past`]).
+    fn node_dwords(
+        &mut self,
+        nodes: &Nodes,
+        from: u32,
+        n: u32,
+        head: Option<Lookup>,
+    ) -> Result<(Vec<V>, Option<Lookup>), Why> {
+        let (h, at) = match (nodes, head) {
+            (&Nodes::Buffer(h, at), _) => (h, at),
+            (&Nodes::Raw(address), None) => {
+                let (out, lookup) = self.raw_load(address, 4 * from, n);
+                return Ok((out, Some(lookup)));
+            }
+            (&Nodes::Raw(address), Some(head)) => {
+                return Ok((self.raw_load_past(address, head, 4 * from, n), None));
+            }
         };
         let c = self.cur;
         let (u, align) = (self.s.m.undef(self.s.t.i32), self.s.m.i32(4));
@@ -244,12 +267,13 @@ impl Lower<'_> {
                 out.push(self.as_int(x));
             }
         }
-        Ok(out)
+        Ok((out, None))
     }
 
     /// `dwords` dwords at byte `offset` past `address`, a 64-bit GPU address
-    /// (`i64`), from title memory ([`Lower::memory`]).
-    fn raw_load(&mut self, address: V, offset: u32, dwords: u32) -> Result<Vec<V>, Why> {
+    /// (`i64`), from title memory ([`Lower::memory`]), and the lookup they
+    /// were read through.
+    fn raw_load(&mut self, address: V, offset: u32, dwords: u32) -> (Vec<V>, Lookup) {
         let c = self.cur;
         let i64t = self.s.m.int(64);
         let off = self.s.m.int_const(i64t, i64::from(offset));
@@ -263,21 +287,44 @@ impl Lower<'_> {
         let hi = self.s.m.bin(c, Bin::And, hi, mask);
         // A node (64 bytes, 64-byte aligned) lies in one 64 KiB page.
         let (h, at) = self.memory(lo, hi, 4 * dwords, false, None);
+        let lookup = Lookup { h, at, lo };
+        (self.raw_dwords(&lookup, 0, dwords), lookup)
+    }
+
+    /// [`Self::raw_load`] at byte `offset` past `address`, whose first byte
+    /// `head` looked up. Where byte `offset` lies in the head's 64 KiB page
+    /// the dwords are read through its lookup (the same view, its offset
+    /// plus `offset`; a miss there is marked already): only lanes whose node
+    /// crosses into the next page look up again.
+    fn raw_load_past(&mut self, address: V, head: Lookup, offset: u32, dwords: u32) -> Vec<V> {
+        let c = self.cur;
+        let (page, last) = (self.s.m.i32(0xFFFF), self.s.m.i32(0x1_0000 - offset));
+        let x = self.s.m.bin(c, Bin::And, head.lo, page);
+        let crosses = self.s.m.cmp(c, pred::IUGE, x, last);
+        let reused = self.raw_dwords(&head, offset, dwords);
+        let at = self.begin_guarded(Some(crosses));
+        let (own, _) = self.raw_load(address, offset, dwords);
+        let pairs: Vec<(V, V)> = own.into_iter().zip(reused).collect();
+        self.end_guarded(at, &pairs)
+    }
+
+    /// `dwords` dwords at byte `offset` past a lookup's byte.
+    fn raw_dwords(&mut self, lookup: &Lookup, offset: u32, dwords: u32) -> Vec<V> {
         let c = self.cur;
         let (u, align) = (self.s.m.undef(self.s.t.i32), self.s.m.i32(4));
         let mut out = Vec::new();
         for k in (0..dwords).step_by(4) {
             let m = (dwords - k).min(4);
-            let o = self.s.m.i32(4 * k);
-            let o = self.s.m.bin(c, Bin::Add, at, o);
+            let o = self.s.m.i32(offset + 4 * k);
+            let o = self.s.m.bin(c, Bin::Add, lookup.at, o);
             let mask = self.s.m.i8((1u8 << m) - 1);
-            let r = self.raw_buffer_load(c, &[h, o, u, mask, align]);
+            let r = self.raw_buffer_load(c, &[lookup.h, o, u, mask, align]);
             for j in 0..m {
                 let x = self.s.m.extract(c, r, j);
                 out.push(self.as_int(x));
             }
         }
-        Ok(out)
+        out
     }
 
     /// The child pointers of a box node (`w`: its 28 dwords, past 16 zero

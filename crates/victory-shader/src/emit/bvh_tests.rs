@@ -841,3 +841,104 @@ fn intersections_on_nodes_in_title_memory_equal_the_reference() {
     run_cases(false, 4, true);
     run_cases(true, 4, true);
 }
+
+/// A box32 node in the last 64 bytes of a 64 KiB page has its last 48
+/// bytes in the next page, here another copy's: lanes whose node crosses
+/// look its tail up again (`Lower::raw_load_past`), the others read theirs
+/// through their node's first lookup; both equal the reference.
+#[test]
+fn box32_nodes_across_a_page_boundary_equal_the_reference() {
+    let shader = build(false, true);
+    let mut rng = Rng(17);
+    let cases: Vec<(Vec<u32>, u32, Ray)> = std::iter::repeat_with(|| case(&mut rng))
+        .filter(|c| c.1 == 5)
+        .take(LANES)
+        .collect();
+    // Copy A holds the page at TITLE: the rays, the even lanes' nodes, and
+    // in its last 64 bytes the odd lanes' one node (lane 1's), whose tail
+    // copy B holds, the next page.
+    let (nodes, across) = (LANES * 64, 0x1_0000 - 64);
+    let shared = &cases[1].0;
+    let mut a = vec![0u32; 0x1_0000 / 4];
+    a[across / 4..].copy_from_slice(&shared[..16]);
+    let b = shared[16..28].to_vec();
+    for (n, (w, _, ray)) in cases.iter().enumerate() {
+        let node = if n % 2 == 1 { across } else { nodes + 128 * n };
+        let r = &mut a[16 * n..16 * n + 12];
+        r[0] = (node >> 3 | 5) as u32;
+        r[1] = ray.extent.to_bits();
+        for k in 0..3 {
+            r[2 + k] = ray.origin[k].to_bits();
+            r[5 + k] = ray.dir[k].to_bits();
+            r[8 + k] = ray.inv[k].to_bits();
+        }
+        if n % 2 == 0 {
+            a[node / 4..node / 4 + 28].copy_from_slice(w);
+        }
+    }
+    // The next page's entry names copy B's views (heap index 5).
+    let mut table = page_table(1, 3);
+    let next = TITLE as u32 + 0x1_0000;
+    let entry = 4096 + 2 * (4096 + (next >> 16 & 0xFFF) as usize);
+    table[entry..entry + 2].copy_from_slice(&[5, next]);
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let mut ran = 0;
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else {
+            eprintln!("no SM 6.6 {label} device; skipped");
+            continue;
+        };
+        let (root, pso) = host
+            .compute_pipeline(&shader)
+            .unwrap_or_else(|e| panic!("{label}: compute_pipeline failed: {e}"));
+        let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+        for u in &shader.user_data {
+            ud[u.index as usize] = match (u.root, u.slot) {
+                (RootType::Table, 1) => 0,
+                (RootType::Constants, 0) => (TITLE >> (32 * u.dword)) as u32,
+                _ => panic!("{u:?}"),
+            };
+        }
+        let views = [
+            View::RawUav((LANES * 4) as u32),
+            View::Memory(&a),
+            View::Pair,
+            View::NullPair,
+            View::Pair,
+            View::Memory(&b),
+            View::Pair,
+        ];
+        let out = host
+            .dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    roots: vec![
+                        (0, Root::Constants(ud)),
+                        (
+                            1,
+                            Root::View {
+                                srv: true,
+                                data: table.clone(),
+                            },
+                        ),
+                        (2, Root::Uav(2 * 4096 / 32)),
+                    ],
+                    views: &views,
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                },
+            )
+            .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
+        for (n, (w, _, ray)) in cases.iter().enumerate() {
+            let node = if n % 2 == 1 { shared } else { w };
+            let want = intersect(node, 5, ray);
+            let got = &out[0][4 * n..4 * n + 4];
+            assert_eq!(got, want, "{label}: lane {n}, {ray:?}, node {node:08x?}");
+        }
+        ran += 1;
+    }
+    assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
+}

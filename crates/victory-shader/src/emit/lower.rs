@@ -97,6 +97,10 @@ pub(crate) struct Lowered {
     /// Whether the module sets DXIL `ForceEarlyDepthStencil`.
     #[cfg(test)]
     pub early_depth_stencil: bool,
+    /// Blocks of the written raw buffer loads, and of those that read the
+    /// title-memory page table, one entry per load.
+    #[cfg(test)]
+    pub raw_loads: [Vec<usize>; 2],
 }
 
 pub(crate) struct Parts<'a> {
@@ -363,6 +367,8 @@ struct Lower<'a> {
     /// The program's constant table (the code from the first byte read
     /// through `s_getpc_b64` on): global, first byte, dwords.
     code_table: Option<(V, u32, u32)>,
+    /// The null pair's view in the page table ([`Lower::memory_null`]).
+    memory_null: Option<V>,
     /// Loop headers' iteration counters (see [`LOOP_LIMIT`]): the phi by
     /// IR block, and its incoming (value, DXIL block) pairs.
     counters: HashMap<usize, (V, Vec<(V, usize)>)>,
@@ -890,6 +896,7 @@ impl<'a> Lower<'a> {
             sections: HashMap::new(),
             section_out: Set::default(),
             code_table: None,
+            memory_null: None,
             counters: HashMap::new(),
             abort: None,
             round16: round16(p),
@@ -1585,6 +1592,15 @@ impl<'a> Lower<'a> {
         {
             self.s.flags |= flags::EARLY_DEPTH_STENCIL;
         }
+        #[cfg(test)]
+        let raw_loads = {
+            let (m, name) = (&self.s.m, "dx.op.rawBufferLoad.f32");
+            let table = match self.s.memory {
+                Some(h) => m.written_call_blocks_on(name, h),
+                None => Vec::new(),
+            };
+            [m.written_call_blocks(name), table]
+        };
         Ok(Lowered {
             cmp_samplers,
             root_cbvs,
@@ -1626,6 +1642,8 @@ impl<'a> Lower<'a> {
             has_half_wave_mask: self.s.m.has_i32_const(!31),
             #[cfg(test)]
             early_depth_stencil: self.s.flags & flags::EARLY_DEPTH_STENCIL != 0,
+            #[cfg(test)]
+            raw_loads,
             dxil: self.s.finish(),
             user_data,
             samplers: self.samplers,
@@ -5401,14 +5419,17 @@ impl<'a> Lower<'a> {
         let c = self.cur;
         let map = self.s.memory_handle();
         let k = |l: &mut Self, x: u32| l.s.m.i32(x);
-        let (k3, first, four) = (k(self, 3), k(self, 4096 * 4), k(self, 4));
+        let (k3, first) = (k(self, 3), k(self, 4096 * 4));
         let at = self.s.m.bin(c, Bin::Shl, entry, k3);
         let at = self.s.m.bin(c, Bin::Add, at, first);
-        let view = self.raw_dword(map, at);
-        let at = self.s.m.bin(c, Bin::Add, at, four);
-        let start = self.raw_dword(map, at);
-        // Block 0's first entry names the null pair: no copy holds the page.
-        let null = self.raw_dword(map, first);
+        // The entry's two dwords in one load: view, then start.
+        let (u, mask, al) = (self.s.m.undef(self.s.t.i32), self.s.m.i8(3), k(self, 4));
+        let r = self.raw_buffer_load(c, &[map, at, u, mask, al]);
+        let [view, start] = [0, 1].map(|j| {
+            let x = self.s.m.extract(c, r, j);
+            self.as_int(x)
+        });
+        let null = self.memory_null();
         let miss = self.s.m.cmp(c, pred::EQ, view, null);
         // Views come in pairs: the raw SRV, then the raw UAV of one copy.
         let (view, props) = if write {
@@ -5428,6 +5449,24 @@ impl<'a> Lower<'a> {
             l1,
             miss,
         }
+    }
+
+    /// Block 0's first entry in the page table, the null pair's view: no
+    /// copy holds a page whose entry names it. The same for every access,
+    /// so read once, in the entry block.
+    fn memory_null(&mut self) -> V {
+        if let Some(null) = self.memory_null {
+            return null;
+        }
+        let map = self.s.memory_handle();
+        let b = self.s.entry;
+        let u = self.s.m.undef(self.s.t.i32);
+        let (mask, al, first) = (self.s.m.i8(1), self.s.m.i32(4), self.s.m.i32(4096 * 4));
+        let r = self.raw_buffer_load(b, &[map, first, u, mask, al]);
+        let x = self.s.m.extract(b, r, 0);
+        let null = self.s.m.cast(b, Cast::Bitcast, x, self.s.t.i32);
+        self.memory_null = Some(null);
+        null
     }
 
     /// A descriptor load from a table or heap whose dwords the program only

@@ -1671,3 +1671,105 @@ fn pixel_shader_skips_early_depth_stencil_with_discard_depth_or_uav() {
     );
     assert!(!uav.early_depth_stencil);
 }
+
+/// GLOBAL `op` with address `s[saddr:saddr+1] + vaddr + offset`.
+const fn global(op: u32, vdst: u8, vaddr: u8, saddr: u8, offset: u32) -> [u32; 2] {
+    [
+        0x37 << 26 | op << 18 | 2 << 14 | (offset & 0xFFF),
+        vaddr as u32 | (saddr as u32) << 16 | (vdst as u32) << 24,
+    ]
+}
+
+/// Lowers a one-thread compute program with a pointer to title memory in
+/// root constants s[0:1] (and s2, s3), the raw UAV of table entry 0 (s4) in
+/// s[8:11], around `body`.
+fn lower_memory(body: &[u32]) -> Lowered {
+    let mut words = vec![
+        0xBE85_0380, // s_mov_b32 s5, 0
+        0xF408_0202, // s_load_dwordx4 s[8:11], s[4:5], 0
+        0xFA00_0000,
+    ];
+    words.extend_from_slice(body);
+    words.push(S_ENDPGM);
+    let constants = RootParam {
+        sgprs: 4,
+        ..root(RootType::Constants, 0, 0)
+    };
+    let buffer = UsedResource {
+        kind: ResourceType::Uav,
+        root: RootType::Table,
+        table_offset_dwords: 0,
+        lower_bound: 0,
+        stride: 0,
+        dwords: 4,
+        user_data: 4,
+        slot: 1,
+    };
+    let l = lower_with(
+        &words,
+        vec![constants, root(RootType::Table, 4, 1)],
+        vec![buffer],
+    )
+    .expect("lower");
+    assert!(l.memory);
+    l
+}
+
+/// Each title-memory access reads the page table twice, its level-1 entry
+/// and then the page's entry (view and start in one load), and the null
+/// pair's view, the same for all, is read once in the entry block: here
+/// two loads behind a branch from it.
+#[test]
+fn the_null_pair_is_read_once_in_the_entry_block() {
+    let mut w = vec![
+        0xBF06_8002, // s_cmp_eq_u32 s2, 0
+        0xBF85_000A, // s_cbranch_scc1 -> s_endpgm
+        0x7E02_0280, // v_mov_b32 v1, 0
+    ];
+    w.extend(global(0x0C, 2, 1, 0, 0)); // global_load_dword v2, v1, s[0:1]
+    w.extend(global(0x0C, 3, 1, 0, 0x100));
+    w.push(0xBF8C_0000); // s_waitcnt
+    w.extend([0xE070_0000, 0x8002_0200]); // buffer_store_dword v2, off, s[8:11], 0
+    w.extend([0xE070_0004, 0x8002_0300]); // v3 at 4
+    let l = lower_memory(&w);
+    let [loads, table] = &l.raw_loads;
+    assert_eq!(table.len(), 1 + 2 * 2, "{table:?}");
+    assert_eq!(loads.len(), 1 + 2 * 3, "{loads:?}");
+    assert_eq!(table.iter().filter(|&&b| b == 0).count(), 1, "{table:?}");
+    assert_eq!(loads.iter().filter(|&&b| b == 0).count(), 1, "{loads:?}");
+}
+
+/// A box32 node's last 48 bytes are read through its first 64 bytes'
+/// page-table lookup, and looked up again only in lanes whose node starts
+/// in the last 64 bytes of a page (`raw_load_past`): the head's lookup and
+/// the null pair's view in the entry block, then the head's 16 dwords and
+/// the tail's 12 through that lookup, and the second lookup in a block of
+/// its own.
+#[test]
+fn a_box32_nodes_tail_reuses_its_heads_lookup() {
+    // The descriptor in s[12:15], based at the pointer.
+    let mut w = vec![
+        0x908C_8800, // s_lshr_b64 s[12:13], s[0:1], 8
+        0x880D_FF0D, // s_or_b32 s13, s13, 0x80000000
+        0x8000_0000,
+        0xBE8E_03C1, // s_mov_b32 s14, -1
+        0xBE8F_03FF, // s_mov_b32 s15: type 8, barycentrics, no bound
+        8 << 28 | 1 << 24 | 1 << 27 | 0x3FF,
+    ];
+    // v2..v12: the node pointer and the ray, from s2 and s3.
+    w.extend((0..11u32).map(|k| 0x7E00_0200 | (2 + k) << 17 | (2 + k % 2)));
+    // image_bvh_intersect_ray v[20:23], v[2:12], s[12:15]
+    w.extend([0xF198_9F01, 20 << 8 | (12 >> 2) << 16 | 2]);
+    // buffer_store_dwordx4 v[20:23], off, s[8:11], 0
+    w.extend([0xE078_0000, 0x8002_1400]);
+    let l = lower_memory(&w);
+    let [loads, table] = &l.raw_loads;
+    let at = |b: usize| loads.iter().filter(|&&x| x == b).count();
+    assert_eq!(table.len(), 1 + 2 + 2, "{table:?}");
+    assert_eq!(loads.len(), 1 + (2 + 4) + 3 + (2 + 3), "{loads:?}");
+    assert_eq!(table[..3], [0; 3], "{table:?}");
+    let again = table[3];
+    assert!(table[4] == again && at(again) == 2, "{loads:?} {table:?}");
+    let through_head = loads.iter().filter(|&&b| b != 0 && b < again);
+    assert_eq!(through_head.count(), 4 + 3, "{loads:?} {table:?}");
+}
