@@ -962,6 +962,13 @@ pub fn emit_with(
     )
 }
 
+/// Whether `what` refuses a program because its console wave64 runs as two
+/// 32-lane host waves that cannot meet where it needs them to.
+fn halves_refusal(what: &str) -> bool {
+    what.contains("(wave64 on a 32-lane host)")
+        || what.starts_with("LDS one console wave64 shares without barriers")
+}
+
 fn emit_pruned(
     input: &EmitInput<'_>,
     options: Options,
@@ -1059,6 +1066,29 @@ fn emit_pruned(
         options.per_vertex_center,
         !options.disable_literal_halves,
     ) {
+        // A console wave the host splits into 32-lane halves needs both at
+        // each group barrier, and lanes that left early for the end never
+        // arrive; kept on to the end with EXEC off (`ir::keep_lanes_to_end`),
+        // they do. A program with no such early exit stays refused.
+        Err(e @ ShaderError::Unsupported { what, .. })
+            if options.host_wave32 && native.stage == HwStage::Cs && halves_refusal(what) =>
+        {
+            let Some(q) = crate::ir::keep_lanes_to_end(p) else {
+                return Err(e);
+            };
+            let st = structure::structure(&q)?;
+            let res = resource::track(&q, &native.layout, native.stage, Some(&st))?;
+            return emit_pruned(
+                &EmitInput {
+                    p: &q,
+                    st: &st,
+                    res: &res,
+                    ..*input
+                },
+                options,
+                keep,
+            );
+        }
         // Discarded lanes kept on as helpers can read what no surviving
         // lane does (a register only killed lanes skipped writing); such a
         // program kills them as the console does (`structure::killing`).
