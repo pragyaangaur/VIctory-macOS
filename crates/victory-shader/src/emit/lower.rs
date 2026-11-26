@@ -134,6 +134,10 @@ pub(crate) struct Parts<'a> {
     /// With `atomic_locks`, the lanes first try their locks in rounds
     /// ([`Options::atomic_lock_rounds`](super::Options)).
     pub atomic_lock_rounds: bool,
+    /// With `atomic_lock_rounds`, a glc-clear 64-bit `umax` first reduces
+    /// each texel's lanes of a wave to their maximum key
+    /// ([`Options::atomic_umax`](super::Options)).
+    pub atomic_umax: bool,
     /// Compute-stage biased samples run as gradient samples scaled by
     /// `2^bias` ([`Options::bias_as_gradients`](super::Options)).
     pub bias_as_gradients: bool,
@@ -331,9 +335,9 @@ struct Lower<'a> {
     /// In halves: per IR block, whether each lane runs it once
     /// ([`once_per_lane`]), where lane masks can pass between the halves.
     once: Vec<bool>,
-    /// In halves: the group-shared dwords lane masks pass through, once made
-    /// ([`Lower::ballot_across_halves`]).
-    half_masks: Option<V>,
+    /// In halves: the group-shared dwords values pass between the halves
+    /// through, once made ([`Lower::exchange_halves`]).
+    half_words: Option<V>,
     /// The DXIL block the instruction being lowered starts in: every lane
     /// running its IR block runs it (no guard of the instruction's own).
     level: usize,
@@ -868,7 +872,7 @@ impl<'a> Lower<'a> {
             halves_refused,
             relabelled: None,
             once: if halves { once_per_lane(p) } else { Vec::new() },
-            half_masks: None,
+            half_words: None,
             level: 0,
             alike: if halves {
                 halves::lane_uniform(x)
@@ -1398,9 +1402,11 @@ impl<'a> Lower<'a> {
         }
         // An active reduction substitutes its identity for inactive lanes.
         // If the group fits one host wave, the absent upper half contributes
-        // only identities and the host wave contains all participating lanes.
-        if prefix.is_some() || !self.one_host_wave() {
-            self.same_half(ACROSS)?;
+        // only identities and the host wave holds the console wave's lanes in
+        // order. Otherwise the halves pass each other their results.
+        let across = self.halves && !self.one_host_wave();
+        if across && !self.across_here() {
+            return Err(ACROSS);
         }
         let c = self.cur;
         let &m = self
@@ -1465,6 +1471,26 @@ impl<'a> Lower<'a> {
                     &[arg, k, u],
                 )
             }
+        };
+        let r = if across {
+            // A prefix's half total: the sum of the half's lanes.
+            let total = match prefix {
+                None => r,
+                Some(_) => {
+                    let (sum, unsigned) = (self.s.m.i8(0), self.s.m.i8(u8::from(!float)));
+                    self.s.op(
+                        c,
+                        &format!("waveActiveOp.{sfx}"),
+                        Attr::NoUnwind,
+                        ty,
+                        119,
+                        &[arg, sum, unsigned],
+                    )
+                }
+            };
+            self.reduce_across(op, r, total, prefix.is_some(), ident)?
+        } else {
+            r
         };
         Ok(if float { self.as_int(r) } else { r })
     }
@@ -4879,7 +4905,10 @@ impl<'a> Lower<'a> {
     /// in divergent code (D3DMetal's return other lanes' values there).
     /// With [`Parts::atomic_lock_rounds`] the lanes first try their locks
     /// in rounds, all at once, and only the lanes still not done take
-    /// turns. Returns the old value's low and high dwords.
+    /// turns. `not_rep` marks the lanes a reduction before this made
+    /// members of a representative's group, done from the start.
+    /// Returns the old value's low and high dwords.
+    #[allow(clippy::too_many_arguments)]
     fn locked_atomic64(
         &mut self,
         h: V,
@@ -4888,6 +4917,7 @@ impl<'a> Lower<'a> {
         op: &str,
         value: V,
         compare: Option<V>,
+        not_rep: V,
     ) -> (V, V) {
         let i32t = self.s.t.i32;
         let i64t = self.s.m.int(64);
@@ -5006,11 +5036,13 @@ impl<'a> Lower<'a> {
         // take a lock, and in its turn it would spin to the bound.
         let (c, finished, olo0, ohi0) = if self.x.atomic_lock_rounds {
             let i1 = self.s.t.i1;
+            // Done from the start: a helper lane, and a lane the umax
+            // reduction reduced to a representative's member.
             let start = if self.s.pixel {
-                self.s
-                    .op(c, "isHelperLane.i1", Attr::ReadOnly, i1, 221, &[])
+                let helper = self.s.op(c, "isHelperLane.i1", Attr::ReadOnly, i1, 221, &[]);
+                self.s.m.bin(c, Bin::Or, helper, not_rep)
             } else {
-                self.s.m.bool(false)
+                not_rep
             };
             let yes = self.s.m.bool(true);
             let mut blocks = [0; 5];
@@ -5130,6 +5162,111 @@ impl<'a> Lower<'a> {
         let rhi = self.s.m.phi(done, i32t);
         self.s.m.set_phi(rhi, vec![(ohi, latch), (ohi0, c)]);
         (rlo, rhi)
+    }
+
+    /// The umax reduction ([`Parts::atomic_umax`]): each texel's lanes of
+    /// the wave collapse to one representative carrying their maximum
+    /// key, in registers, before any of them locks. One pass a group: the
+    /// lowest lane remaining leads, the lanes on its texel contribute to
+    /// two wave maxima — the group's high dword, then the low dwords of
+    /// its best — and the lead takes the result while they leave. The
+    /// loop is wave-uniform: `remaining` is the ballot the caller took
+    /// where its guard was live, and every other edge carries another
+    /// ballot, so every lane runs it alike and the wave operations inside
+    /// see the participating set. A wave wider than 32 lanes has bits the
+    /// ballot's first dword does not hold: the caller enables this only
+    /// under the rounds, which the host that needs the locks runs in 32
+    /// lane waves. Returns the lead's value and whether the lane
+    /// represents none.
+    fn reduce_umax(&mut self, present: V, cs: &[V], coords: usize, me: V, vlo: V, vhi: V) -> (V, V) {
+        let (i32t, i64t, i1) = (self.s.t.i32, self.s.m.int(64), self.s.t.i1);
+        let c = self.cur;
+        let k = |l: &mut Self, v: u32| l.s.m.i32(v);
+        let (zero, one) = (k(self, 0), k(self, 1));
+        let (yes, no) = (self.s.m.bool(true), self.s.m.bool(false));
+        let mut blocks = [0; 3];
+        for b in &mut blocks {
+            *b = self.s.m.new_block();
+        }
+        let [head, body, done] = blocks;
+        self.s.m.terminate(c, Term::Br(head));
+        let remaining = self.s.m.phi(head, i32t);
+        let rep = self.s.m.phi(head, i1);
+        let glo = self.s.m.phi(head, i32t);
+        let ghi = self.s.m.phi(head, i32t);
+        let more = self.s.m.cmp(head, pred::NE, remaining, zero);
+        self.s.m.terminate(head, Term::CondBr(more, body, done));
+        // The lead: the lowest lane remaining, by halving.
+        let mut x = remaining;
+        let mut lead = zero;
+        for b in [16u32, 8, 4, 2, 1] {
+            let (mask, step) = (k(self, (1 << b) - 1), k(self, b));
+            let low = self.s.m.bin(body, Bin::And, x, mask);
+            let has = self.s.m.cmp(body, pred::NE, low, zero);
+            let up = self.s.m.bin(body, Bin::Add, lead, step);
+            lead = self.s.m.select(body, has, lead, up);
+            let high = self.s.m.bin(body, Bin::LShr, x, step);
+            x = self.s.m.select(body, has, low, high);
+        }
+        // The group: the lanes remaining on the lead's texel.
+        let mut same = yes;
+        for &ck in cs.iter().take(coords) {
+            let lead_ck = self
+                .s
+                .op(body, "waveReadLaneAt.i32", Attr::NoUnwind, i32t, 117, &[ck, lead]);
+            let eq = self.s.m.cmp(body, pred::EQ, ck, lead_ck);
+            same = self.s.m.select(body, eq, same, no);
+        }
+        let mine = self.s.m.bin(body, Bin::LShr, remaining, me);
+        let mine = self.s.m.bin(body, Bin::And, mine, one);
+        let mine = self.s.m.cmp(body, pred::NE, mine, zero);
+        let same = self.s.m.select(body, mine, same, no);
+        let four = self.s.m.named_struct("dx.types.fouri32", vec![i32t; 4]);
+        let group = self.s.op(body, "waveActiveBallot", Attr::NoUnwind, four, 116, &[same]);
+        let group = self.s.m.extract(body, group, 0);
+        // The group's maximum key, in two maxima.
+        let (kind, unsigned) = (self.s.m.i8(3), self.s.m.i8(1));
+        let offer_hi = self.s.m.select(body, same, ghi, zero);
+        let g_hi = self.s.op(
+            body,
+            "waveActiveOp.i32",
+            Attr::NoUnwind,
+            i32t,
+            119,
+            &[offer_hi, kind, unsigned],
+        );
+        let best = self.s.m.cmp(body, pred::EQ, ghi, g_hi);
+        let same_lo = self.s.m.select(body, same, glo, zero);
+        let offer_lo = self.s.m.select(body, best, same_lo, zero);
+        let g_lo = self.s.op(
+            body,
+            "waveActiveOp.i32",
+            Attr::NoUnwind,
+            i32t,
+            119,
+            &[offer_lo, kind, unsigned],
+        );
+        // The lead takes the group's key; the group leaves.
+        let am = self.s.m.cmp(body, pred::EQ, me, lead);
+        let nlo = self.s.m.select(body, am, g_lo, glo);
+        let nhi = self.s.m.select(body, am, g_hi, ghi);
+        let nrep = self.s.m.bin(body, Bin::Or, rep, am);
+        let not_group = k(self, u32::MAX);
+        let flip = self.s.m.bin(body, Bin::Xor, group, not_group);
+        let left = self.s.m.bin(body, Bin::And, remaining, flip);
+        self.s.m.terminate(body, Term::Br(head));
+        self.s.m.set_phi(remaining, vec![(present, c), (left, body)]);
+        self.s.m.set_phi(rep, vec![(no, c), (nrep, body)]);
+        self.s.m.set_phi(glo, vec![(vlo, c), (nlo, body)]);
+        self.s.m.set_phi(ghi, vec![(vhi, c), (nhi, body)]);
+        self.cur = done;
+        let lo = self.s.m.cast(done, Cast::ZExt, glo, i64t);
+        let hi = self.s.m.cast(done, Cast::ZExt, ghi, i64t);
+        let k32 = self.s.m.int_const(i64t, 32);
+        let hi = self.s.m.bin(done, Bin::Shl, hi, k32);
+        let value = self.s.m.bin(done, Bin::Or, lo, hi);
+        let not_rep = self.s.m.bin(done, Bin::Xor, rep, yes);
+        (value, not_rep)
     }
 
     /// The dword at byte `at` of raw buffer `h`.
@@ -7374,10 +7511,23 @@ impl<'a> Lower<'a> {
                     self.s.flags |= flags::WAVE_OPS;
                 } else {
                     self.cross_lane(false)?;
-                    self.same_half(
-                        "a lane read that may cross 32-lane halves (wave64 on a 32-lane host)",
-                    )?;
                 }
+                if self.halves && !self.one_host_wave() {
+                    if !self.across_here() {
+                        return Err(
+                            "a lane read that may cross 32-lane halves (wave64 on a 32-lane host)",
+                        );
+                    }
+                    let r = self.read_lane_across(a, lane)?;
+                    return int(self, r);
+                }
+                // In halves, a group of one host wave has no lane past 31.
+                let lane = if self.halves {
+                    let k31 = self.s.m.i32(31);
+                    self.s.m.bin(c, Bin::And, lane, k31)
+                } else {
+                    lane
+                };
                 let r = self.read_lane(a, lane);
                 int(self, r)
             }
@@ -7453,7 +7603,12 @@ impl<'a> Lower<'a> {
                     && matches!(v.src.first(), Some(&Operand::Vector { reg, .. })
                         if !inst.read(Reg::V(reg)).is_some_and(|x| self.alike.contains(&x)))
                 {
-                    return Err(halves::FIRST_ACROSS);
+                    if !self.across_here() {
+                        return Err(halves::FIRST_ACROSS);
+                    }
+                    let a = s(self, 0)?;
+                    let r = self.first_lane_across(a)?;
+                    return int(self, r);
                 }
                 let a = s(self, 0)?;
                 // shortcut: without console lanes, the first lane of the host
@@ -9376,8 +9531,27 @@ impl<'a> Lower<'a> {
             if wide && self.x.atomic_locks {
                 let compare = (code == u32::MAX).then(|| value_at(self, 1));
                 let h = self.handle(site, src, false, (kind | 0x1000 | 0x4000, 0x205))?;
+                // The umax reduction (#240), before anything locks and
+                // before the guarded region: the ballot of the guard is
+                // taken where the guard is live — inside, a ballot of the
+                // branch's own condition is not exact under D3DMetal. A
+                // glc-set umax reads its old value, so it cannot reduce.
+                let (value, not_rep) = if self.x.atomic_umax
+                    && self.x.atomic_lock_rounds
+                    && op == "umax"
+                    && !cache.glc
+                {
+                    let bit = guard.unwrap_or_else(|| self.s.m.bool(true));
+                    let four = self.s.m.named_struct("dx.types.fouri32", vec![self.s.t.i32; 4]);
+                    let present = self.s.op(c, "waveActiveBallot", Attr::NoUnwind, four, 116, &[bit]);
+                    let present = self.s.m.extract(c, present, 0);
+                    let me = self.s.op(c, "waveGetLaneIndex", Attr::ReadNone, self.s.t.i32, 111, &[]);
+                    self.reduce_umax(present, &cs, coords, me, vals[0], vals[1])
+                } else {
+                    (value, self.s.m.bool(false))
+                };
                 let at = self.begin_guarded(guard);
-                let (lo, hi) = self.locked_atomic64(h, &cs, coords, op, value, compare);
+                let (lo, hi) = self.locked_atomic64(h, &cs, coords, op, value, compare, not_rep);
                 let r = self.end_guarded(at, &[(lo, old[0]), (hi, old[1])]);
                 if cache.glc {
                     for (k, x) in (0..).zip(r) {
