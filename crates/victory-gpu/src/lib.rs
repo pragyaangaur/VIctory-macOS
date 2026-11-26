@@ -89,6 +89,8 @@ mod inplace_probe;
 pub use copystat::CountingAlloc;
 #[cfg(windows)]
 pub use alias::{alias_region, enabled as alias_buffers, unalias_region};
+#[cfg(all(windows, feature = "diagnostics"))]
+pub use alias::{PhysicalHeap, physical_heap};
 #[cfg(windows)]
 pub use host::{MeshSupport, host_mesh_support, on_failure};
 #[cfg(windows)]

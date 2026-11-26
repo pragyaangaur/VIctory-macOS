@@ -169,6 +169,7 @@ fn shader(l: lower::Lowered) -> super::HostShader {
         root_cbvs: l.root_cbvs,
         root_srvs: l.root_srvs,
         root_uavs: l.root_uavs,
+        root_srv_bytes: l.root_srv_bytes,
         memory: l.memory,
         memory_writes: l.memory_writes,
         view_addresses: l.view_addresses,
