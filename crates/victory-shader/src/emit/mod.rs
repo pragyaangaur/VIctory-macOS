@@ -529,6 +529,12 @@ pub struct Options {
     /// `VICTORY_P10`/`VICTORY_P20` inputs from a geometry shader. Used as a
     /// mesh+pixel fallback where no geometry stage exists.
     pub per_vertex_center: bool,
+    /// With [`Options::host_wave32`]: the two 32-lane halves of a console
+    /// wave pass each other values in divergent code too, waiting for each
+    /// other on group-shared memory (`lower::meet`), where without it such
+    /// a read across the halves is refused. The translation differs, so
+    /// the shader cache keys on it.
+    pub halves_rendezvous: bool,
 }
 
 /// Metal's limit on a mesh shader's outputs per thread group, in bytes
@@ -1059,6 +1065,7 @@ fn emit_pruned(
         host_wave32: options.host_wave32,
         narrow_waves: options.narrow_waves,
         uav_size_level0: options.uav_size_level0,
+        halves_rendezvous: options.halves_rendezvous,
     };
     let l = match lower::lower_pruned(
         &parts(st, res),

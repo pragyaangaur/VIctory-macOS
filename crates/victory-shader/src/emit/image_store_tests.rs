@@ -138,6 +138,7 @@ fn lower(native: &NativeProgram) -> Result<HostShader, ShaderError> {
         resource::track(&p, &native.layout, native.stage, Some(&st)).expect("resource::track");
     let io = io::raise(&p, native).expect("io::raise");
     let lowered = lower::lower(&lower::Parts {
+        halves_rendezvous: false,
         native,
         p: &p,
         st: &st,

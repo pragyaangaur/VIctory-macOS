@@ -28,6 +28,7 @@ mod bvh;
 #[path = "half_views.rs"]
 mod half_views;
 mod halves;
+mod meet;
 mod packed;
 mod round_mode;
 mod mesh;
@@ -37,6 +38,8 @@ use barriers::split_wave_barriers;
 use barriers::{in_step, split_wave_barriers_with_step, step_and_cap};
 pub(crate) use mesh::KeptOutputs;
 use mesh::prune_signature;
+pub(crate) use meet::MeetSite;
+use super::bitcode::Rmw;
 use packed::packed_half;
 use round_mode::{round16, round16_after};
 
@@ -196,6 +199,9 @@ pub(crate) struct Parts<'a> {
     pub bias_as_gradients: bool,
     /// The host's waves have at most 32 lanes (`emit::Options::host_wave32`).
     pub host_wave32: bool,
+    /// In halves, the two halves of a console wave meet in divergent code
+    /// ([`Options::halves_rendezvous`](super::Options), `lower::meet`).
+    pub halves_rendezvous: bool,
     /// See [`Options::narrow_waves`](super::Options).
     pub narrow_waves: bool,
     /// A size query on a writable image asks for level 0, not an undefined
@@ -285,8 +291,18 @@ fn lower_with_structure(
     per_vertex_center: bool,
 ) -> Result<Lowered, ShaderError> {
     let mut bad = HashMap::new();
+    // Divergent sites where the halves meet (`lower::meet`): a pass that
+    // finds new ones goes again with them laid out.
+    let mut plan: Set<MeetSite> = Set::default();
     loop {
-        match Lower::new(parts, &bad, keep, per_vertex_center).run() {
+        let found = std::cell::RefCell::new(Set::default());
+        let r = Lower::new(parts, &bad, keep, per_vertex_center, &plan, &found).run();
+        let found = found.into_inner();
+        if !found.is_empty() {
+            plan.extend(found);
+            continue;
+        }
+        match r {
             Ok(l) => return Ok(l),
             Err(Stop::Retry(v, why)) => {
                 if bad.insert(v, why).is_some() {
@@ -487,6 +503,18 @@ struct Lower<'a> {
     /// In halves: the group-shared dwords values pass between the halves
     /// through, once made ([`Lower::exchange_halves`]).
     half_words: Option<V>,
+    /// In halves, a group of more than one host wave: the divergent
+    /// regions where the halves can meet (`lower::meet`).
+    meet: Option<meet::Meet>,
+    /// The sites earlier passes found, laid out in this one.
+    meet_plan: &'a Set<MeetSite>,
+    /// Sites this pass found that are not laid out yet.
+    meet_found: &'a std::cell::RefCell<Set<MeetSite>>,
+    meet_layout: meet::MeetLayout,
+    /// The rendezvous words, once made ([`Lower::meet_prologue`]).
+    meet_words: Option<V>,
+    /// Each region's epoch, from its branch block's end on.
+    meet_epoch: Map<usize, V>,
     /// The DXIL block the instruction being lowered starts in: every lane
     /// running its IR block runs it (no guard of the instruction's own).
     level: usize,
@@ -734,6 +762,8 @@ impl<'a> Lower<'a> {
         bad: &'a HashMap<Value, Why>,
         keep: Option<&KeptOutputs>,
         per_vertex_center: bool,
+        meet_plan: &'a Set<MeetSite>,
+        meet_found: &'a std::cell::RefCell<Set<MeetSite>>,
     ) -> Self {
         let p = x.p;
         let mut phi_at = Map::default();
@@ -915,7 +945,10 @@ impl<'a> Lower<'a> {
             }
         }
         let (step, cap_escaped, group_scalars) = step_and_cap(p, x.st, halves);
-        Lower {
+        let one_host_wave = s.threads.is_some_and(|t| t.iter().product::<u32>() <= 32);
+        let meet = (halves && !one_host_wave && x.halves_rendezvous)
+            .then(|| meet::meet_regions(p, x.st, &step));
+        let mut l = Lower {
             s,
             x,
             bad,
@@ -984,6 +1017,12 @@ impl<'a> Lower<'a> {
             group_scalars,
             cap_escaped,
             half_words: None,
+            meet,
+            meet_plan,
+            meet_found,
+            meet_layout: meet::MeetLayout::default(),
+            meet_words: None,
+            meet_epoch: Map::default(),
             level: 0,
             alike: if halves {
                 halves::lane_uniform(x)
@@ -1027,7 +1066,9 @@ impl<'a> Lower<'a> {
             abort: None,
             round16: round16(p),
             mode16: Some(0),
-        }
+        };
+        l.lay_out_meet();
+        l
     }
 
     /// The dword of the program's code at byte `byte` (a constant table
@@ -1623,6 +1664,7 @@ impl<'a> Lower<'a> {
         }
         self.find_sections();
         self.inputs()?;
+        self.meet_prologue();
         if let Some(mesh) = self.s.mesh {
             self.mesh_prologue(mesh).map_err(|w| unsupported(0, w))?;
             self.block[order[0]] = Some(self.cur);
@@ -1667,6 +1709,7 @@ impl<'a> Lower<'a> {
                     self.vals.insert(phi.value, val);
                 }
             }
+            self.meet_enter(b);
             let mut i = 0;
             self.mode16 = self.round16[b];
             while i < p.blocks[b].insts.len() {
@@ -1684,6 +1727,7 @@ impl<'a> Lower<'a> {
                 if self.split_barriers.contains(&(b, i)) {
                     self.group_barrier();
                 }
+                self.meet_masks(b, Some(i));
                 self.level = self.cur;
                 self.inst(b, i)?;
                 self.mode16 = round16_after(&p.blocks[b].insts[i], self.mode16);
@@ -1700,6 +1744,12 @@ impl<'a> Lower<'a> {
             if self.split_barriers.contains(&(b, p.blocks[b].insts.len())) {
                 self.group_barrier();
             }
+            self.meet_masks(b, None);
+            let offset = p.blocks[b]
+                .insts
+                .last()
+                .map_or(p.blocks[b].offset, |i| i.machine.offset);
+            self.meet_exit(b).map_err(|w| unsupported(offset, w))?;
             self.mask_ok = self.mask_data == MaskData::Console;
             self.tail[b] = Some(self.cur);
             self.level = self.cur;
@@ -2307,6 +2357,15 @@ impl<'a> Lower<'a> {
                 if across {
                     match self.across_at(def) {
                         Some(a) => at = a,
+                        // In divergent code the halves meet there (laid
+                        // out by the next pass: a stand-in until then).
+                        None if def
+                            .is_some_and(|d| self.meet_later(MeetSite::Mask(lo), d)) =>
+                        {
+                            let zero = self.s.m.i32(0);
+                            self.ballots.insert(lo, (zero, zero));
+                            return Ok(zero);
+                        }
                         None => {
                             if let Ok(xy) = self.mask_number(lo) {
                                 self.ballots.insert(lo, xy);

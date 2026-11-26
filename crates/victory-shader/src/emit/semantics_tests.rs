@@ -283,6 +283,7 @@ fn lower_program(words: &[u32]) -> Result<HostShader, String> {
     let res = resource::track(&p, &native.layout, native.stage, Some(&st)).map_err(e)?;
     let io = io::raise(&p, &native).map_err(e)?;
     let lowered = lower::lower(&lower::Parts {
+        halves_rendezvous: false,
         native: &native,
         p: &p,
         st: &st,

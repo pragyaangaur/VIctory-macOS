@@ -168,6 +168,16 @@ pub fn narrow_waves() -> bool {
     })
 }
 
+/// Whether the two 32-lane halves of a console wave64 pass each other
+/// values in divergent code by waiting for each other on group-shared
+/// memory (`victory_shader::emit::Options::halves_rendezvous`): on, wherever
+/// programs run in halves. `VICTORY_HALVES_RENDEZVOUS=0` goes back to
+/// refusing such programs.
+fn halves_rendezvous() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_HALVES_RENDEZVOUS").as_deref() != Ok("0"))
+}
+
 /// Whether 64-thread wave64 shaders keep only the per-lane translation.
 fn literal_halves_disabled() -> bool {
     static OFF: OnceLock<bool> = OnceLock::new();
@@ -263,17 +273,20 @@ pub(crate) fn translation_build(options: victory_shader::emit::Options) -> &'sta
     let umax = rounds && options.atomic_umax;
     let uav_level0 = options.uav_size_level0;
     let no_literal = options.host_wave32 && options.disable_literal_halves;
-    if !locks && !bias && !narrow && !no_literal && !uav_level0 {
+    // Only where programs run in halves does the rendezvous change them.
+    let apart = options.host_wave32 && !options.halves_rendezvous;
+    if !locks && !bias && !narrow && !no_literal && !uav_level0 && !apart {
         return build();
     }
-    static BUILDS: [OnceLock<[u8; 32]>; 128] = [const { OnceLock::new() }; 128];
+    static BUILDS: [OnceLock<[u8; 32]>; 256] = [const { OnceLock::new() }; 256];
     let n = usize::from(locks)
         | usize::from(bias) << 1
         | usize::from(narrow) << 2
         | usize::from(rounds) << 3
         | usize::from(umax) << 4
         | usize::from(no_literal) << 5
-        | usize::from(uav_level0) << 6;
+        | usize::from(uav_level0) << 6
+        | usize::from(apart) << 7;
     BUILDS[n].get_or_init(|| {
         let mut h = blake3::Hasher::new();
         h.update(build());
@@ -298,6 +311,9 @@ pub(crate) fn translation_build(options: victory_shader::emit::Options) -> &'sta
         if no_literal {
             h.update(b"literal halves disabled");
         }
+        if apart {
+            h.update(b"no halves rendezvous");
+        }
         *h.finalize().as_bytes()
     })
 }
@@ -319,6 +335,7 @@ pub(crate) fn runtime_options() -> victory_shader::emit::Options {
         disable_literal_halves: literal_halves_disabled(),
         per_vertex_center: false,
         uav_size_level0: uav_size_level0(),
+        halves_rendezvous: halves_rendezvous(),
     }
 }
 

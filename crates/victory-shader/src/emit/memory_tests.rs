@@ -124,6 +124,7 @@ fn typed_store_program(soffset: u8) -> Result<HostShader, crate::ShaderError> {
     let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("track");
     let io = io::raise(&p, &native).expect("io::raise");
     let lowered = lower::lower(&lower::Parts {
+        halves_rendezvous: false,
         native: &native,
         p: &p,
         st: &st,
@@ -293,6 +294,7 @@ fn program() -> HostShader {
     assert_eq!(memory, 11, "every access through the pointer is title memory");
     let io = io::raise(&p, &native).expect("io::raise");
     let l = lower::lower(&lower::Parts {
+        halves_rendezvous: false,
         native: &native,
         p: &p,
         st: &st,
@@ -506,6 +508,7 @@ fn runs_from_just_before_a_copy_read_its_first_dwords() {
     let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("track");
     let io = io::raise(&p, &native).expect("io::raise");
     let l = lower::lower(&lower::Parts {
+        halves_rendezvous: false,
         native: &native,
         p: &p,
         st: &st,
@@ -695,6 +698,7 @@ fn root_views_read_their_copy_and_zeros_past_it() {
         let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("track");
         let io = io::raise(&p, native).expect("io::raise");
         lower::lower(&lower::Parts {
+            halves_rendezvous: false,
             native,
             p: &p,
             st: &st,
@@ -855,6 +859,7 @@ fn writes_through_views_mark_their_pages() {
     let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("track");
     let io = io::raise(&p, &native).expect("io::raise");
     let l = lower::lower(&lower::Parts {
+        halves_rendezvous: false,
         native: &native,
         p: &p,
         st: &st,
@@ -1099,6 +1104,7 @@ fn heap_direct_texture_reads_mark_their_heap_index() {
         let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("track");
         let io = io::raise(&p, &native).expect("io::raise");
         lower::lower(&lower::Parts {
+            halves_rendezvous: false,
             native: &native,
             p: &p,
             st: &st,
@@ -1232,6 +1238,7 @@ fn straddling_writes_across_256mib_and_4gib_boundaries_mark_exact_pages() {
     let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("track");
     let io = io::raise(&p, &native).expect("io::raise");
     let l = lower::lower(&lower::Parts {
+        halves_rendezvous: false,
         native: &native,
         p: &p,
         st: &st,
@@ -1414,6 +1421,7 @@ fn early_depth_stencil_skips_occluded_read_mark_pixel_shaders() {
     let vres = resource::track(&vp, &vs_native.layout, vs_native.stage, Some(&vst)).expect("vs res");
     let vio = io::raise(&vp, &vs_native).expect("vs io");
     let vs_lowered = lower::lower(&lower::Parts {
+        halves_rendezvous: false,
         native: &vs_native,
         p: &vp,
         st: &vst,
@@ -1514,6 +1522,7 @@ fn early_depth_stencil_skips_occluded_read_mark_pixel_shaders() {
     let pres = resource::track(&pp, &ps_native.layout, ps_native.stage, Some(&pst)).expect("ps res");
     let pio = io::raise(&pp, &ps_native).expect("ps io");
     let ps_lowered = lower::lower(&lower::Parts {
+        halves_rendezvous: false,
         native: &ps_native,
         p: &pp,
         st: &pst,
