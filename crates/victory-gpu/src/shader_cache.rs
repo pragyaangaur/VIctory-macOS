@@ -114,6 +114,17 @@ fn atomic_lock_rounds() -> bool {
     })
 }
 
+/// Whether a glc-clear 64-bit `umax` first reduces each texel's lanes of
+/// a wave to their maximum key, one representative locking (`emit`,
+/// "Atomic locks"; #240): opt-in while it is measured,
+/// `VICTORY_ATOMIC_UMAX=1`. Only with [`atomic_lock_rounds`].
+fn atomic_umax() -> bool {
+    static UMAX: OnceLock<bool> = OnceLock::new();
+    *UMAX.get_or_init(|| {
+        atomic_lock_rounds() && std::env::var("VICTORY_ATOMIC_UMAX").as_deref() == Ok("1")
+    })
+}
+
 /// The rounds, given whether the locks are on and
 /// `VICTORY_ATOMIC_LOCK_ROUNDS`: on with the locks unless it is `0`.
 fn rounds_on(locks: bool, var: Option<&str>) -> bool {
@@ -163,22 +174,24 @@ pub(crate) fn under_wine() -> bool {
     false
 }
 
-/// [`build`] for translations with host workarounds (atomic locks and
-/// their rounds, bias as gradients, narrow waves): their own cache entries,
-/// one per combination.
+/// [`build`] for translations with host workarounds (atomic locks, their
+/// rounds and umax reduction, bias as gradients, narrow waves): their own
+/// cache entries, one per combination.
 pub(crate) fn translation_build(options: victory_shader::emit::Options) -> &'static [u8; 32] {
     let locks = options.atomic_locks;
     let bias = options.bias_as_gradients;
     let narrow = options.narrow_waves;
     let rounds = locks && options.atomic_lock_rounds;
+    let umax = rounds && options.atomic_umax;
     if !locks && !bias && !narrow {
         return build();
     }
-    static BUILDS: [OnceLock<[u8; 32]>; 16] = [const { OnceLock::new() }; 16];
+    static BUILDS: [OnceLock<[u8; 32]>; 32] = [const { OnceLock::new() }; 32];
     let n = usize::from(locks)
         | usize::from(bias) << 1
         | usize::from(narrow) << 2
-        | usize::from(rounds) << 3;
+        | usize::from(rounds) << 3
+        | usize::from(umax) << 4;
     BUILDS[n].get_or_init(|| {
         let mut h = blake3::Hasher::new();
         h.update(build());
@@ -187,6 +200,9 @@ pub(crate) fn translation_build(options: victory_shader::emit::Options) -> &'sta
         }
         if rounds {
             h.update(b"atomic lock rounds");
+        }
+        if umax {
+            h.update(b"atomic umax");
         }
         if bias {
             h.update(b"bias as gradients");
@@ -208,6 +224,7 @@ pub(crate) fn runtime_options() -> victory_shader::emit::Options {
         view_marks: true,
         atomic_locks: atomic_locks(),
         atomic_lock_rounds: atomic_lock_rounds(),
+        atomic_umax: atomic_umax(),
         bias_as_gradients: bias_as_gradients(),
         host_wave32: host_wave32(),
         narrow_waves: narrow_waves(),
