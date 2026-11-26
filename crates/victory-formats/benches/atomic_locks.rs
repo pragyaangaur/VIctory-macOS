@@ -1,15 +1,17 @@
-//! Time the emulated 64-bit image atomic's two forms as the wave's own
+//! Time the emulated 64-bit image atomic's forms as the wave's own
 //! instruction stream, on CPU: the turn loop `locked_atomic64` emits
-//! today, and the rounds-then-turns form PR #257 lands (the round form
-//! announced on issue #240, as it landed: four capped rounds of one
-//! attempt per lane not done, then today's turns for whoever is
-//! left). The lock words (`ATOMIC_LOCKS` of them, hashed from the
-//! coordinates), the spin's compare-exchange and the fenced
-//! read-modify-write are the emitted ones (victory-shader `lower.rs`,
-//! "Atomic locks"); what the title uses them for is one operation, per
-//! #240's disassembly of its shaders: an unsigned maximum of 64-bit
-//! keys into R32G32_UINT texels, all in alpha pre-pass pixel shaders,
-//! all lanes of a wave per instruction.
+//! today; the rounds-then-turns form PR #257 lands (four capped rounds
+//! of one attempt per lane not done, then today's turns for whoever is
+//! left); and the umax form, which a glc-clear `image_atomic_umax`
+//! enables — the wave first reduces each texel's lanes to their
+//! maximum key, in registers, one representative a group, and only the
+//! representatives lock. The lock words (`ATOMIC_LOCKS` of them,
+//! hashed from the coordinates), the spin's compare-exchange and the
+//! fenced read-modify-write are the emitted ones (victory-shader
+//! `lower.rs`, "Atomic locks"); what the title uses them for is one
+//! operation, per #240's disassembly of its shaders: an unsigned
+//! maximum of 64-bit keys into R32G32_UINT texels, all in alpha
+//! pre-pass pixel shaders, all lanes of a wave per instruction.
 //!
 //! Four shapes: the three the runtime's own test writes
 //! (`image_atomics_of_64_bits`, "as the alpha prepasses use them") —
@@ -32,10 +34,10 @@
 //! word, which is what the announced turn priority gives when the
 //! wave's own lanes never hold each other's locks.
 //!
-//! Both forms are asserted to leave the same texels, to return the
-//! same old values lane by lane, and to free every lock word, against
-//! a plain sequential umax — the exactness bar issue #240 set for any
-//! faster form.
+//! Every form is asserted to leave the same texels, the turn and round
+//! forms to return the same old values lane by lane, and every lock
+//! word is freed, against a plain sequential umax — the exactness bar
+//! issue #240 set for any faster form.
 
 use std::hint::black_box;
 use std::sync::atomic::{fence, AtomicU32, AtomicU64, Ordering};
@@ -130,6 +132,9 @@ struct Count {
     attempts: usize,
     /// The loop's iterations: a turn each, or a round.
     rounds: usize,
+    /// Wave operations the umax form's reduction adds: two lane reads,
+    /// one ballot and two active maxima a group, plus the first ballot.
+    wave_ops: usize,
 }
 
 /// The form `locked_atomic64` emits: the wave runs a loop over lane
@@ -173,17 +178,24 @@ fn turn(m: &Memory, lanes: &mut [Lane], count: &mut Count) {
 /// without a wave operation). A lane the rounds leave takes today's
 /// turn, one uncontended attempt; a wave whose lanes have distinct
 /// locks finishes in the first round and skips the turns.
-fn round(m: &Memory, lanes: &mut [Lane], count: &mut Count) {
+fn round(m: &Memory, lanes: &mut [Lane], count: &mut Count, start_done: &[bool; LANES]) {
     let mut words = [0usize; LANES];
     for (i, lane) in lanes.iter().enumerate() {
         words[i] = lock_of(lane.x, lane.y);
     }
     // The lanes not done, and this round's winners, as the masks the
-    // wave keeps in registers.
+    // wave keeps in registers. `start_done` marks the lanes done from
+    // the start, as the rounds' helper lanes are.
+    let mut done = *start_done;
     let mut rest: [usize; LANES] = core::array::from_fn(|i| i);
-    let mut rest_n = lanes.len();
+    let mut rest_n = 0;
+    for (i, d) in done.iter().enumerate() {
+        if !d {
+            rest[rest_n] = i;
+            rest_n += 1;
+        }
+    }
     let mut won: [usize; LANES] = [0; LANES];
-    let mut done = [false; LANES];
     for _ in 0..ROUNDS {
         count.rounds += 1;
         // Every lane not done attempts once, in lane order.
@@ -257,6 +269,39 @@ fn round(m: &Memory, lanes: &mut [Lane], count: &mut Count) {
     }
 }
 
+/// The umax form: glc clear, so nothing reads the old value and max is
+/// associative — the wave first reduces each texel's lanes to their
+/// maximum key, in registers, one representative a group, and only the
+/// representatives run the rounds and the turns. The reduction is one
+/// pass per group: the lowest lane leads, the group's maximum key
+/// becomes the lead's, the members are done from the start.
+fn umax(m: &Memory, lanes: &mut [Lane], count: &mut Count) {
+    let mut start = [false; LANES];
+    count.wave_ops += 1;
+    for lead in 0..lanes.len() {
+        if start[lead] {
+            continue;
+        }
+        count.wave_ops += 5;
+        let mut hi = lanes[lead].value >> 32;
+        let mut lo = lanes[lead].value & u32::MAX as u64;
+        for member in lead + 1..lanes.len() {
+            if start[member] || (lanes[member].x, lanes[member].y) != (lanes[lead].x, lanes[lead].y) {
+                continue;
+            }
+            let v = lanes[member].value;
+            if v >> 32 > hi {
+                (hi, lo) = (v >> 32, v & u32::MAX as u64);
+            } else if v >> 32 == hi && v & u32::MAX as u64 > lo {
+                lo = v & u32::MAX as u64;
+            }
+            start[member] = true;
+        }
+        lanes[lead].value = lo | hi << 32;
+    }
+    round(m, lanes, count, &start);
+}
+
 /// A plain umax in lane order: the old values and texels both forms
 /// must leave, exactly.
 fn reference(m: &Memory, lanes: &mut [Lane]) {
@@ -314,8 +359,14 @@ fn olds(lanes: &[Lane]) -> Vec<u64> {
     lanes.iter().map(|l| l.old).collect()
 }
 
-/// Both forms against a plain umax, on fresh state: the same texels,
-/// the same old values lane by lane, every lock freed.
+/// The rounds as PR #257 lands them, every lane its own group.
+fn round_form(m: &Memory, lanes: &mut [Lane], count: &mut Count) {
+    round(m, lanes, count, &[false; LANES]);
+}
+
+/// Every form against a plain umax, on fresh state: the same texels,
+/// the turn and round forms the same old values lane by lane, the umax
+/// form's members never reading one, every lock freed.
 fn checked(shape: Shape) {
     let mut lcg = Lcg(0x9E37_79B9_7F4A_7C15);
     for coords in programs(shape) {
@@ -325,19 +376,34 @@ fn checked(shape: Shape) {
         turn(&turn_m, &mut turn_lanes, &mut Count::default());
         let round_m = Memory::zeroed();
         let mut round_lanes = given.clone();
-        round(&round_m, &mut round_lanes, &mut Count::default());
+        round_form(&round_m, &mut round_lanes, &mut Count::default());
+        let umax_m = Memory::zeroed();
+        let mut umax_lanes = given.clone();
+        umax(&umax_m, &mut umax_lanes, &mut Count::default());
         let plain = Memory::zeroed();
         let mut plain_lanes = given;
         reference(&plain, &mut plain_lanes);
         assert!(turn_m.freed(), "a lock left taken");
         assert!(round_m.freed(), "a lock left taken");
+        assert!(umax_m.freed(), "a lock left taken");
         assert!(turn_m.texels_eq(&round_m), "the texels differ");
+        assert!(turn_m.texels_eq(&umax_m), "the texels differ");
         assert!(turn_m.texels_eq(&plain), "the texels differ from a plain umax");
         assert_eq!(olds(&turn_lanes), olds(&round_lanes), "an old value differs");
         assert_eq!(
             olds(&turn_lanes),
             olds(&plain_lanes),
             "an old value differs from a plain umax"
+        );
+        let members = |lanes: &[Lane]| {
+            (0..lanes.len())
+                .filter(|&i| (0..i).any(|j| (lanes[j].x, lanes[j].y) == (lanes[i].x, lanes[i].y)))
+                .map(|i| lanes[i].old)
+                .collect::<Vec<_>>()
+        };
+        assert!(
+            members(&umax_lanes).iter().all(|&old| old == 0),
+            "a member read an old value"
         );
     }
 }
@@ -352,10 +418,11 @@ fn main() {
     ];
     let forms = [
         ("turn", turn as fn(&Memory, &mut [Lane], &mut Count)),
-        ("round", round),
+        ("round", round_form),
+        ("umax", umax),
     ];
 
-    // Untimed: both forms exact, every shape.
+    // Untimed: every form exact, every shape.
     for (_, shape) in shapes {
         checked(shape);
     }
@@ -374,6 +441,7 @@ fn main() {
             println!("bench_atomic_locks_{name}_{shape_name}_barriers {}", count.barriers);
             println!("bench_atomic_locks_{name}_{shape_name}_attempts {}", count.attempts);
             println!("bench_atomic_locks_{name}_{shape_name}_rounds {}", count.rounds);
+            println!("bench_atomic_locks_{name}_{shape_name}_wave_ops {}", count.wave_ops);
         }
     }
 

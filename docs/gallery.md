@@ -25,3 +25,29 @@ Screenshots and videos that testers posted in the issues, newest first within ea
   <img src="https://github.com/user-attachments/assets/5ce34eca-cc47-4934-ad67-b999324ee791" width="480" alt="The game world, a city skyline at night, on an M5 Pro under VIctory" loading="lazy">
 
 - [Video](https://github.com/user-attachments/assets/61b2b07c-5401-44bd-8fbe-829acec5903f): Current main loading into the world without freezing on LakshanSivakumar's M5 Pro, at 0.2 fps, 25 November 2026 (#50).
+
+- The prologue yard on cocobailey's M2 Pro on main `b6dd0b1` with fault tracking, 26 November 2026 (#50).
+
+  <img src="https://github.com/user-attachments/assets/02bc86ef-2b66-4b39-91de-4d8d398833d6" width="480" alt="The prologue yard of the game on an M2 Pro under VIctory" loading="lazy">
+
+- The fence and guard tower in the same run (#50).
+
+  <img src="https://github.com/user-attachments/assets/bb1dab6d-d7a2-4d5a-8025-ecc4fca1cfc0" width="480" alt="The fence and a guard tower in the prologue yard on an M2 Pro" loading="lazy">
+
+- The same spot a day earlier on main `485b230`: red and neon smears, with stale layers at the sides (#50).
+
+  <img src="https://github.com/user-attachments/assets/d2323d6e-e643-4a48-b353-33285e5290ee" width="480" alt="The prologue yard on an M2 Pro before the fixes, with red and neon smears" loading="lazy">
+
+- The first gameplay prompt, "Move around / Move the camera", on cocobailey's M2 Pro, about 2 s per frame, 25 November 2026 (#50).
+
+  <img src="https://github.com/user-attachments/assets/24f8c857-2494-4239-b7a9-06b60e9f58d6" width="480" alt="The game's first gameplay prompt on an M2 Pro under VIctory" loading="lazy">
+
+- The camera turned left after holding a key on the keyboard stand-in pad, the same run (#50).
+
+  <img src="https://github.com/user-attachments/assets/45c76c28-ea66-4a4d-ba7b-819a8e936f7d" width="480" alt="The game camera turned left on an M2 Pro under VIctory" loading="lazy">
+
+- The title card "Vice City, two years ago" on jjlange's M3 Max, first run with no variables set, 25 November 2026 (#50).
+
+  <img src="https://github.com/user-attachments/assets/482a101c-e375-4e35-b5a3-dfc3bd8faf30" width="480" alt="The game's Vice City, two years ago title card on an M3 Max under VIctory" loading="lazy">
+
+- [Video](https://github.com/user-attachments/assets/cfd769c0-5ade-412a-8f5c-766e3e521615): From launch to the freeze on LakshanSivakumar's M5 Pro (48 GB), 25 November 2026 (#65).
