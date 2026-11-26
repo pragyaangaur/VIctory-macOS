@@ -1304,9 +1304,48 @@ pub(crate) mod tests {
         p
     }
 
+    /// Frees a test's allocation at `p`, unless the guards still guard or
+    /// hold a page of it: then it stays allocated, as the other tests'
+    /// pools do.
+    ///
+    /// A copy that a batch, a page table or a widened view still holds
+    /// keeps its tracker after the test drops its own handle. Freed under
+    /// it, the pages stayed in `protected`, and a test running at the same
+    /// time that was given the same address got them unguarded:
+    /// [`protect`] skips a page it has guarded already, so the new
+    /// allocation stayed writable and its writes went unseen (#31: a guard
+    /// test failed in 7 of 150 full runs on an M5 Pro, whichever drew the
+    /// address; 2 of 300 with this). The title's own memory does not go
+    /// this way: the runtime tells the guards when it unmaps it
+    /// ([`title_memory_remapped`]).
     pub(crate) fn free(p: usize) {
+        if still_watched(p) {
+            return;
+        }
         // SAFETY: an allocation of ours.
         unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
+    }
+
+    /// Whether the guards guard or hold a page of the allocation at `p`.
+    fn still_watched(p: usize) -> bool {
+        use windows_sys::Win32::System::Memory::{MEMORY_BASIC_INFORMATION, VirtualQuery};
+        // The allocation's length: its regions, while they start from `p`
+        // (guarded and open pages are regions of their own).
+        let mut len = 0;
+        loop {
+            // SAFETY: plain data filled in by the query.
+            let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+            // SAFETY: a valid out pointer of the right size.
+            let n = unsafe { VirtualQuery((p + len) as *const _, &mut info, size_of_val(&info)) };
+            if n == 0 || info.AllocationBase as usize != p || info.RegionSize == 0 {
+                break;
+            }
+            len += info.RegionSize;
+        }
+        let (first, last) = (p / PAGE, (p + len).div_ceil(PAGE));
+        let g = guards();
+        g.protected.range(first..last).next().is_some()
+            || g.holders.range(first..last).next().is_some()
     }
 
     /// Everything is changed at first; after taking, only what is written

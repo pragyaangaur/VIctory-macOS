@@ -193,7 +193,14 @@
 //!   in a branch a wave whose lanes all finished skips. On D3DMetal (M5 Pro)
 //!   a wave's 64-bit `umax` on distinct texels took 29 µs in turns and
 //!   6 µs in rounds. In a pixel program helper lanes skip the lock in
-//!   rounds: their atomics are discarded, so they could never take it.
+//!   rounds: their atomics are discarded, so they could never take it. A
+//!   lane waiting for a lock another wave holds gives up after
+//!   [`ATOMIC_LOCK_SPINS`] tries in compute and mesh programs
+//!   ([`ATOMIC_LOCK_SPINS_DRAWN`] in the others, whose draws macOS ends
+//!   when they run long) and goes on without it, so a lock nobody frees
+//!   cannot hang the GPU, but that lane's update can be lost (#240). A
+//!   lock is left taken when the host GPU ends a shader that held it, so
+//!   the host frees all of them after a submission it ended.
 //! * **Read marks** (with [`Options::view_marks`]; added 2026-11-25):
 //!   every image instruction that reads a texture shader view the program
 //!   takes from the resource heap itself (not through a table, whose slots
@@ -272,10 +279,10 @@ use crate::{ShaderError, io, ir, resource, structure};
 
 pub use sampler::StaticSampler;
 pub use shader::{
-    ATOMIC_LOCK_ROUNDS, ATOMIC_LOCKS, ATOMIC_LOCKS_AT, HEAP_SAMPLERS, HEAP_VIEWS, MEMORY_SPACE,
-    NULL_BUFFER_VIEW, ROOT_CBV_SPACE, SAMPLER_SPACE, USER_DATA_SPACE, VIEW_INTEGER, VIEW_MARK_NONE,
-    VIEW_MARKS, VIEW_READS, VIEW_SIGNED, VIEW_STRIDE_BITS, VIEW_STRIDES, VIEW_WRITE_BITS,
-    VIEW_WRITES, VIEW_WRITES_BYTES,
+    ATOMIC_LOCK_ROUNDS, ATOMIC_LOCK_SPINS, ATOMIC_LOCK_SPINS_DRAWN, ATOMIC_LOCKS, ATOMIC_LOCKS_AT,
+    HEAP_SAMPLERS, HEAP_VIEWS, MEMORY_SPACE, NULL_BUFFER_VIEW, ROOT_CBV_SPACE, SAMPLER_SPACE,
+    USER_DATA_SPACE, VIEW_INTEGER, VIEW_MARK_NONE, VIEW_MARKS, VIEW_READS, VIEW_SIGNED,
+    VIEW_STRIDE_BITS, VIEW_STRIDES, VIEW_WRITE_BITS, VIEW_WRITES, VIEW_WRITES_BYTES,
 };
 
 /// The loop limit without an override: 2^14.

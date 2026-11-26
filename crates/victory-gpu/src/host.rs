@@ -1628,6 +1628,16 @@ impl Host {
     /// submission lock.
     fn lost(&self, submitted: &mut u64, mark: &Mark) {
         let lost = LOST[0].fetch_add(1, Ordering::Relaxed) + 1;
+        // A lane that held a lock of an emulated 64-bit atomic when the GPU
+        // ended its shader never frees it (`victory_shader::emit`, "Atomic
+        // locks"): free them all before anything else runs.
+        let freed = crate::shadow::free_atomic_locks();
+        if freed > 0 {
+            tracing::warn!(
+                freed,
+                "atomic locks left taken by the ended submission freed"
+            );
+        }
         if self.runs(submitted, mark) {
             if lost.is_power_of_two() {
                 tracing::warn!(
@@ -3439,6 +3449,13 @@ impl Batch {
         let have = self.current.get(&key).map_or(&empty, |(_, have)| have);
         let mut todo = have.missing(address, end).peekable();
         if todo.peek().is_none() {
+            // Already current: what a later list asked again, and what
+            // #259 keeps current across its moves.
+            #[cfg(feature = "diagnostics")]
+            {
+                crate::copystat::add(crate::copystat::C::Skipped, 1);
+                crate::copystat::add(crate::copystat::C::SkippedBytes, (end - address) as u64);
+            }
             return;
         }
         let i = *self.pending.entry(key).or_insert_with(|| {
@@ -5045,6 +5062,36 @@ mod batch {
         crate::shadow::unregister(p, p as u64);
         drop(copy);
         crate::watch::tests::free(p);
+    }
+
+    /// A list asking again for what the submission already brought up to
+    /// date copies nothing, and the copystat line says so: the skipped
+    /// bytes are what staying current saved the later lists.
+    #[test]
+    #[cfg(feature = "diagnostics")]
+    fn a_still_current_ask_is_counted_skipped() {
+        let Some((p, copy)) = plain(2) else {
+            return;
+        };
+        let len = 2 * PAGE;
+        let mut batch = Batch::default();
+        batch.add(&copy, p, len);
+        assert!(batch.flush() > 0, "all of it at first");
+        let (skips, bytes) = (
+            crate::copystat::count(crate::copystat::C::Skipped),
+            crate::copystat::count(crate::copystat::C::SkippedBytes),
+        );
+        batch.add(&copy, p, len);
+        assert_eq!(batch.flush(), 0, "nothing again in the submission");
+        assert!(
+            crate::copystat::count(crate::copystat::C::Skipped) > skips,
+            "the ask counted"
+        );
+        assert!(
+            crate::copystat::count(crate::copystat::C::SkippedBytes) >= bytes + len as u64,
+            "its bytes"
+        );
+        done(p, Some(copy));
     }
 
     /// A copy of `pages` pages of plain private memory, which is not the

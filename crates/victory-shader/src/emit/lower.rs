@@ -5036,7 +5036,8 @@ impl<'a> Lower<'a> {
         let turn = self.s.m.cmp(head, pred::EQ, me, i);
         self.s.m.terminate(head, Term::CondBr(turn, spin, latch));
 
-        // Spin, bounded (past it, on without the lock).
+        // Spin, bounded by the stage (past it, on without the lock; see
+        // `atomic_lock_spins`).
         let got = self.s.op(
             spin,
             "atomicCompareExchange.i32",
@@ -5049,7 +5050,7 @@ impl<'a> Lower<'a> {
         let tries = self.s.m.phi(spin, i32t);
         let more = self.s.m.bin(spin, Bin::Add, tries, one);
         self.s.m.set_phi(tries, vec![(zero, head), (more, spin)]);
-        let limit = k(self, 1 << 16);
+        let limit = k(self, super::shader::atomic_lock_spins(self.x.native.stage));
         let out = self.s.m.cmp(spin, pred::IUGE, more, limit);
         let leave = self.s.m.bin(spin, Bin::Or, won, out);
         self.s.m.terminate(spin, Term::CondBr(leave, held, spin));

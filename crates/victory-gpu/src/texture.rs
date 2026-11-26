@@ -829,10 +829,16 @@ thread_local! {
 }
 
 impl Scratch {
+    const KEEP: usize = 32 << 20;
+
     /// The thread's buffer, at least `size` bytes.
     fn take(size: usize) -> Self {
         let mut v = SCRATCH.take();
         if v.len() < size {
+            // Vec can double across the retention limit on an otherwise cacheable request.
+            if size <= Self::KEEP && v.capacity() > Self::KEEP / 2 {
+                v.reserve_exact(size - v.len());
+            }
             v.resize(size, 0);
         }
         Scratch(v)
@@ -842,8 +848,7 @@ impl Scratch {
 impl Drop for Scratch {
     fn drop(&mut self) {
         // The largest textures' buffers are not kept.
-        const KEEP: usize = 32 << 20;
-        if self.0.len() <= KEEP {
+        if self.0.capacity() <= Self::KEEP {
             SCRATCH.set(std::mem::take(&mut self.0));
         }
     }
@@ -1125,6 +1130,24 @@ fn skip_same_frame(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn texture_scratch_reuses_growing_buffers_within_the_retained_capacity() {
+        let mib = 1 << 20;
+        SCRATCH.set(Vec::new());
+        drop(Scratch::take(31 * mib));
+        drop(Scratch::take(32 * mib));
+        let kept = SCRATCH.take();
+        assert_eq!(kept.len(), 32 * mib);
+        assert!(
+            kept.capacity() <= 32 * mib,
+            "kept {} bytes",
+            kept.capacity()
+        );
+        drop(kept);
+        drop(Scratch::take(33 * mib));
+        assert_eq!(SCRATCH.take().capacity(), 0);
+    }
 
     #[test]
     fn parallel_texture_work_reuses_workers_and_finishes_before_returning() {

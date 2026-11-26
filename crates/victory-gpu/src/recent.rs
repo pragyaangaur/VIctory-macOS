@@ -79,11 +79,13 @@ impl Pool {
     /// Takes `v` back, emptied, at `now`. The pool keeps at most `cap`
     /// bytes, the largest buffers.
     pub(crate) fn give(&mut self, mut v: Vec<u8>, now: Instant, cap: usize) {
-        v.clear();
-        let i = self
-            .free
-            .partition_point(|(f, _)| f.capacity() < v.capacity());
-        self.free.insert(i, (v, now));
+        if v.capacity() <= cap {
+            v.clear();
+            let i = self
+                .free
+                .partition_point(|(f, _)| f.capacity() < v.capacity());
+            self.free.insert(i, (v, now));
+        }
         let mut total = 0;
         if let Some(i) = self.free.iter().rposition(|(f, _)| {
             total += f.capacity();
@@ -218,6 +220,17 @@ mod tests {
         let (x, y) = (pool.take(50).unwrap(), pool.take(50).unwrap());
         assert_eq!((x.as_ptr(), y.as_ptr()), (pb, pa));
         assert!(pool.take(500).unwrap().capacity() >= 1000);
+    }
+
+    #[test]
+    fn oversized_return_preserves_buffers_that_fit_the_current_cap() {
+        let mut pool = Pool::new();
+        let now = Instant::now();
+        pool.give(Vec::with_capacity(32), now, 128);
+        pool.give(Vec::with_capacity(64), now, 128);
+        pool.give(Vec::with_capacity(256), now, 64);
+        assert_eq!(pool.bytes(), 64);
+        assert!(pool.take(64).is_some());
     }
 
     #[test]

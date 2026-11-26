@@ -4,6 +4,7 @@
 
 use super::bitcode::{Attr, Md, Module, Ty, V, pred};
 use super::container::{self, Binding, Psv, SigElement};
+use crate::native::HwStage;
 
 /// Where the shader reads its user data: `b0` in this space.
 pub const USER_DATA_SPACE: u32 = 0;
@@ -61,6 +62,30 @@ pub const ATOMIC_LOCKS: u32 = 1 << 16;
 /// lanes still not done take turns (`emit`, "Atomic locks", with
 /// [`Options::atomic_lock_rounds`](super::Options)).
 pub const ATOMIC_LOCK_ROUNDS: u32 = 4;
+/// Tries a lane of a compute or mesh program makes at a lock another wave
+/// holds before it goes on without it (`emit`, "Atomic locks"). A lane that
+/// waits it out can lose its update, so the bound has to outlast a busy
+/// lock: at 2^16 tries, 2,048 groups adding into one texel lost adds on an
+/// M5 Pro (2 of 100 runs in turns, 1 of 40 in rounds), as 8 groups did on
+/// an M2 Max (#240), and at 2^22 none did in 100 runs of each. macOS does
+/// not end a compute dispatch for running long, so the wait costs time only.
+pub const ATOMIC_LOCK_SPINS: u32 = 1 << 22;
+/// The same in the other stages, whose draws macOS ends when their pixels
+/// run about 50 ms (`docs/macos.md`, "Metal ends long draws"). An ended draw
+/// loses all it drew and can stop the queue, which is worse than one lost
+/// update, so a lane there keeps the shorter bound.
+pub const ATOMIC_LOCK_SPINS_DRAWN: u32 = 1 << 16;
+const _: () = assert!(ATOMIC_LOCK_SPINS_DRAWN < ATOMIC_LOCK_SPINS);
+
+/// How many tries a lane of `stage` makes at a held lock before it goes on
+/// without it: [`ATOMIC_LOCK_SPINS`] in compute and mesh programs,
+/// [`ATOMIC_LOCK_SPINS_DRAWN`] in the others.
+pub const fn atomic_lock_spins(stage: HwStage) -> u32 {
+    match stage {
+        HwStage::Cs | HwStage::Ms => ATOMIC_LOCK_SPINS,
+        _ => ATOMIC_LOCK_SPINS_DRAWN,
+    }
+}
 /// Where the lock words start in the buffer bound at `u`[`VIEW_WRITES`], in
 /// bytes: after the written pages and the read marks.
 pub const ATOMIC_LOCKS_AT: u32 = (VIEW_READS + HEAP_VIEWS) / 8;

@@ -2207,6 +2207,43 @@ fn image_atomics_of_64_bits_in_rounds_match_the_turns() {
 /// in a round and then again in a turn would show here.
 #[test]
 fn image_atomic_adds_of_64_bits_apply_once() {
+    let words = adds64_words();
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    for groups in [1u64, 8] {
+        for rounds in [false, true] {
+            if !adds64_apply_once(&words, groups, rounds) {
+                eprintln!("no SM 6.6 device; skipped");
+                return;
+            }
+        }
+    }
+}
+
+/// The adds of [`image_atomic_adds_of_64_bits_apply_once`] where 2,048
+/// groups meet on one lock, 20 times in each form. A lane that waits out
+/// its bound goes on without the lock and loses its add: with a bound of
+/// 2^16 tries this lost adds on an M5 Pro (2 of 100 runs in turns, 1 of 40
+/// in rounds) and with 8 groups on an M2 Max (patcliftongc, #240); see
+/// [`super::ATOMIC_LOCK_SPINS`]. Slow on WARP; run with `--ignored` on a
+/// Mac.
+#[test]
+#[ignore = "a stress under contention, for D3DMetal (#240)"]
+fn image_atomic_adds_of_64_bits_apply_once_under_contention() {
+    let words = adds64_words();
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    for rounds in [false, true] {
+        for _ in 0..20 {
+            if !adds64_apply_once(&words, 2048, rounds) {
+                eprintln!("no SM 6.6 device; skipped");
+                return;
+            }
+        }
+    }
+}
+
+/// The shader of [`image_atomic_adds_of_64_bits_apply_once`]: every lane
+/// adds `0xFFFF_FFFF` into texel (0, 0), then into its own texel (l, 1).
+fn adds64_words() -> Vec<u32> {
     let v0 = vgpr(0);
     let mut words = atomics64_prologue();
     words.extend([
@@ -2222,32 +2259,48 @@ fn image_atomic_adds_of_64_bits_apply_once() {
     words.extend(image_atomic(0x11, 1, 3, 8, 3, false));
     words.extend(image_atomic(0x11, 1, 5, 8, 3, false));
     words.push(S_ENDPGM);
-    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
-    for groups in [1u64, 8] {
-        for rounds in [false, true] {
-            let Some((got, locks, label, _)) =
-                locked_atomics64(&words, rounds, (32, 2), groups as u32)
-            else {
-                eprintln!("no SM 6.6 device; skipped");
-                return;
-            };
-            let form = if rounds { "rounds" } else { "turns" };
-            let label = format!("{label}, {form}, {groups} groups");
-            let add = u64::from(u32::MAX);
-            assert_eq!(got[0], 32 * groups * add, "{label}: the shared texel");
-            assert!(
-                got[1..32].iter().all(|&t| t == 0),
-                "{label}: the rest of row 0"
-            );
-            assert!(
-                got[32..].iter().all(|&t| t == groups * add),
-                "{label}: own texels"
-            );
-            assert!(
-                locks.iter().all(|&w| w == 0),
-                "{label}: a lock left taken or a page marked"
-            );
-        }
+    words
+}
+
+/// Runs [`adds64_words`] as `groups` groups of 32 lanes (in rounds first if
+/// `rounds`) and checks that every add applied once and no lock is left
+/// taken. `false` with no SM 6.6 device.
+fn adds64_apply_once(words: &[u32], groups: u64, rounds: bool) -> bool {
+    let Some((got, locks, label, _)) = locked_atomics64(words, rounds, (32, 2), groups as u32)
+    else {
+        return false;
+    };
+    let form = if rounds { "rounds" } else { "turns" };
+    let label = format!("{label}, {form}, {groups} groups");
+    let add = u64::from(u32::MAX);
+    assert_eq!(got[0], 32 * groups * add, "{label}: the shared texel");
+    assert!(
+        got[1..32].iter().all(|&t| t == 0),
+        "{label}: the rest of row 0"
+    );
+    assert!(
+        got[32..].iter().all(|&t| t == groups * add),
+        "{label}: own texels"
+    );
+    assert!(
+        locks.iter().all(|&w| w == 0),
+        "{label}: a lock left taken or a page marked"
+    );
+    true
+}
+
+/// Lanes of compute and mesh programs wait longer for a held lock than
+/// those of the stages whose draws macOS ends when they run long (#240).
+#[test]
+fn atomic_lock_bound_follows_the_stage() {
+    use super::shader::atomic_lock_spins;
+    let (compute, drawn) = (super::ATOMIC_LOCK_SPINS, super::ATOMIC_LOCK_SPINS_DRAWN);
+    for stage in [HwStage::Cs, HwStage::Ms] {
+        assert_eq!(atomic_lock_spins(stage), compute, "{stage:?}");
+    }
+    let others = [HwStage::Ps, HwStage::Vs, HwStage::Gs, HwStage::Es];
+    for stage in others.into_iter().chain([HwStage::Hs, HwStage::Ls]) {
+        assert_eq!(atomic_lock_spins(stage), drawn, "{stage:?}");
     }
 }
 
