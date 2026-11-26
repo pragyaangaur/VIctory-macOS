@@ -13,9 +13,10 @@
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Condvar, LazyLock, Mutex, MutexGuard};
+use std::sync::{Arc, Condvar, LazyLock, Mutex};
 use std::time::Duration;
 
+use super::lock;
 use super::xgameruntime::{Guid, HRESULT, Interface, Methods, Object, S_OK, add_ref, missing};
 
 /// The task-queue provider; it is also the interface id titles ask for.
@@ -29,7 +30,11 @@ pub const PROVIDER: Guid = Guid {
 pub const E_PENDING: HRESULT = 0x8000_000A_u32 as i32;
 pub const E_ABORT: HRESULT = 0x8000_4004_u32 as i32;
 pub const E_NOTIMPL: HRESULT = 0x8000_4001_u32 as i32;
+pub const E_NOINTERFACE: HRESULT = 0x8000_4002_u32 as i32;
+pub const E_POINTER: HRESULT = 0x8000_4003_u32 as i32;
+pub const E_FAIL: HRESULT = 0x8000_4005_u32 as i32;
 pub const E_INVALIDARG: HRESULT = 0x8007_0057_u32 as i32;
+pub const E_OUTOFMEMORY: HRESULT = 0x8007_000E_u32 as i32;
 pub const E_NOT_SUFFICIENT_BUFFER: HRESULT = 0x8007_007A_u32 as i32;
 pub const E_ILLEGAL_METHOD_CALL: HRESULT = 0x8000_000E_u32 as i32;
 
@@ -255,10 +260,6 @@ impl Queue {
             callback(context as *mut c_void, Arc::as_ptr(self), port);
         }
     }
-}
-
-fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
-    m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 /// The process queue: `None` until first used (then a thread-pool queue),

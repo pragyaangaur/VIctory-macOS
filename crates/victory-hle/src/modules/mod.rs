@@ -5,8 +5,7 @@
 //! Run `victory census` over your titles to see what is still missing.
 //!
 //! Planned areas (driven by census results, not by completeness):
-//! `file` (package paths), `thread` (TLS callbacks for title threads),
-//! `xaudio2`, `xstore` stubs.
+//! `thread` (TLS callbacks for title threads), `xaudio2`.
 
 #[cfg(windows)]
 pub mod apu;
@@ -46,7 +45,14 @@ pub mod xstore;
 pub mod xsystem;
 pub mod xuser;
 
+use std::sync::{Mutex, MutexGuard};
+
 use crate::HleModule;
+
+/// Locks `mutex`, taking the data even if a thread panicked holding it.
+pub(crate) fn lock<T: ?Sized>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(|e| e.into_inner())
+}
 
 pub(crate) fn all() -> Vec<HleModule> {
     let mut all = vec![

@@ -19,7 +19,7 @@
 
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
-use std::ffi::{CStr, c_char, c_void};
+use std::ffi::{c_char, c_void};
 use std::os::windows::fs::FileExt;
 use std::os::windows::io::FromRawHandle;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering};
@@ -27,8 +27,8 @@ use std::sync::{Condvar, Mutex, MutexGuard, OnceLock};
 
 use victory_formats::bcpack::{self, Tables};
 
-use super::xasync::{E_INVALIDARG, E_NOTIMPL, E_PENDING};
-use super::xgameruntime::{Guid, HRESULT, Methods, Object, S_OK, add_ref, missing, put};
+use super::xasync::{E_INVALIDARG, E_NOINTERFACE, E_NOTIMPL, E_OUTOFMEMORY, E_PENDING};
+use super::xgameruntime::{Guid, HRESULT, Methods, Object, S_OK, add_ref, missing, put, text};
 use crate::{HleModule, hle_export};
 
 /// The factory interface Grand Theft Auto VI asks for.
@@ -38,8 +38,6 @@ const FACTORY: Guid = Guid::new(
     0x4884,
     [0xa0, 0xa3, 0xf7, 0x86, 0x2e, 0xa2, 0x43, 0xae],
 );
-const E_NOINTERFACE: HRESULT = 0x8000_4002_u32 as i32;
-const E_OUTOFMEMORY: HRESULT = 0x8007_000E_u32 as i32;
 /// `HRESULT_FROM_WIN32(ERROR_HANDLE_EOF)`: the source ends early.
 const END_OF_FILE: HRESULT = 0x8007_0026_u32 as i32;
 /// `HRESULT_FROM_WIN32(ERROR_INVALID_DATA)`: a bad compressed stream.
@@ -158,7 +156,7 @@ extern "system" fn create_status_array(
 ) -> HRESULT {
     tracing::info!(
         capacity,
-        name = text(name),
+        name = text(name).unwrap_or_default(),
         iid = iid_text(iid),
         "dstorage: status array"
     );
@@ -191,7 +189,7 @@ extern "system" fn create_queue(
     let Some(desc) = (unsafe { desc.as_ref() }) else {
         return E_INVALIDARG;
     };
-    let name = text(desc.name);
+    let name = text(desc.name).unwrap_or_default();
     tracing::info!(
         source = desc.source_type,
         capacity = desc.capacity,
@@ -223,16 +221,6 @@ extern "system" fn set_staging_buffer_size(_: Factory, size: u32) -> HRESULT {
         scheduler.lock().staging = u64::from(size);
     }
     S_OK
-}
-
-fn text(name: *const c_char) -> String {
-    if name.is_null() {
-        return String::new();
-    }
-    // SAFETY: a NUL-terminated name from the title.
-    unsafe { CStr::from_ptr(name) }
-        .to_string_lossy()
-        .into_owned()
 }
 
 static FACTORY_VTABLE: Methods<16> = Methods([
@@ -872,7 +860,7 @@ fn execute(request: &Request) -> Result<(), HRESULT> {
             destination_size = request.destination_size,
             intermediate_size = request.intermediate_size,
             tag = request.tag,
-            name = text(request.name),
+            name = text(request.name).unwrap_or_default(),
             hr = format_args!("{:#010x}", hr as u32),
             "dstorage: request failed: {why}"
         );

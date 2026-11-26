@@ -443,7 +443,8 @@ struct Physical {
     views: BTreeMap<usize, (usize, Slice)>,
     /// Where each slice (section, page index) is mapped: the addresses of
     /// its page in every view showing it (the GPU side's change tracking
-    /// follows writes through one view to the others, `aliases`).
+    /// follows writes through one view to the others,
+    /// `victory_gpu::title_memory_aliased`).
     shown: HashMap<(usize, usize), Vec<usize>>,
 }
 
@@ -456,9 +457,10 @@ impl Slice {
 
 /// Every address of a title view showing a page that title memory at
 /// `[at, at + len)` shows, except the page's own address: pushed to `out`
-/// as (page address, other address). The GPU side's change tracking
-/// (`victory_gpu::watch`) marks writes there too.
-pub fn aliases(at: usize, len: usize, out: &mut Vec<(usize, usize)>) {
+/// as (page address, other address). Tests read `shown` back with it; the
+/// GPU side's change tracking (`victory_gpu::watch`) marks writes there too.
+#[cfg(test)]
+fn aliases(at: usize, len: usize, out: &mut Vec<(usize, usize)>) {
     let physical = physical();
     let end = at.saturating_add(len);
     let first = physical

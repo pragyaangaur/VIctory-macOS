@@ -12,7 +12,8 @@
 //! Mixed audio leaves through the host's WASAPI, which titles and
 //! middleware reach through COM like on PC. fmod's console build sets up
 //! the coprocessor inside `System_Create` and waits there for its first
-//! command to be acknowledged; Grand Theft Auto VI uses only XMA contexts.
+//! command to be acknowledged. Grand Theft Auto VI uses XMA contexts here;
+//! its Opus audio goes through the decoder in `apu` (`xapu.dll`).
 #![allow(non_snake_case)]
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
@@ -23,19 +24,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard, OnceLock, RwLock, RwLockReadGuard};
 use std::time::Instant;
 
-use super::xasync::E_INVALIDARG;
+use super::lock;
+use super::xasync::{E_FAIL, E_INVALIDARG, E_OUTOFMEMORY};
 use super::xgameruntime::{HRESULT, S_OK};
 use crate::{HleModule, hle_export};
 
 #[cfg(all(windows, feature = "diagnostics"))]
 pub mod capture;
-
-const E_FAIL: HRESULT = 0x8000_4005_u32 as i32;
-const E_OUTOFMEMORY: HRESULT = 0x8007_000E_u32 as i32;
-
-fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
-    m.lock().unwrap_or_else(|e| e.into_inner())
-}
 
 // The APU heap.
 

@@ -12,7 +12,6 @@ victory-gpu.workspace = true
 victory-loader.workspace = true
 victory-pe.workspace = true
 victory-formats.workspace = true
-opus-pure.workspace = true
 miniz_oxide.workspace = true
 tracing.workspace = true
 
@@ -48,6 +47,8 @@ windows = { workspace = true, features = [
 ] }
 # `#[implement]` names it.
 windows-core = { workspace = true, optional = true }
+# Opus decoding for the console's audio decoder (`modules::apu`).
+opus-pure.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

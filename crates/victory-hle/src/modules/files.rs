@@ -11,7 +11,6 @@
 //! does not use, so no host drive is hidden.
 #![allow(non_snake_case)]
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
-#![allow(clippy::too_many_arguments)]
 
 use std::ffi::{CStr, c_char, c_void};
 use std::os::windows::ffi::OsStrExt;

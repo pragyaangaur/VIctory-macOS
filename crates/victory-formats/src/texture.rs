@@ -45,10 +45,6 @@ impl Swizzle {
     pub const SW_64KB_S: Swizzle = Swizzle(9);
     pub const SW_64KB_D: Swizzle = Swizzle(10);
     pub const SW_64KB_S_T: Swizzle = Swizzle(17);
-    pub const SW_64KB_D_T: Swizzle = Swizzle(18);
-    pub const SW_4KB_S_X: Swizzle = Swizzle(21);
-    pub const SW_4KB_D_X: Swizzle = Swizzle(22);
-    pub const SW_4KB_R_X: Swizzle = Swizzle(23);
     pub const SW_64KB_Z_X: Swizzle = Swizzle(24);
     pub const SW_64KB_S_X: Swizzle = Swizzle(25);
     pub const SW_64KB_D_X: Swizzle = Swizzle(26);

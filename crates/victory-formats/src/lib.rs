@@ -5,8 +5,9 @@
 //! [`pagetable`] (the title-memory page table the GPU's shaders look
 //! addresses up in), [`extents`] (where the copies a submission flushed
 //! sit in memory, so a byte window reaches only the copies that can
-//! hold it). Planned: BCPack textures, audio codecs (XMA2, Opus), and
-//! the zlib streams used by hardware decompression.
+//! hold it), [`bcpack`] (BCPack texture decompression) and [`xma`] (the XMA2
+//! audio decoder). Opus and the zlib streams used by hardware decompression
+//! are decoded in `victory-hle`, with `opus-pure` and `miniz_oxide`.
 
 pub mod bcpack;
 pub mod extents;
