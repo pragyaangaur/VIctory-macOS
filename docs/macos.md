@@ -252,9 +252,15 @@ The title has eight loops that write cache lines back with `clwb`, which faults 
 
 Under Rosetta with D3DMetal, memory the title commits read-write with `XMemVirtualAlloc`, in whole 64 KiB pages, is pointed at the pages of a D3DMetal buffer with `mach_vm_remap` (#204). The GPU then reads and writes the title's own memory, so those buffers need no host copy, no copy-back after a submission that wrote them, and no refresh before one. A probe at start-up falls back to the copies if the remap does not work, and `VICTORY_ALIAS_BUFFERS=0` keeps the copies.
 
+## The title's output size on a Mac
+
+The title takes its output size from its own settings (`settings.xml`, `video/resolutionFullscreen`), which a Series X wrote as 3840x2160, so a run without `VICTORY_OUTPUT` drew the world at 3840x2160. On a Mac the output size is 1280x720 now, the smallest of the title's own modes: `victory-loader/src/resolution.rs` writes it into the title's code at load, where the bytes match build 1.0.2.1, and logs `resolution: ... Done` for each site. On a 16 GB M4 (Series X), 1280x720 brought the GPU time of a world frame from about 8.4 s to 0.86 s.
+
+`VICTORY_OUTPUT=<W>x<H>` asks for another of the title's modes, as before. `VICTORY_OUTPUT=0`, or `none`, leaves the title's own size alone, for a run that wants the picture at the size its settings carry. On Windows, without the switch, the title's own size is used as before.
+
 ## Optional switches for slow storage, low memory and speed
 
-None of these changes the default. Each is read from the environment when the game starts, and all of them are tools for testers, so please post what you see on #131 or #135 when you try one.
+None of these changes the default, except `VICTORY_OUTPUT`, which sets the title's output size on a Mac (see above). Each is read from the environment when the game starts, and all of them are tools for testers, so please post what you see on #131 or #135 when you try one.
 
 | Switch | What it does |
 | --- | --- |
@@ -266,7 +272,7 @@ None of these changes the default. Each is read from the environment when the ga
 | `VICTORY_GPU_BUDGET_MB=<MB>` | Sets the budget that host textures are kept under, in place of the device's. |
 | `VICTORY_PATCH_WIDE=<list>` | Splits the 256-bit stores listed by `cargo xtask wide-stores` into 128-bit halves, so fault tracking does not stop Rosetta on them (see above). |
 | `VICTORY_MESH_OVER_LIMIT=1` | Makes mesh pipelines whose outputs are over Metal's 32 KiB anyway (refused under Wine by default, as they hang the queue; see above). |
-| `VICTORY_OUTPUT=<W>x<H>` | Sets the title's output size, one of its own modes: 1280x720, 1664x936, 1920x1080, 2560x1440 or 3840x2160. It patches the title's code at load, only where the bytes match build 1.0.2.1, and logs `resolution: ... Done` for each site. On a 16 GB M4 (Series X), 1280x720 brought the GPU time of a world frame from about 8.4 s to 0.86 s. Ported from avatarmanz/VIctory-7900XTX. |
+| `VICTORY_OUTPUT=<W>x<H>` | Sets the title's output size, one of its own modes: 1280x720, 1664x936, 1920x1080, 2560x1440 or 3840x2160. It patches the title's code at load, only where the bytes match build 1.0.2.1, and logs `resolution: ... Done` for each site. Without it the size is 1280x720 on a Mac (see above) and the title's own size elsewhere; `0`, or `none`, leaves the title's own size alone. On a 16 GB M4 (Series X), 1280x720 brought the GPU time of a world frame from about 8.4 s to 0.86 s. Ported from avatarmanz/VIctory-7900XTX. |
 | `VICTORY_RENDER_SCALE=<s>` | 0.5 to 1.0: the title's own upscaler's render scale (2/3 by default, Series X). Not yet tested on a Mac. |
 | `VICTORY_UPSCALER=<6\|7>` | Makes the title pick its own upscaler (6) or FidelityFX (7). Not yet tested on a Mac. |
 | `VICTORY_STEP_OVER=pool` | Steps over the title's "no free element" traps: an `int3` followed by `xor r, r`, the shape of a full fixed-size pool's allocator, whose caller then gets the NULL it already checks for. Series 1.0.2.1 hits one at `+0x5149aec` (the instance lists' pool, Marvisak/VIctory#698) about 20 minutes into the opening when frames take seconds. A list of hex offsets also works. |

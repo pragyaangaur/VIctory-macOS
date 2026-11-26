@@ -157,8 +157,9 @@ pub fn run(
         }
     }
     // The title's output size, render scale and upscaler (`VICTORY_OUTPUT`,
-    // `VICTORY_RENDER_SCALE`, `VICTORY_UPSCALER`; each
-    // off without it), ported from avatarmanz/VIctory-7900XTX.
+    // `VICTORY_RENDER_SCALE`, `VICTORY_UPSCALER`; the output size 1280x720
+    // on a Mac without the first, the other two off without theirs),
+    // ported from avatarmanz/VIctory-7900XTX.
     #[cfg(windows)]
     if execute {
         let size = image.info().size_of_image as usize;

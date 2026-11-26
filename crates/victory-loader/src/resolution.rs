@@ -1,7 +1,8 @@
 //! The title's output size and render scale (`VICTORY_OUTPUT`,
-//! `VICTORY_RENDER_SCALE`, `VICTORY_UPSCALER`; each off without it): places
-//! in the title's code changed at load, each compared byte for byte first
-//! and left alone, said so, if it differs (another build of the title).
+//! `VICTORY_RENDER_SCALE`, `VICTORY_UPSCALER`; the output size 1280x720 on
+//! a Mac without the first, the other two off without theirs): places in
+//! the title's code changed at load, each compared byte for byte first and
+//! left alone, said so, if it differs (another build of the title).
 //!
 //! What the title does (game_scarlett_master.exe 1.0.2.1, image offsets):
 //!
@@ -22,7 +23,9 @@
 //!   after it (the device parameters +0x1e0fb30, the render size +0x7b4e10)
 //!   sees the same size. The back buffers' pool (64 MB on Series X) is
 //!   checked to be used up but for 2 MB (+0x247af25, an `int3`); for another
-//!   size that check is jumped over.
+//!   size that check is jumped over. The size asked for is
+//!   `VICTORY_OUTPUT`'s, or 1280x720 on a Mac without it ([`DEFAULT_OUTPUT`]),
+//!   or the title's own size when the switch says `0` or `none`.
 //! - **Render scale.** The upscaler the title picks (+0x7e93f0: 6, its own,
 //!   except on Series S with a flag, 7, AMD FidelityFX) gives the render
 //!   size from the output size (+0x7e92f0 → the upscaler's +0x50 method):
@@ -56,17 +59,95 @@ pub const MODES: [(u32, u32); 5] = [
     (3840, 2160),
 ];
 
-/// `VICTORY_OUTPUT=<w>x<h>`: one of [`MODES`]. `None` if unset or not one
-/// (said why).
-pub fn asked_output() -> Option<(u32, u32)> {
-    let spec = std::env::var("VICTORY_OUTPUT").ok()?;
-    let size = parse_output(&spec);
-    if size.is_none() {
-        eprintln!(
-            "VIctory: VICTORY_OUTPUT={spec}: expected one of the title's modes: 1920x1080, 2560x1440, 1280x720, 1664x936, 3840x2160"
-        );
+/// The size the title's output is asked for on a Mac without
+/// `VICTORY_OUTPUT`: the smallest of the title's modes (docs/macos.md).
+pub const DEFAULT_OUTPUT: (u32, u32) = (1280, 720);
+
+/// What the title's output size is asked to be.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Asked {
+    /// The title's own size, the one its settings carry: nothing is
+    /// patched.
+    Title,
+    /// This size: the title's code is patched to it.
+    Size((u32, u32)),
+}
+
+/// `VICTORY_OUTPUT=<w>x<h>`: one of [`MODES`], or `0` or `none` for the
+/// title's own size (the one its settings carry). Unset: 1280x720 on a Mac
+/// ([`DEFAULT_OUTPUT`]), the title's own size elsewhere.
+pub fn asked_output() -> Asked {
+    let spec = std::env::var("VICTORY_OUTPUT").ok();
+    asked_output_on(spec.as_deref(), on_a_mac())
+}
+
+/// What `VICTORY_OUTPUT` asks for, for a host that is a Mac or not: the
+/// value's own, or the default when it is unset or wrong (said why).
+fn asked_output_on(spec: Option<&str>, mac: bool) -> Asked {
+    let fallback = default_output_on(mac);
+    let Some(spec) = spec else {
+        return fallback;
+    };
+    match parse_asked(spec) {
+        Ok(asked) => asked,
+        Err(why) => {
+            eprintln!("VIctory: VICTORY_OUTPUT={spec}: {why}");
+            fallback
+        }
     }
-    size
+}
+
+/// The modes and the opt-out, said when a value is neither.
+const EXPECTED_OUTPUT: &str = "expected one of the title's modes: 1920x1080, 2560x1440, 1280x720, 1664x936, 3840x2160, or 0 or none for the title's own size";
+
+/// What `spec` asks for: one of [`MODES`], or the title's own size for `0`
+/// or `none`. `Err` says what is wrong with it.
+fn parse_asked(spec: &str) -> Result<Asked, String> {
+    let trimmed = spec.trim();
+    if trimmed == "0" || trimmed.eq_ignore_ascii_case("none") {
+        return Ok(Asked::Title);
+    }
+    parse_output(spec)
+        .map(Asked::Size)
+        .ok_or_else(|| format!("{EXPECTED_OUTPUT}; ignored, the default is used"))
+}
+
+/// The size asked for without `VICTORY_OUTPUT`: [`DEFAULT_OUTPUT`] on a
+/// Mac, the title's own size elsewhere.
+fn default_output_on(mac: bool) -> Asked {
+    if mac {
+        Asked::Size(DEFAULT_OUTPUT)
+    } else {
+        Asked::Title
+    }
+}
+
+/// Whether the host is a Mac: the title runs here under Wine, whose host
+/// is the Mac (`wine_get_host_version` names it).
+#[cfg(windows)]
+fn on_a_mac() -> bool {
+    use std::ffi::{CStr, c_char};
+    use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleA, GetProcAddress};
+    type HostVersion = unsafe extern "C" fn(*mut *const c_char, *mut *const c_char);
+    // SAFETY: ntdll is always loaded; both names end with a NUL.
+    unsafe {
+        let Some(f) = GetProcAddress(
+            GetModuleHandleA(c"ntdll.dll".as_ptr().cast()),
+            c"wine_get_host_version".as_ptr().cast(),
+        ) else {
+            return false;
+        };
+        let f: HostVersion = std::mem::transmute(f);
+        let (mut sysname, mut release) = (std::ptr::null(), std::ptr::null());
+        f(&mut sysname, &mut release);
+        !sysname.is_null() && CStr::from_ptr(sysname) == c"Darwin"
+    }
+}
+
+/// Whether the host is a Mac: never, on a host that is not Windows.
+#[cfg(not(windows))]
+fn on_a_mac() -> bool {
+    false
 }
 
 pub fn parse_output(spec: &str) -> Option<(u32, u32)> {
@@ -328,7 +409,7 @@ pub unsafe fn apply_asked(base: usize, size: usize) {
     // none: a smaller output with the pool check left in stops the title,
     // and the check gone without a smaller output is pointless.
     let mut asked: Vec<(Group, String)> = Vec::new();
-    if let Some((w, h)) = asked_output() {
+    if let Asked::Size((w, h)) = asked_output() {
         let mut group = vec![(&OUTPUT, output_code(w, h))];
         if (w, h) != (3840, 2160) {
             group.push((&POOL_CHECK, pool_check_code()));
@@ -384,6 +465,60 @@ mod tests {
         assert_eq!(parse_render_scale("1"), Some(1.0));
         assert_eq!(parse_render_scale("0.4"), None);
         assert_eq!(parse_render_scale("1.5"), None);
+    }
+
+    /// Without the switch, the output size is 1280x720 on a Mac and the
+    /// title's own size elsewhere.
+    #[test]
+    fn the_default_output_is_720p_on_a_mac() {
+        assert_eq!(asked_output_on(None, true), Asked::Size((1280, 720)));
+        assert_eq!(asked_output_on(None, false), Asked::Title);
+        assert_eq!(DEFAULT_OUTPUT, (1280, 720));
+    }
+
+    /// Every mode the title has parses, and the opt-out leaves the title's
+    /// own size alone.
+    #[test]
+    fn every_mode_and_the_opt_out_parse() {
+        for (w, h) in MODES {
+            assert_eq!(parse_asked(&format!("{w}x{h}")), Ok(Asked::Size((w, h))));
+        }
+        assert_eq!(parse_asked("0"), Ok(Asked::Title));
+        assert_eq!(parse_asked("none"), Ok(Asked::Title));
+        assert_eq!(parse_asked("None"), Ok(Asked::Title));
+        assert_eq!(parse_asked(" none "), Ok(Asked::Title));
+    }
+
+    /// A value that is neither a mode nor the opt-out says what is
+    /// expected, and is ignored: the default is used instead.
+    #[test]
+    fn a_wrong_output_value_says_why_and_is_ignored() {
+        let why = parse_asked("1600x900").unwrap_err();
+        assert!(why.contains("1280x720"), "{why}");
+        assert!(why.contains("3840x2160"), "{why}");
+        assert!(why.contains("none"), "{why}");
+        assert!(parse_asked("1080p").is_err());
+        assert_eq!(
+            asked_output_on(Some("1600x900"), true),
+            Asked::Size((1280, 720))
+        );
+        assert_eq!(asked_output_on(Some("1600x900"), false), Asked::Title);
+    }
+
+    /// The value the switch carries is used as it is, on a Mac and
+    /// elsewhere.
+    #[test]
+    fn an_asked_output_is_used_as_it_is() {
+        assert_eq!(
+            asked_output_on(Some("2560x1440"), true),
+            Asked::Size((2560, 1440))
+        );
+        assert_eq!(
+            asked_output_on(Some("2560x1440"), false),
+            Asked::Size((2560, 1440))
+        );
+        assert_eq!(asked_output_on(Some("0"), true), Asked::Title);
+        assert_eq!(asked_output_on(Some("none"), false), Asked::Title);
     }
 
     /// The calls and loads in the bytes compared are the ones the
