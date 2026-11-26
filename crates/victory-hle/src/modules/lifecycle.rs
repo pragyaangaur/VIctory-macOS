@@ -271,9 +271,7 @@ fn stand_in(title: HWND, ex_style: u32, style: u32, x: i32, y: i32, width: i32, 
     if title.is_null() {
         return;
     }
-    let (x, y, width, height) = if std::env::var_os("VICTORY_WINDOW_SECONDARY").as_deref()
-        == Some(std::ffi::OsStr::new("1"))
-    {
+    let (x, y, width, height) = if secondary_asked() {
         let Some(area) = secondary_work_area() else {
             tracing::error!(
                 "secondary display unavailable or ambiguous; refusing to show title window"
@@ -325,8 +323,51 @@ fn stand_in(title: HWND, ex_style: u32, style: u32, x: i32, y: i32, width: i32, 
     unsafe { wm::SetPropW(title, STAND_IN, window) };
 }
 
-/// Select exactly one non-primary monitor, or refuse an ambiguous layout.
+/// Whether `VICTORY_WINDOW_SECONDARY` asks for a display: `1` (the only
+/// non-primary one) or `x,y` (the one holding that desktop point).
+pub fn secondary_asked() -> bool {
+    std::env::var("VICTORY_WINDOW_SECONDARY")
+        .is_ok_and(|v| v == "1" || secondary_point(&v).is_some())
+}
+
+/// `x,y` as a desktop point.
+fn secondary_point(v: &str) -> Option<(i32, i32)> {
+    let (x, y) = v.split_once(',')?;
+    Some((x.trim().parse().ok()?, y.trim().parse().ok()?))
+}
+
+/// The work area of the display `VICTORY_WINDOW_SECONDARY=x,y` names, or
+/// none if no display holds that point.
+fn work_area_at(x: i32, y: i32) -> Option<RECT> {
+    use windows_sys::Win32::Foundation::POINT;
+    use windows_sys::Win32::Graphics::Gdi::{
+        GetMonitorInfoW, MONITOR_DEFAULTTONULL, MONITORINFO, MonitorFromPoint,
+    };
+    // SAFETY: plain queries; the output struct is live.
+    unsafe {
+        let monitor = MonitorFromPoint(POINT { x, y }, MONITOR_DEFAULTTONULL);
+        if monitor.is_null() {
+            return None;
+        }
+        let mut info = MONITORINFO {
+            cbSize: size_of::<MONITORINFO>() as u32,
+            ..Default::default()
+        };
+        (GetMonitorInfoW(monitor, &mut info) != 0).then_some(info.rcWork)
+    }
+}
+
+/// Select the display `VICTORY_WINDOW_SECONDARY` asks for: with `x,y` the
+/// one holding that point (for layouts with several extra displays), else
+/// exactly one non-primary monitor, or refuse an ambiguous layout.
 fn secondary_work_area() -> Option<RECT> {
+    if let Some((x, y)) = std::env::var("VICTORY_WINDOW_SECONDARY")
+        .ok()
+        .as_deref()
+        .and_then(secondary_point)
+    {
+        return work_area_at(x, y);
+    }
     use windows_sys::Win32::Graphics::Gdi::{
         EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITORINFO,
     };

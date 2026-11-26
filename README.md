@@ -115,7 +115,9 @@ For now this gets as far as VIctory does on Windows, as the note at the top expl
 
 Set `VICTORY_WINDOW_SECONDARY=1` to open the game window on the only non-primary
 display. This requires two extended displays. If VIctory cannot select a single
-secondary display, it leaves the game window hidden. `VICTORY_WINDOW_MAX=WIDTHxHEIGHT`
+secondary display, it leaves the game window hidden. With more than one extra display,
+`VICTORY_WINDOW_SECONDARY=x,y` picks the one that holds that desktop point instead.
+`VICTORY_WINDOW_MAX=WIDTHxHEIGHT`
 can further limit the window size without changing the render target.
 
 ## Running the tests
