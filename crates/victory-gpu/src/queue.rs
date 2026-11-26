@@ -624,6 +624,8 @@ extern "system" fn present(
     let frame = FRAMES.fetch_add(1, Ordering::Relaxed) + 1;
     #[cfg(windows)]
     account_frame(frame);
+    #[cfg(windows)]
+    crate::shadow::trim_pool();
     #[cfg(feature = "diagnostics")]
     crate::frame::presented();
     if frame.is_power_of_two() {

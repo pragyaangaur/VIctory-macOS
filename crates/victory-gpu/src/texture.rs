@@ -138,12 +138,20 @@ static BUFFERS: Mutex<Buffers> = Mutex::new(Buffers {
 const KEPT_BYTES: u64 = 64 << 20;
 
 /// Called before a submission's uploads: the buffers of the last one are
-/// free again (the oldest dropped past `KEPT_BYTES`).
+/// free again (the oldest dropped past `KEPT_BYTES`), and so are its chunks,
+/// of which the pool keeps what any submission needed lately, at most
+/// `CHUNKS_KEPT` (a peak of 16 held 512 MB for good). Dropping a chunk
+/// from the pool frees it only when the lists using it are done: each keeps
+/// its own reference (`record_upload`).
 pub(crate) fn recycle() {
     {
+        let now = std::time::Instant::now();
         let mut c = CHUNKS.lock().unwrap_or_else(|e| e.into_inner());
+        let c = &mut *c;
+        let needed = c.current + usize::from(c.used > 0);
+        let kept = c.lately.begin(now, needed).min(CHUNKS_KEPT);
         (c.current, c.used) = (0, 0);
-        c.all.truncate(CHUNKS_KEPT);
+        c.all.truncate(kept);
     }
     let mut b = BUFFERS.lock().unwrap_or_else(|e| e.into_inner());
     let b = &mut *b;
@@ -193,15 +201,23 @@ struct Chunks {
     /// The chunk being carved and the bytes taken from it.
     current: usize,
     used: u64,
+    /// The chunks submissions needed lately.
+    lately: crate::recent::Peak,
 }
 
 // SAFETY: the mappings are persistent mappings of the upload buffers.
 unsafe impl Send for Chunks {}
 
-static CHUNKS: Mutex<Chunks> = Mutex::new(Chunks { all: Vec::new(), current: 0, used: 0 });
+static CHUNKS: Mutex<Chunks> = Mutex::new(Chunks {
+    all: Vec::new(),
+    current: 0,
+    used: 0,
+    lately: crate::recent::Peak::new(),
+});
 
 const CHUNK: u64 = 32 << 20;
-/// Chunks kept between submissions (more are made while one needs them).
+/// Chunks kept between submissions at most (more are made while one needs
+/// them).
 const CHUNKS_KEPT: usize = 16;
 
 /// `size` bytes of staging space: a buffer, the offset of the space in it

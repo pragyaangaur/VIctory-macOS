@@ -223,40 +223,34 @@ impl Widened {
 type Snapshot = (Vec<(usize, Vec<u8>)>, std::collections::HashSet<usize>);
 
 /// Snapshot memory kept for reuse (already touched, so no page faults).
-static POOL: Mutex<Vec<Vec<u8>>> = Mutex::new(Vec::new());
+static POOL: Mutex<crate::recent::Pool> = Mutex::new(crate::recent::Pool::new());
 
 /// An empty buffer with room for `n` bytes, from the pool if it has one.
 fn pooled(n: usize) -> Vec<u8> {
-    let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
-    let fit = pool
-        .iter()
-        .enumerate()
-        .filter(|(_, v)| v.capacity() >= n)
-        .min_by_key(|(_, v)| v.capacity())
-        .map(|(i, _)| i);
-    let mut v = match fit {
-        Some(i) => pool.swap_remove(i),
-        None => Vec::with_capacity(n),
-    };
-    v.clear();
-    v
+    let taken = POOL.lock().unwrap_or_else(|e| e.into_inner()).take(n);
+    taken.unwrap_or_else(|| Vec::with_capacity(n))
 }
 
 /// Returns a snapshot buffer to the pool, which keeps the largest up to
 /// [`POOL_BYTES`] in all: a world submission snapshots several copies, and
 /// fresh buffers cost a page fault per 4 KiB touched (millions per frame).
+/// What no snapshot used for a while goes at the present ([`trim_pool`]).
 fn give_back(v: Vec<u8>) {
+    let now = std::time::Instant::now();
     let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
-    pool.push(v);
-    pool.sort_by_key(|v| std::cmp::Reverse(v.capacity()));
-    let mut total = 0;
-    pool.retain(|v| {
-        total += v.capacity();
-        total <= POOL_BYTES
-    });
+    pool.give(v, now, POOL_BYTES);
 }
 
-/// Snapshot memory kept for reuse.
+/// At each present: frees the largest pooled buffer no snapshot took lately
+/// (the peak of a heavy frame, which `pooled` never picks again once lighter
+/// frames fit smaller ones), outside the pool's lock.
+pub(crate) fn trim_pool() {
+    let now = std::time::Instant::now();
+    let freed = POOL.lock().unwrap_or_else(|e| e.into_inner()).trim(now);
+    drop(freed);
+}
+
+/// Snapshot memory kept for reuse at most.
 const POOL_BYTES: usize = 512 << 20;
 
 // SAFETY: D3D12 resources are free-threaded; `data` is a persistent mapping
