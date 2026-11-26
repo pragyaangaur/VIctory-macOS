@@ -333,6 +333,9 @@ pub struct HostShader {
     /// Root UAVs (raw buffers) the host binds as root descriptors:
     /// `u<index>` in [`ROOT_CBV_SPACE`] (likewise).
     pub root_uavs: Vec<u8>,
+    /// The exclusive byte end of reads from each raw root SRV whose offsets
+    /// are all known. An omitted slot may read anywhere in its buffer.
+    pub root_srv_bytes: Vec<(u8, u32)>,
     /// Whether the shader reads title memory at addresses it computes: the
     /// host binds the page table `t0` in [`MEMORY_SPACE`] (module notes,
     /// "Title memory").
@@ -841,6 +844,7 @@ fn emit_pruned(
         root_cbvs: l.root_cbvs,
         root_srvs: l.root_srvs,
         root_uavs: l.root_uavs,
+        root_srv_bytes: l.root_srv_bytes,
         memory: l.memory,
         memory_writes: l.memory_writes,
         view_addresses: l.view_addresses,
@@ -1491,6 +1495,7 @@ mod tests {
             root_cbvs: Vec::new(),
             root_srvs: Vec::new(),
             root_uavs: Vec::new(),
+            root_srv_bytes: Vec::new(),
             memory: false,
             memory_writes: false,
             view_addresses: false,
@@ -1508,6 +1513,7 @@ mod tests {
                 root_cbvs: Vec::new(),
                 root_srvs: Vec::new(),
                 root_uavs: Vec::new(),
+                root_srv_bytes: Vec::new(),
                 memory: false,
                 memory_writes: false,
                 view_addresses: false,

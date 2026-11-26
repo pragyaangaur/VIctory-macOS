@@ -50,6 +50,7 @@ pub(crate) struct Lowered {
     pub root_cbvs: Vec<u8>,
     pub root_srvs: Vec<u8>,
     pub root_uavs: Vec<u8>,
+    pub root_srv_bytes: Vec<(u8, u32)>,
     /// Reads title memory at computed addresses (the page table).
     pub memory: bool,
     /// Writes there (the written-pages bitmap).
@@ -262,6 +263,8 @@ struct Lower<'a> {
     /// Handles of root SRVs and UAVs read as bounded views, by user-data
     /// dword ([`Lower::root_view`]).
     root_views: Map<u32, V>,
+    /// Each raw root SRV's farthest read, or unknown if it has a dynamic offset.
+    root_srv_reads: BTreeMap<u8, Option<u32>>,
     samplers: Vec<[u32; 4]>,
     descriptors: Map<(Site, bool), &'a Source>,
     scalar: Map<Site, Address>,
@@ -809,6 +812,7 @@ impl<'a> Lower<'a> {
             user_data: None,
             user_reads: BTreeMap::new(),
             root_views: Map::default(),
+            root_srv_reads: BTreeMap::new(),
             samplers: Vec::new(),
             descriptors: x
                 .res
@@ -1558,6 +1562,11 @@ impl<'a> Lower<'a> {
         let root_cbvs = self.s.root_cbvs.iter().map(|r| r.0).collect();
         let root_srvs = self.s.root_srvs.iter().map(|r| r.0).collect();
         let root_uavs = self.s.root_uavs.iter().map(|r| r.0).collect();
+        let root_srv_bytes = self
+            .root_srv_reads
+            .into_iter()
+            .filter_map(|(slot, end)| end.map(|end| (slot, end)))
+            .collect();
         let memory = self.s.memory.is_some();
         let memory_writes = self.s.memory_dirty.is_some();
         let view_addresses = self.s.view_addresses.is_some();
@@ -1583,6 +1592,7 @@ impl<'a> Lower<'a> {
             root_cbvs,
             root_srvs,
             root_uavs,
+            root_srv_bytes,
             memory,
             memory_writes,
             view_addresses,
@@ -2052,7 +2062,13 @@ impl<'a> Lower<'a> {
         active: Option<V>,
     ) -> Result<(V, V), Why> {
         let Some((lo, hi)) = self.root_address(src) else {
-            let h = self.handle(site, src, false, props)?;
+            let read_end = (!write && bytes >= 4)
+                .then(|| self.s.m.int_value(off))
+                .flatten()
+                .and_then(|off| u32::try_from(off).ok())
+                .filter(|off| off.is_multiple_of(4))
+                .and_then(|off| off.checked_add(bytes));
+            let h = self.handle_access(site, src, false, props, read_end)?;
             let off = match self.root_view_offset(src) {
                 Some(at) => self.s.m.bin(self.cur, Bin::Add, off, at),
                 None => off,
@@ -5924,7 +5940,18 @@ impl<'a> Lower<'a> {
     /// often before the instruction). A view read through a table needs
     /// none: the host makes the slot for the draw.
     fn handle(&mut self, site: Site, src: &Source, sampler: bool, props: (u32, u32)) -> Result<V, Why> {
-        let h = self.handle_made(site, src, sampler, props)?;
+        self.handle_access(site, src, sampler, props, None)
+    }
+
+    fn handle_access(
+        &mut self,
+        site: Site,
+        src: &Source,
+        sampler: bool,
+        props: (u32, u32),
+        read_end: Option<u32>,
+    ) -> Result<V, Why> {
+        let h = self.handle_made(site, src, sampler, props, read_end)?;
         if let Some(&index) = self.s.texture_index.get(&h)
             && self.is_heap_direct(src)
         {
@@ -5939,6 +5966,7 @@ impl<'a> Lower<'a> {
         src: &Source,
         sampler: bool,
         props: (u32, u32),
+        read_end: Option<u32>,
     ) -> Result<V, Why> {
         let props = if self.pops && props.0 & 0x1000 != 0 {
             self.s.flags |= flags::ROVS;
@@ -6037,6 +6065,10 @@ impl<'a> Lower<'a> {
                         Ok(self.s.root_cbv_handle(rp.slot))
                     }
                     (RootType::Descriptor, Some(ResourceType::Srv), 11) if !self.root_memory => {
+                        self.root_srv_reads
+                            .entry(rp.slot)
+                            .and_modify(|end| *end = end.zip(read_end).map(|(a, b)| a.max(b)))
+                            .or_insert(read_end);
                         Ok(self.root_view(address.param, false))
                     }
                     (RootType::Descriptor, Some(ResourceType::Srv), 11) => {
