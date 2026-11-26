@@ -9,7 +9,9 @@
 //! `VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE`) point the title's `VirtualAlloc`
 //! virtual address range directly at the D3DMetal buffer's physical pages.
 //!
-//! Opt-in via `VICTORY_ALIAS_BUFFERS=1` on Rosetta + D3DMetal (never WARP).
+//! On by default on Rosetta + D3DMetal (never WARP); `VICTORY_ALIAS_BUFFERS=0`
+//! keeps the host copies. The probe at start-up ([`supported`]) still falls
+//! back to the copies where the remap does not work.
 
 use std::sync::{Mutex, OnceLock};
 
@@ -221,20 +223,21 @@ mod mach {
     }
 }
 
-fn decide_enabled(switch_on: bool, rosetta: bool, warp: bool) -> bool {
-    switch_on && rosetta && !warp
+/// `asked`: `Some(on)` when `VICTORY_ALIAS_BUFFERS` is set (`0` is off, any
+/// other value on), `None` when it is not: then on.
+fn decide_enabled(asked: Option<bool>, rosetta: bool, warp: bool) -> bool {
+    asked.unwrap_or(true) && rosetta && !warp
 }
 
-/// Whether `VICTORY_ALIAS_BUFFERS` is enabled on this host (Rosetta + D3DMetal).
+/// Whether title buffers are aliased on this host: Rosetta + D3DMetal,
+/// unless `VICTORY_ALIAS_BUFFERS=0`.
 pub fn enabled() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| {
         let warp = cfg!(feature = "diagnostics") && crate::switch::on("VICTORY_D3D12_WARP");
-        decide_enabled(
-            crate::switch::on("VICTORY_ALIAS_BUFFERS"),
-            crate::watch::rosetta(),
-            warp,
-        )
+        let asked = std::env::var_os("VICTORY_ALIAS_BUFFERS")
+            .map(|_| crate::switch::on("VICTORY_ALIAS_BUFFERS"));
+        decide_enabled(asked, crate::watch::rosetta(), warp)
     })
 }
 
@@ -550,10 +553,17 @@ mod tests {
 
     #[test]
     fn switch_respects_rosetta_and_warp() {
-        assert!(!decide_enabled(false, true, false));
-        assert!(!decide_enabled(true, false, false));
-        assert!(!decide_enabled(true, true, true));
-        assert!(decide_enabled(true, true, false));
+        assert!(!decide_enabled(Some(false), true, false));
+        assert!(!decide_enabled(Some(true), false, false));
+        assert!(!decide_enabled(Some(true), true, true));
+        assert!(decide_enabled(Some(true), true, false));
+    }
+
+    #[test]
+    fn unset_is_on_under_rosetta_only() {
+        assert!(decide_enabled(None, true, false));
+        assert!(!decide_enabled(None, false, false));
+        assert!(!decide_enabled(None, true, true));
     }
 
     #[test]
