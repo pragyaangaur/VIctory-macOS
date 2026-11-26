@@ -1304,7 +1304,27 @@ pub(crate) mod tests {
         p
     }
 
+    /// Frees allocation `p`, reporting the unmapping first as the runtime
+    /// does ([`title_memory_remapped`]). A host copy can outlive its memory
+    /// in a test (a submission on another thread still holds it), and its
+    /// guards would stay in the guard set: memory allocated there next, by
+    /// any test, then counted as guarded already and its writes went unseen.
     pub(crate) fn free(p: usize) {
+        use windows_sys::Win32::System::Memory::{MEMORY_BASIC_INFORMATION, VirtualQuery};
+        // The allocation's length: its regions, which protections split.
+        let mut end = p;
+        loop {
+            // SAFETY: plain data filled in by the query.
+            let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+            // SAFETY: a valid out pointer of the right size.
+            if unsafe { VirtualQuery(end as *const _, &mut info, size_of_val(&info)) } == 0
+                || info.AllocationBase as usize != p
+            {
+                break;
+            }
+            end += info.RegionSize;
+        }
+        title_memory_remapped(p, end - p);
         // SAFETY: an allocation of ours.
         unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
     }
@@ -1478,6 +1498,43 @@ pub(crate) mod tests {
         assert_eq!(t.take_split(p, p + 2 * PAGE), (vec![(p, p + PAGE)], vec![(p + PAGE, p + 2 * PAGE)]));
         assert!(t.take(p, p + 2 * PAGE).is_empty(), "both taken");
         drop(t);
+        free(p);
+    }
+
+    /// Memory freed while a tracker still holds it (a host copy outliving
+    /// its memory) and allocated again at the same address is guarded anew
+    /// by the next take, so a write there counts. The runtime reports the
+    /// unmapping first, and so does [`free`]; without it the guard set kept
+    /// the freed page, a take trusted it and the new memory stayed writable.
+    #[test]
+    fn memory_freed_under_a_tracker_and_allocated_again_is_guarded_anew() {
+        let p = pool(1);
+        let stale = track(p, PAGE, true).expect("tracked");
+        assert_eq!(stale.take(p, p + PAGE), [(p, p + PAGE)]);
+        free(p);
+        // SAFETY: the address just freed, as a new pool; another thread's
+        // allocation may have taken it meanwhile.
+        let again = unsafe {
+            VirtualAlloc(
+                p as *const _,
+                PAGE,
+                MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH,
+                PAGE_READWRITE,
+            )
+        } as usize;
+        if again != p {
+            if again != 0 {
+                free(again);
+            }
+            return; // the address went to another allocation: nothing to see
+        }
+        let t = track(p, PAGE, true).expect("tracked");
+        assert_eq!(t.take(p, p + PAGE), [(p, p + PAGE)]);
+        assert!(read_only(p), "the new memory is guarded");
+        // SAFETY: our pool, guarded: the handler opens it.
+        unsafe { (p as *mut u32).write_volatile(7) };
+        assert!(t.changed(p / PAGE), "the write counts");
+        drop((stale, t));
         free(p);
     }
 
