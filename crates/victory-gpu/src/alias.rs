@@ -20,6 +20,9 @@ use windows_sys::Win32::System::Memory::{
 use crate::host::host;
 use crate::watch::PAGE;
 
+#[cfg(any(test, feature = "diagnostics"))]
+use windows::Win32::Graphics::Direct3D12::*;
+
 #[cfg(target_arch = "x86_64")]
 mod mach {
     use core::arch::asm;
@@ -307,6 +310,135 @@ fn supported() -> Option<bool> {
     })
 }
 
+/// CPU-visible backing for XMem physical pages. The placed buffer keeps a
+/// CPU mapping of the heap from which reserved resources can take tiles.
+#[cfg(any(test, feature = "diagnostics"))]
+pub struct PhysicalHeap {
+    backing: ID3D12Resource,
+    // A placed buffer must keep its heap alive.
+    pub(crate) _heap: ID3D12Heap,
+    address: usize,
+    len: usize,
+}
+
+#[cfg(any(test, feature = "diagnostics"))]
+impl PhysicalHeap {
+    pub(crate) fn new(device: &ID3D12Device, len: usize) -> windows::core::Result<Self> {
+        let desc = D3D12_HEAP_DESC {
+            SizeInBytes: len as u64,
+            Properties: D3D12_HEAP_PROPERTIES {
+                Type: D3D12_HEAP_TYPE_CUSTOM,
+                CPUPageProperty: D3D12_CPU_PAGE_PROPERTY_WRITE_BACK,
+                MemoryPoolPreference: D3D12_MEMORY_POOL_L0,
+                CreationNodeMask: 1,
+                VisibleNodeMask: 1,
+            },
+            Flags: D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS,
+            ..Default::default()
+        };
+        let buffer = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+            Width: len as u64,
+            Height: 1,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            ..Default::default()
+        };
+        let mut heap = None;
+        let mut backing = None;
+        let mut address = std::ptr::null_mut();
+        // SAFETY: plain D3D12 creation with output slots on this stack.
+        let (heap, backing) = unsafe {
+            device.CreateHeap(&desc, &mut heap)?;
+            let heap: ID3D12Heap = heap.ok_or_else(windows::core::Error::empty)?;
+            device.CreatePlacedResource(
+                &heap,
+                0,
+                &buffer,
+                D3D12_RESOURCE_STATE_COMMON,
+                None,
+                &mut backing,
+            )?;
+            let backing: ID3D12Resource = backing.ok_or_else(windows::core::Error::empty)?;
+            backing.Map(0, None, Some(&mut address))?;
+            (heap, backing)
+        };
+        if address.is_null() {
+            return Err(windows::core::Error::empty());
+        }
+        Ok(Self {
+            backing,
+            _heap: heap,
+            address: address as usize,
+            len,
+        })
+    }
+
+    /// The CPU view, valid for the lifetime of this heap.
+    pub fn cpu_address(&self) -> usize {
+        self.address
+    }
+
+    /// Replaces a Windows file view with the corresponding heap pages.
+    ///
+    /// # Safety
+    /// The caller owns the destination view and keeps this heap alive as
+    /// long as the view is mapped.
+    pub unsafe fn alias_view(&self, at: usize, offset: usize, len: usize) -> bool {
+        if at == 0
+            || len == 0
+            || [at, offset, len].iter().any(|n| !n.is_multiple_of(PAGE))
+            || offset.checked_add(len).is_none_or(|end| end > self.len)
+        {
+            return false;
+        }
+        // SAFETY: the caller owns the view; the source range is in the
+        // live placed buffer and checked above.
+        let remap = unsafe {
+            mach::remap_shared(
+                at as u64,
+                (self.address + offset) as u64,
+                len as u64,
+                mach::VM_FLAGS_FIXED | mach::VM_FLAGS_OVERWRITE,
+            )
+        };
+        remap.msg == 0 && remap.kr == 0 && remap.address == at as u64
+    }
+}
+
+#[cfg(any(test, feature = "diagnostics"))]
+impl Drop for PhysicalHeap {
+    fn drop(&mut self) {
+        // SAFETY: unmapped once, while the placed buffer still owns the view.
+        unsafe { self.backing.Unmap(0, None) };
+    }
+}
+
+/// Allocates CPU-visible physical tiles for the Rosetta diagnostics trial.
+#[cfg(feature = "diagnostics")]
+pub fn physical_heap(len: usize) -> Option<PhysicalHeap> {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    if !*ENABLED.get_or_init(|| crate::switch::on("VICTORY_PHYSICAL_TILES") && supported().is_some())
+        || len == 0
+        || !len.is_multiple_of(PAGE)
+    {
+        return None;
+    }
+    let host = host()?;
+    match PhysicalHeap::new(&host.device, len) {
+        Ok(heap) => Some(heap),
+        Err(error) => {
+            tracing::warn!(len, %error, "physical tile heap unavailable; using a file section");
+            None
+        }
+    }
+}
+
 /// Aliases `[base, base + len)` onto a new write-back L0 D3D12 buffer so CPU
 /// and GPU share physical pages with zero copy.
 pub fn alias_region(base: usize, len: usize, preserve_contents: bool) -> bool {
@@ -385,7 +517,6 @@ pub fn unalias_region(base: usize) -> bool {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-    use windows::Win32::Graphics::Direct3D12::*;
     use windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC;
     use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
     use windows_sys::Win32::System::Diagnostics::Debug::{

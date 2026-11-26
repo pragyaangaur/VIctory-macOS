@@ -12,9 +12,9 @@
 //! repository. This version uses only copies (no `D3DCompile`), tries
 //! three sizes and times the openings.
 //!
-//! Every test here is ignored by default and only prints; none fails on
-//! what the host answers. Each check is its own test, so a call that stops
-//! the process leaves the others to run on their own. Run them with:
+//! The probes are ignored by default. The heap-opening probes print the
+//! host's answers. The reserved-buffer probe checks the tile bytes and
+//! address directly. Each probe can run in a separate process.
 //!
 //! ```sh
 //! tools/macos/test-wine.sh -p victory-gpu --lib inplace_probe -- --ignored --nocapture --test-threads=1
@@ -783,22 +783,8 @@ fn inplace_probe_6_remap_cpu_visible_tiles() {
     let device = host_device().expect("a D3D12 host");
     let mut rig = Rig::new(&device).unwrap();
     let mut reserved: Option<ID3D12Resource> = None;
-    let mut heap: Option<ID3D12Heap> = None;
-    let mut backing: Option<ID3D12Resource> = None;
-    let mut data = std::ptr::null_mut();
-    let desc = D3D12_HEAP_DESC {
-        SizeInBytes: BYTES as u64,
-        Properties: D3D12_HEAP_PROPERTIES {
-            Type: D3D12_HEAP_TYPE_CUSTOM,
-            CPUPageProperty: D3D12_CPU_PAGE_PROPERTY_WRITE_BACK,
-            MemoryPoolPreference: D3D12_MEMORY_POOL_L0,
-            CreationNodeMask: 1,
-            VisibleNodeMask: 1,
-        },
-        Flags: D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS,
-        ..Default::default()
-    };
-    // SAFETY: each output is our own and both buffers span exactly four tiles.
+    let backing = crate::alias::PhysicalHeap::new(&device, BYTES).expect("CPU-visible tile heap");
+    // SAFETY: the output is ours and the buffer spans exactly four tiles.
     unsafe {
         device
             .CreateReservedResource(
@@ -808,28 +794,9 @@ fn inplace_probe_6_remap_cpu_visible_tiles() {
                 &mut reserved,
             )
             .expect("a reserved UAV buffer");
-        device
-            .CreateHeap(&desc, &mut heap)
-            .expect("CPU-visible tile heap");
-        device
-            .CreatePlacedResource(
-                heap.as_ref().unwrap(),
-                0,
-                &buffer_desc(BYTES as u64, D3D12_RESOURCE_FLAG_NONE),
-                D3D12_RESOURCE_STATE_COMMON,
-                None,
-                &mut backing,
-            )
-            .expect("a buffer over the tile heap");
-        backing
-            .as_ref()
-            .unwrap()
-            .Map(0, None, Some(&mut data))
-            .unwrap();
     }
-    let (reserved, backing, heap) = (reserved.unwrap(), backing.unwrap(), heap.unwrap());
-    let data = data.cast::<u8>();
-    assert!(!data.is_null());
+    let reserved = reserved.unwrap();
+    let data = backing.cpu_address() as *mut u8;
     // SAFETY: a live reserved buffer.
     let address = unsafe { reserved.GetGPUVirtualAddress() };
     assert_ne!(address, 0);
@@ -850,7 +817,7 @@ fn inplace_probe_6_remap_cpu_visible_tiles() {
                 1,
                 Some(&start),
                 Some(&size),
-                &heap,
+                &backing._heap,
                 TILES as u32,
                 Some(flags.as_ptr()),
                 Some(offsets.as_ptr()),
@@ -910,6 +877,36 @@ fn inplace_probe_6_remap_cpu_visible_tiles() {
     // SAFETY: null-mapping the GPU view leaves the CPU heap tile alive.
     unsafe {
         assert_eq!(data.read(), 0x77);
-        backing.Unmap(0, None);
+    }
+
+    if crate::watch::rosetta() {
+        // SAFETY: the file view is a whole, separately owned tile. It is
+        // released before its replacement backing is dropped.
+        unsafe {
+            let section = mem::CreateFileMappingW(
+                INVALID_HANDLE_VALUE,
+                std::ptr::null(),
+                mem::PAGE_READWRITE,
+                0,
+                K64 as u32,
+                std::ptr::null(),
+            );
+            assert!(!section.is_null());
+            let view = mem::MapViewOfFile(section, mem::FILE_MAP_WRITE, 0, 0, K64);
+            let alias = view.Value.cast::<u8>();
+            assert!(!alias.is_null());
+            assert!(backing.alias_view(alias as usize, 2 * K64, K64));
+            assert_eq!(alias.read(), 0x33);
+            alias.write_bytes(0x6a, K64);
+            let tile = rig.fetch(&reserved, (2 * K64) as u64, K64).unwrap();
+            assert!(tile.iter().all(|&byte| byte == 0x6a), "guest view to GPU");
+            rig.store(&reserved, (2 * K64) as u64, &vec![0x43; K64])
+                .unwrap();
+            assert!(std::slice::from_raw_parts(alias, K64).iter().all(|&byte| byte == 0x43));
+            assert_ne!(mem::UnmapViewOfFile(view), 0);
+            windows_sys::Win32::Foundation::CloseHandle(section);
+            let tile = rig.fetch(&reserved, (2 * K64) as u64, K64).unwrap();
+            assert!(tile.iter().all(|&byte| byte == 0x43), "GPU after guest unmap");
+        }
     }
 }

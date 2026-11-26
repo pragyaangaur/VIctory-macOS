@@ -194,6 +194,10 @@ On an M1 Max with CrossOver Wine 11.17 and D3DMetal 4.0 beta 3, a reserved buffe
 
 Run the probe under the D3DMetal Wine runner with `tools/macos/test-wine.sh -p victory-gpu --lib inplace_probe_6_remap_cpu_visible_tiles -- --ignored --test-threads=1`.
 
+The diagnostics switch `VICTORY_PHYSICAL_TILES=1` lets XMem use CPU-visible D3D12 heaps for physical page allocations on Rosetta. Wine supplies its usual placeholder views, and the mapped view and DirectStorage share the heap's bytes. The XMem test checks page aliases, remapping, unmapping, and DirectStorage writes. The GPU probe also checks both directions of a copy through an aliased Windows view, including after that view is unmapped.
+
+A separate 6.10 GiB heap and reserved buffer worked on the same M1 Max. Readback matched data from four sampled tiles, including the last two in the heap. A GPU write reached the final tile's CPU mapping.
+
 ## Host presentation size
 
 Set `VICTORY_PRESENT_MAX=1280x720` to cap the host presentation pass and DXGI swap chain at 720p. Smaller pictures keep their native size. The cap preserves the picture’s aspect ratio and applies after the game’s rendering and upscaling.
@@ -238,6 +242,9 @@ None of these changes the default. Each is read from the environment when the ga
 | `VICTORY_SPILL_SHADERS=1` | Keeps shader containers on disk until they are translated. The title passes tens of thousands of containers and draws with a few hundred, and holding them all took about 700 MB of an 8 GB Mac (#135). |
 | `VICTORY_READ_STATS=1` | Logs the requests and bytes read from each file, every 30 seconds, for the 30 most read. It shows which files a slow share serves most, so you can copy those to fast local storage. |
 | `VICTORY_GPU_BUDGET_MB=<MB>` | Sets the budget that host textures are kept under, in place of the device's. |
+| `VICTORY_OUTPUT=<W>x<H>` | Sets the title's output size, one of its own modes: 1280x720, 1664x936, 1920x1080, 2560x1440 or 3840x2160. It patches the title's code at load, only where the bytes match build 1.0.2.1, and logs `resolution: ... Done` for each site. On a 16 GB M4 (Series X), 1280x720 brought the GPU time of a world frame from about 8.4 s to 0.86 s. Ported from avatarmanz/VIctory-7900XTX. |
+| `VICTORY_RENDER_SCALE=<s>` | 0.5 to 1.0: the title's own upscaler's render scale (2/3 by default, Series X). Not yet tested on a Mac. |
+| `VICTORY_UPSCALER=<6\|7>` | Makes the title pick its own upscaler (6) or FidelityFX (7). Not yet tested on a Mac. |
 | `VICTORY_STEP_OVER=pool` | Steps over the title's "no free element" traps: an `int3` followed by `xor r, r`, the shape of a full fixed-size pool's allocator, whose caller then gets the NULL it already checks for. Series 1.0.2.1 hits one at `+0x5149aec` (the instance lists' pool, Marvisak/VIctory#698) about 20 minutes into the opening when frames take seconds. A list of hex offsets also works. |
 | `VICTORY_ALIAS_BUFFERS=1` | Under Rosetta with D3DMetal, points title buffers at the pages of a D3DMetal buffer with `mach_vm_remap`, so they need no host copies (#204). A probe at start-up falls back to the copies if the remap does not work. It has only synthetic tests so far, so it needs a run in the game. |
 | `VICTORY_WINDOW_SECONDARY=1` | Opens the game window on the only non-primary display. |
