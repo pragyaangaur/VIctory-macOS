@@ -11,6 +11,7 @@ const HEIGHT: usize = 34;
 const DEPTH: usize = 512;
 const SLICES: [usize; 8] = [0, 7, 8, 15, 16, 40, 255, 511];
 const R16_FLOAT: u32 = 54;
+const R32_FLOAT: u32 = 41;
 const SENTINEL: u32 = 123456789;
 const COMMON: u32 = D3D12_RESOURCE_STATE_COMMON.0 as u32;
 const UAV: u32 = D3D12_RESOURCE_STATE_UNORDERED_ACCESS.0 as u32;
@@ -130,6 +131,16 @@ fn expected(x: usize, y: usize, z: usize) -> u32 {
 #[test]
 #[ignore = "requires PC DXC and hardware D3D12; see #242"]
 fn r16_volume_validate_uav_srv_prelude_split() {
+    run_volume_fixture(R16_FLOAT);
+}
+
+#[test]
+#[ignore = "requires PC DXC and hardware D3D12"]
+fn r32_volume_validate_uav_srv_prelude_split() {
+    run_volume_fixture(R32_FLOAT);
+}
+
+fn run_volume_fixture(format: u32) {
     assert!(
         !crate::switch::on("VICTORY_GPU_TIMING"),
         "unset VICTORY_GPU_TIMING to exercise batched submissions"
@@ -160,7 +171,7 @@ fn r16_volume_validate_uav_srv_prelude_split() {
             0,
             HEIGHT as u32,
             DEPTH as u32 | 1 << 16,
-            R16_FLOAT,
+            format,
             1,
             0,
             0,
@@ -171,11 +182,11 @@ fn r16_volume_validate_uav_srv_prelude_split() {
         let uav = View::Unordered(
             texture as usize,
             0,
-            Some([R16_FLOAT, 8, 0, 0, u32::MAX, 0, 0, 0, 0, 0]),
+            Some([format, 8, 0, 0, u32::MAX, 0, 0, 0, 0, 0]),
         );
         let srv = View::Shader(
             texture as usize,
-            Some([R16_FLOAT, 8, 0x1688, 0, 0, 1, 0, 0, 0, 0]),
+            Some([format, 8, 0x1688, 0, 0, 1, 0, 0, 0, 0]),
         );
         let slots = Slots::new(2);
         slots.make(0, &uav);
