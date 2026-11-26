@@ -19,6 +19,7 @@ use windows_sys::Win32::System::Memory::{
     VirtualAlloc, VirtualFree, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE,
 };
 
+use crate::backend::HostMemory;
 use crate::host::host;
 use crate::watch::PAGE;
 

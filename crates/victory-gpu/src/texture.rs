@@ -28,6 +28,7 @@ use rayon::iter::{IndexedParallelIterator, IntoParallelIterator, ParallelIterato
 use rayon::slice::ParallelSliceMut;
 use windows::Win32::Graphics::Direct3D12::*;
 
+use crate::backend::HostMemory;
 use crate::host::{HostList, host};
 use crate::object::This;
 use windows::core::Interface;

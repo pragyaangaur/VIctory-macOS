@@ -13,6 +13,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
 use std::sync::{Arc, Mutex};
 
+use crate::backend::HostGpu;
 use crate::descriptor::View;
 use crate::host::HostList;
 use crate::object::This;

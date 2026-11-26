@@ -2518,6 +2518,8 @@ pub(crate) fn test_buffer(width: u64) -> This {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(windows)]
+    use crate::backend::HostGpu;
 
     #[cfg(windows)]
     #[test]

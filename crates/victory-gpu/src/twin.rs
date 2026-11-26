@@ -562,6 +562,7 @@ fn compile() -> windows::core::Result<Converter> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::backend::HostGpu;
 
     /// The material-depth frame of Grand Theft Auto VI: written through
     /// unordered views, read as a shader resource in the same list, written

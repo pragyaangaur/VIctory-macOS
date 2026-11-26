@@ -38,6 +38,7 @@ use std::sync::{Arc, Mutex};
 use victory_formats::pagetable::{self, BLOCK, CAPACITY, LEVEL1};
 use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
 
+use crate::backend::HostMemory;
 use crate::descriptor::host::HostHeap;
 use crate::host::HostList;
 use crate::shadow::Shadow;
@@ -649,6 +650,7 @@ pub(crate) fn bind(list: &HostList, key: usize) -> Option<Map> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::backend::HostGpu;
     use victory_formats::pagetable::table;
 
     #[test]

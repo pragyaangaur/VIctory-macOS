@@ -14,6 +14,7 @@ use windows::Win32::Graphics::Dxgi::Common::*;
 
 use super::paged::Paged;
 use super::{VIEW_TAG, View, ViewPin, view_at, views_current_into, views_forgot};
+use crate::backend::{HostGpu, HostMemory};
 use crate::host::host;
 
 const SYNC_BLOCK_SLOTS: u32 = 128;

@@ -15,6 +15,7 @@ use windows::Win32::Graphics::Dxgi::Common::*;
 use windows::core::{Interface, PCSTR};
 
 use super::{Shader, Translated};
+use crate::backend::HostGpu;
 use crate::host::host;
 
 /// A stream's graphics state, owned (the title's stream lives only for the

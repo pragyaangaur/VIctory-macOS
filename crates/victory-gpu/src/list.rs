@@ -15,6 +15,8 @@ use std::mem::offset_of;
 use crate::object::{
     self, ALLOCATOR, E_INVALIDARG, HRESULT, Iid, LIST, Object, S_OK, Table, This, guid,
 };
+#[cfg(windows)]
+use crate::backend::HostGpu;
 use crate::queue::Written;
 use crate::resource::PAGEABLE_IIDS;
 

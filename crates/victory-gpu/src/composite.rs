@@ -215,6 +215,7 @@ pub(crate) fn result_format(format: DXGI_FORMAT) -> DXGI_FORMAT {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::backend::HostGpu;
     use crate::host::transition;
 
     /// A buffer of `len` bytes in `heap`, in `state`.

@@ -8,6 +8,8 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
+use crate::backend::{HostGpu, HostMemory};
+
 use windows::Win32::Foundation::{HANDLE, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
 use windows::Win32::Graphics::Direct3D12::*;
@@ -32,8 +34,8 @@ pub(crate) fn texture_state(state: u32) -> u32 {
 const RTV_RING: u32 = 1024;
 
 thread_local! {
-    /// The thread holds the submission lock ([`Host::execute`] or
-    /// [`Host::quiet`]).
+    /// The thread holds the submission lock ([`HostGpu::execute`] or
+    /// [`HostGpu::quiet`]).
     static HOLDS_SUBMISSIONS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
@@ -52,7 +54,7 @@ impl Drop for Holding {
     }
 }
 
-/// Submissions held off ([`Host::quiet`]).
+/// Submissions held off ([`HostGpu::quiet`]).
 pub(crate) struct Quiet<'a> {
     // Dropped in this order: the mark, then the lock.
     _holding: Holding,
@@ -1449,8 +1451,12 @@ pub fn host_mesh_support() -> Option<MeshSupport> {
     Some(host()?.mesh_support())
 }
 
-impl Host {
-    pub(crate) fn mesh_support(&self) -> MeshSupport {
+impl HostGpu for Host {
+    type List = HostList;
+    type Error = windows::core::Error;
+    type Quiet<'a> = Quiet<'a>;
+
+    fn mesh_support(&self) -> MeshSupport {
         static MESH: OnceLock<MeshSupport> = OnceLock::new();
         *MESH.get_or_init(|| {
             let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS7::default();
@@ -1487,7 +1493,7 @@ impl Host {
     /// (NVIDIA, Intel): `WaveSize(64)` is refused there, so wave64 compute
     /// programs are translated for waves of 32
     /// (`victory_shader::emit::Options::host_wave32`); logged once.
-    pub(crate) fn wave32(&self) -> bool {
+    fn wave32(&self) -> bool {
         static WAVE32: OnceLock<bool> = OnceLock::new();
         *WAVE32.get_or_init(|| {
             let host = victory_shader::emit::host::Host::from_device(self.device.clone());
@@ -1506,7 +1512,7 @@ impl Host {
 
     /// Whether the host runs 64-bit atomics on typed resources in the
     /// descriptor heap (translated 64-bit image atomics); logged once.
-    pub(crate) fn heap_atomics64(&self) -> bool {
+    fn heap_atomics64(&self) -> bool {
         static ATOMICS: OnceLock<bool> = OnceLock::new();
         *ATOMICS.get_or_init(|| {
             let mut typed = D3D12_FEATURE_DATA_D3D12_OPTIONS9::default();
@@ -1538,7 +1544,7 @@ impl Host {
     }
 
     /// A new list, open for recording.
-    pub(crate) fn new_list(&self) -> windows::core::Result<HostList> {
+    fn new_list(&self) -> windows::core::Result<HostList> {
         // SAFETY: plain object creation.
         unsafe {
             let allocator: ID3D12CommandAllocator = self
@@ -1593,143 +1599,6 @@ impl Host {
         }
     }
 
-    /// Waits until the host fence reaches `value`. The event is only a
-    /// wake-up: the fence's completed value decides. Under D3DMetal a
-    /// submission's work can finish without its event ever being set
-    /// (#50: the title's main thread slept for good in this wait while the
-    /// queue was idle), so the wait wakes every second to check the fence
-    /// itself. A late event left set by an earlier wait cannot end a later
-    /// wait early, as the fence is checked after every wake-up too.
-    fn wait_for(&self, value: u64) {
-        use std::sync::atomic::AtomicU64;
-        static MISSED: AtomicU64 = AtomicU64::new(0);
-        let mut seconds = 0u32;
-        loop {
-            // SAFETY: our event and fence.
-            let woke = unsafe { WaitForSingleObject(self.event, 1000) };
-            // SAFETY: as above.
-            let completed = unsafe { self.fence.GetCompletedValue() };
-            if completed >= value {
-                if woke != windows::Win32::Foundation::WAIT_OBJECT_0 {
-                    let n = MISSED.fetch_add(1, Ordering::Relaxed) + 1;
-                    if n.is_power_of_two() {
-                        tracing::warn!(n, value, completed, "a host submission finished without setting its event; went on after checking the fence");
-                    }
-                }
-                return;
-            }
-            if woke != windows::Win32::Foundation::WAIT_OBJECT_0 {
-                seconds += 1;
-                if seconds.is_power_of_two() {
-                    tracing::warn!(seconds, value, completed, "still waiting for the host GPU");
-                }
-                if seconds == 8 {
-                    let what = WAITING_ON.lock().unwrap_or_else(|e| e.into_inner()).clone();
-                    tracing::error!(%what, value, "host GPU hang: the submission waited on");
-                }
-            }
-        }
-    }
-
-    /// The queue submissions go to now.
-    fn queue(&self) -> ID3D12CommandQueue {
-        self.queue.lock().unwrap_or_else(|e| e.into_inner()).clone()
-    }
-
-    /// The list submissions end with ([`Mark`]); `None` if it could not be
-    /// made, and then submissions are not checked.
-    fn mark(&self) -> Option<&Mark> {
-        self.mark
-            .get_or_init(|| {
-                Mark::new(self)
-                    .inspect_err(|e| tracing::warn!(error = %e, "no submission mark: submissions the host GPU drops go unseen"))
-                    .ok()
-            })
-            .as_ref()
-    }
-
-    /// After a submission that did not run to its mark: what it drew is
-    /// missing. If the queue no longer runs work, a new queue replaces it,
-    /// and the next present makes its swap chain on that one. Under the
-    /// submission lock.
-    fn lost(&self, submitted: &mut u64, mark: &Mark) {
-        let lost = LOST[0].fetch_add(1, Ordering::Relaxed) + 1;
-        // A lane that held a lock of an emulated 64-bit atomic when the GPU
-        // ended its shader never frees it (`victory_shader::emit`, "Atomic
-        // locks"): free them all before anything else runs.
-        let freed = crate::shadow::free_atomic_locks();
-        if freed > 0 {
-            tracing::warn!(
-                freed,
-                "atomic locks left taken by the ended submission freed"
-            );
-        }
-        if self.runs(submitted, mark) {
-            if lost.is_power_of_two() {
-                tracing::warn!(
-                    lost,
-                    "the host GPU ended a submission before it finished, and what it drew is missing \
-                     (under D3DMetal, macOS ends a command buffer when the GPU locks up, as on a draw \
-                     that holds it too long, or takes a page fault)"
-                );
-            }
-            return;
-        }
-        if let Err(e) = self.replace_queue() {
-            fail(format_args!(
-                "the host queue stopped running work, and no new queue could be made: {e}"
-            ));
-        }
-        if !self.runs(submitted, mark) {
-            fail(format_args!(
-                "the host queue stopped running work, and a new queue does not run it either"
-            ));
-        }
-        let queues = LOST[1].fetch_add(1, Ordering::Relaxed) + 1;
-        if queues.is_power_of_two() {
-            tracing::warn!(
-                lost,
-                queues,
-                "the host queue stopped running work after the GPU ended a submission \
-                 (macOS ignores what is submitted to it): moved to a new queue"
-            );
-        }
-    }
-
-    /// Whether the queue runs work: the mark alone, as a submission of its
-    /// own. Under the submission lock.
-    fn runs(&self, submitted: &mut u64, mark: &Mark) -> bool {
-        *submitted += 1;
-        mark.arm(*submitted);
-        let queue = self.queue();
-        // SAFETY: a closed list; the fence and event are ours.
-        unsafe {
-            queue.ExecuteCommandLists(&[mark.list()]);
-            let waited = queue
-                .Signal(&self.fence, *submitted)
-                .and_then(|()| self.fence.SetEventOnCompletion(*submitted, self.event));
-            match waited {
-                Ok(()) => self.wait_for(*submitted),
-                Err(e) => tracing::warn!(error = %e, "host check not waited for"),
-            }
-        }
-        mark.saw(*submitted)
-    }
-
-    /// A new direct queue in place of the current one. Under the submission
-    /// lock, so no submission is on the old queue.
-    fn replace_queue(&self) -> windows::core::Result<()> {
-        // SAFETY: plain object creation.
-        let queue: ID3D12CommandQueue = unsafe {
-            self.device.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC {
-                Type: D3D12_COMMAND_LIST_TYPE_DIRECT,
-                ..Default::default()
-            })
-        }?;
-        *self.queue.lock().unwrap_or_else(|e| e.into_inner()) = queue;
-        Ok(())
-    }
-
     /// Holds other threads' submissions off until dropped, around the making
     /// of a shader-visible host view heap and its fill with null views
     /// (millions of descriptor copies). Under Wine on D3DMetal, lists other
@@ -1737,7 +1606,7 @@ impl Host {
     /// shaders' writes were dropped and their reads gave zeros, whatever
     /// heap the lists bound (VIctory-macOS issue #31). Nothing on a thread
     /// that holds the submission lock already, nor off Wine.
-    pub(crate) fn quiet(&self) -> Option<Quiet<'_>> {
+    fn quiet(&self) -> Option<Quiet<'_>> {
         if !crate::under_wine() || HOLDS_SUBMISSIONS.with(std::cell::Cell::get) {
             return None;
         }
@@ -1746,7 +1615,7 @@ impl Host {
     }
 
     /// Runs closed lists and waits for them.
-    pub(crate) fn execute(&self, runs: &[&HostList]) {
+    fn execute(&self, runs: &[&HostList]) {
         // One submission at a time from preparation to copy-back: snapshots
         // and the ranges shaders write are per host copy, not per submission.
         let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
@@ -2237,6 +2106,146 @@ impl Host {
             crate::capture::dump_submission(sub, &targets);
         }
     }
+}
+
+impl Host {
+    /// Waits until the host fence reaches `value`. The event is only a
+    /// wake-up: the fence's completed value decides. Under D3DMetal a
+    /// submission's work can finish without its event ever being set
+    /// (#50: the title's main thread slept for good in this wait while the
+    /// queue was idle), so the wait wakes every second to check the fence
+    /// itself. A late event left set by an earlier wait cannot end a later
+    /// wait early, as the fence is checked after every wake-up too.
+    fn wait_for(&self, value: u64) {
+        use std::sync::atomic::AtomicU64;
+        static MISSED: AtomicU64 = AtomicU64::new(0);
+        let mut seconds = 0u32;
+        loop {
+            // SAFETY: our event and fence.
+            let woke = unsafe { WaitForSingleObject(self.event, 1000) };
+            // SAFETY: as above.
+            let completed = unsafe { self.fence.GetCompletedValue() };
+            if completed >= value {
+                if woke != windows::Win32::Foundation::WAIT_OBJECT_0 {
+                    let n = MISSED.fetch_add(1, Ordering::Relaxed) + 1;
+                    if n.is_power_of_two() {
+                        tracing::warn!(n, value, completed, "a host submission finished without setting its event; went on after checking the fence");
+                    }
+                }
+                return;
+            }
+            if woke != windows::Win32::Foundation::WAIT_OBJECT_0 {
+                seconds += 1;
+                if seconds.is_power_of_two() {
+                    tracing::warn!(seconds, value, completed, "still waiting for the host GPU");
+                }
+                if seconds == 8 {
+                    let what = WAITING_ON.lock().unwrap_or_else(|e| e.into_inner()).clone();
+                    tracing::error!(%what, value, "host GPU hang: the submission waited on");
+                }
+            }
+        }
+    }
+
+    /// The queue submissions go to now.
+    fn queue(&self) -> ID3D12CommandQueue {
+        self.queue.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// The list submissions end with ([`Mark`]); `None` if it could not be
+    /// made, and then submissions are not checked.
+    fn mark(&self) -> Option<&Mark> {
+        self.mark
+            .get_or_init(|| {
+                Mark::new(self)
+                    .inspect_err(|e| tracing::warn!(error = %e, "no submission mark: submissions the host GPU drops go unseen"))
+                    .ok()
+            })
+            .as_ref()
+    }
+
+    /// After a submission that did not run to its mark: what it drew is
+    /// missing. If the queue no longer runs work, a new queue replaces it,
+    /// and the next present makes its swap chain on that one. Under the
+    /// submission lock.
+    fn lost(&self, submitted: &mut u64, mark: &Mark) {
+        let lost = LOST[0].fetch_add(1, Ordering::Relaxed) + 1;
+        // A lane that held a lock of an emulated 64-bit atomic when the GPU
+        // ended its shader never frees it (`victory_shader::emit`, "Atomic
+        // locks"): free them all before anything else runs.
+        let freed = crate::shadow::free_atomic_locks();
+        if freed > 0 {
+            tracing::warn!(
+                freed,
+                "atomic locks left taken by the ended submission freed"
+            );
+        }
+        if self.runs(submitted, mark) {
+            if lost.is_power_of_two() {
+                tracing::warn!(
+                    lost,
+                    "the host GPU ended a submission before it finished, and what it drew is missing \
+                     (under D3DMetal, macOS ends a command buffer when the GPU locks up, as on a draw \
+                     that holds it too long, or takes a page fault)"
+                );
+            }
+            return;
+        }
+        if let Err(e) = self.replace_queue() {
+            fail(format_args!(
+                "the host queue stopped running work, and no new queue could be made: {e}"
+            ));
+        }
+        if !self.runs(submitted, mark) {
+            fail(format_args!(
+                "the host queue stopped running work, and a new queue does not run it either"
+            ));
+        }
+        let queues = LOST[1].fetch_add(1, Ordering::Relaxed) + 1;
+        if queues.is_power_of_two() {
+            tracing::warn!(
+                lost,
+                queues,
+                "the host queue stopped running work after the GPU ended a submission \
+                 (macOS ignores what is submitted to it): moved to a new queue"
+            );
+        }
+    }
+
+    /// Whether the queue runs work: the mark alone, as a submission of its
+    /// own. Under the submission lock.
+    fn runs(&self, submitted: &mut u64, mark: &Mark) -> bool {
+        *submitted += 1;
+        mark.arm(*submitted);
+        let queue = self.queue();
+        // SAFETY: a closed list; the fence and event are ours.
+        unsafe {
+            queue.ExecuteCommandLists(&[mark.list()]);
+            let waited = queue
+                .Signal(&self.fence, *submitted)
+                .and_then(|()| self.fence.SetEventOnCompletion(*submitted, self.event));
+            match waited {
+                Ok(()) => self.wait_for(*submitted),
+                Err(e) => tracing::warn!(error = %e, "host check not waited for"),
+            }
+        }
+        mark.saw(*submitted)
+    }
+
+    /// A new direct queue in place of the current one. Under the submission
+    /// lock, so no submission is on the old queue.
+    fn replace_queue(&self) -> windows::core::Result<()> {
+        // SAFETY: plain object creation.
+        let queue: ID3D12CommandQueue = unsafe {
+            self.device.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC {
+                Type: D3D12_COMMAND_LIST_TYPE_DIRECT,
+                ..Default::default()
+            })
+        }?;
+        *self.queue.lock().unwrap_or_else(|e| e.into_inner()) = queue;
+        Ok(())
+    }
+
 
     /// With `VICTORY_D3D12_DRED`: the faulting address and the allocations
     /// it lies in (by the names we give them) or the title memory copy just
@@ -3218,7 +3227,7 @@ impl HostList {
     /// A mapped readback buffer of `size` bytes, alive until the list is
     /// reset.
     pub(crate) fn readback(&self, host: &Host, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
-        let (buffer, data) = host.mapped_buffer(size, true)?;
+        let (buffer, data) = host.readback_buffer(size)?;
         name(&buffer, || format!("list readback {size:#x}"));
         self.deferred().uploads.push(buffer.clone());
         Some((buffer, data))
@@ -4040,9 +4049,11 @@ mod title_copies {
     }
 }
 
-impl Host {
+impl HostMemory for Host {
+    type Buffer = ID3D12Resource;
+
     /// A GPU-only buffer of `size` bytes in the copy-destination state.
-    pub(crate) fn default_buffer(&self, size: u64) -> Option<ID3D12Resource> {
+    fn default_buffer(&self, size: u64) -> Option<ID3D12Resource> {
         let heap = D3D12_HEAP_PROPERTIES {
             Type: D3D12_HEAP_TYPE_DEFAULT,
             ..Default::default()
@@ -4072,10 +4083,77 @@ impl Host {
         made.ok().and(buffer)
     }
 
-    pub(crate) fn upload_buffer(&self, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
+    /// A buffer in the upload heap, mapped for writing.
+    fn upload_buffer(&self, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
         self.mapped_buffer(size, false)
     }
 
+    /// A buffer in the readback heap, mapped for reading, in the
+    /// copy-destination state.
+    fn readback_buffer(&self, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
+        self.mapped_buffer(size, true)
+    }
+
+    /// A buffer in system memory that the CPU maps (write-back, so reading
+    /// it is fast too) and shaders read and write: for host copies of title
+    /// memory that shaders write, which upload memory cannot be. Starts in
+    /// the common state (buffers move out of it implicitly).
+    fn shared_buffer(&self, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
+        let heap = D3D12_HEAP_PROPERTIES {
+            Type: D3D12_HEAP_TYPE_CUSTOM,
+            CPUPageProperty: D3D12_CPU_PAGE_PROPERTY_WRITE_BACK,
+            MemoryPoolPreference: D3D12_MEMORY_POOL_L0,
+            ..Default::default()
+        };
+        #[cfg(feature = "diagnostics")]
+        let heap = if self.copies_in_video_memory() {
+            D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_GPU_UPLOAD, ..Default::default() }
+        } else {
+            heap
+        };
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+            Width: size.max(1),
+            Height: 1,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+            ..Default::default()
+        };
+        let mut buffer: Option<ID3D12Resource> = None;
+        let mut data = std::ptr::null_mut();
+        // SAFETY: plain creation and mapping of a CPU-visible buffer.
+        let made = unsafe {
+            self.device
+                .CreateCommittedResource(
+                    &heap,
+                    D3D12_HEAP_FLAG_NONE,
+                    &desc,
+                    D3D12_RESOURCE_STATE_COMMON,
+                    None,
+                    &mut buffer,
+                )
+                .and_then(|()| {
+                    let b = buffer.as_ref().ok_or_else(windows::core::Error::empty)?;
+                    b.Map(0, None, Some(&mut data))
+                })
+        };
+        match made {
+            Ok(()) => Some((buffer?, data.cast())),
+            Err(e) => {
+                tracing::warn!(error = %e, size, "no shared buffer");
+                None
+            }
+        }
+    }
+}
+
+impl Host {
     /// A mapped buffer of `size` bytes: upload memory, or (`readback`)
     /// readback memory in the copy-destination state.
     fn mapped_buffer(&self, size: u64, readback: bool) -> Option<(ID3D12Resource, *mut u8)> {
@@ -4730,7 +4808,7 @@ pub(crate) fn legal_for(flags: u32, state: u32) -> u32 {
 }
 
 impl Host {
-    /// Diagnostics, `VICTORY_COPIES_IN_VIDEO_MEMORY`: [`Host::shared_buffer`]s
+    /// Diagnostics, `VICTORY_COPIES_IN_VIDEO_MEMORY`: [`HostMemory::shared_buffer`]s
     /// (host copies of title memory among them) in video memory the CPU maps
     /// (a GPU upload heap, where the host has one), to measure how much of
     /// the GPU's time is shaders reading the copies over the bus. CPU reads
@@ -4756,64 +4834,6 @@ impl Host {
             tracing::warn!(on = ok, "host copies of title memory in video memory (diagnostics)");
             ok
         })
-    }
-
-    /// A buffer in system memory that the CPU maps (write-back, so reading
-    /// it is fast too) and shaders read and write: for host copies of title
-    /// memory that shaders write, which upload memory cannot be. Starts in
-    /// the common state (buffers move out of it implicitly).
-    pub(crate) fn shared_buffer(&self, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
-        let heap = D3D12_HEAP_PROPERTIES {
-            Type: D3D12_HEAP_TYPE_CUSTOM,
-            CPUPageProperty: D3D12_CPU_PAGE_PROPERTY_WRITE_BACK,
-            MemoryPoolPreference: D3D12_MEMORY_POOL_L0,
-            ..Default::default()
-        };
-        #[cfg(feature = "diagnostics")]
-        let heap = if self.copies_in_video_memory() {
-            D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_GPU_UPLOAD, ..Default::default() }
-        } else {
-            heap
-        };
-        let desc = D3D12_RESOURCE_DESC {
-            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
-            Width: size.max(1),
-            Height: 1,
-            DepthOrArraySize: 1,
-            MipLevels: 1,
-            SampleDesc: DXGI_SAMPLE_DESC {
-                Count: 1,
-                Quality: 0,
-            },
-            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
-            Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
-            ..Default::default()
-        };
-        let mut buffer: Option<ID3D12Resource> = None;
-        let mut data = std::ptr::null_mut();
-        // SAFETY: plain creation and mapping of a CPU-visible buffer.
-        let made = unsafe {
-            self.device
-                .CreateCommittedResource(
-                    &heap,
-                    D3D12_HEAP_FLAG_NONE,
-                    &desc,
-                    D3D12_RESOURCE_STATE_COMMON,
-                    None,
-                    &mut buffer,
-                )
-                .and_then(|()| {
-                    let b = buffer.as_ref().ok_or_else(windows::core::Error::empty)?;
-                    b.Map(0, None, Some(&mut data))
-                })
-        };
-        match made {
-            Ok(()) => Some((buffer?, data.cast())),
-            Err(e) => {
-                tracing::warn!(error = %e, size, "no shared buffer");
-                None
-            }
-        }
     }
 }
 
@@ -5096,6 +5116,7 @@ fn pump() {
 mod batch {
     // `mod tests` is already taken at the top of this file
     use super::Batch;
+    use crate::backend::HostGpu;
     use crate::shadow::Shadow;
     use crate::watch::PAGE;
     use std::sync::Arc;
@@ -5408,6 +5429,8 @@ mod batch {
 
 #[cfg(test)]
 mod withholding {
+    use crate::backend::HostGpu;
+
     /// A list in which a program using title memory missed memory: what
     /// that program wrote is withheld from title memory and leaves the
     /// copies at once; what an ordinary program wrote in the same list goes
@@ -5462,6 +5485,7 @@ mod withholding {
 #[cfg(test)]
 mod marks {
     use super::LOST;
+    use crate::backend::HostGpu;
     use std::sync::atomic::Ordering;
     use windows::Win32::Graphics::Direct3D::*;
     use windows::Win32::Graphics::Direct3D12::*;

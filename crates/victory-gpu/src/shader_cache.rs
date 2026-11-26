@@ -73,7 +73,7 @@ fn build() -> &'static [u8; 32] {
 /// (made here if it is not yet: the cache belongs to the GPU it was filled
 /// on, as the pipeline library does); none without one.
 fn host_wave32() -> bool {
-    crate::host::host().is_some_and(crate::host::Host::wave32)
+    crate::host::host().is_some_and(crate::backend::HostGpu::wave32)
 }
 
 /// This file, whose `encode` and `decode` define the entries.

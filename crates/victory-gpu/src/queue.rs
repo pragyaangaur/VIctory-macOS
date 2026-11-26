@@ -4,6 +4,8 @@
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
+#[cfg(windows)]
+use crate::backend::HostGpu;
 use crate::object::{self, E_INVALIDARG, HRESULT, Iid, Object, QUEUE, S_OK, Table, This, guid};
 use crate::resource::PAGEABLE_IIDS;
 
