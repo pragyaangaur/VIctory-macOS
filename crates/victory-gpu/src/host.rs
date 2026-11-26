@@ -995,6 +995,57 @@ pub(crate) mod tests {
         node.pCommandListDebugNameA = longer.as_ptr().cast();
         assert!(!list.is_node(&node), "a number that only starts with ours is no match");
     }
+
+    #[test]
+    fn bind_pipeline_deduplicates_kept_objects_until_reset() {
+        let Some(host) = host() else { return };
+        let Ok(list) = host.new_list() else { return };
+        let Ok((root, pso)) = crate::compute::pipeline(
+            "[numthreads(1, 1, 1)] void main() {}",
+            windows::core::s!("bind_pipeline_test"),
+            0,
+            &[],
+        ) else {
+            list.close();
+            return;
+        };
+
+        list.bind_pipeline("test_pso", &pso, &root);
+        list.bind_pipeline("test_pso", &pso, &root);
+        assert_eq!(list.deferred().kept.len(), 2);
+        assert_eq!(list.deferred().bound_pipelines.len(), 1);
+
+        list.close();
+        list.reset();
+        assert!(list.deferred().kept.is_empty());
+        assert!(list.deferred().bound_pipelines.is_empty());
+        list.bind_pipeline("test_pso", &pso, &root);
+        assert_eq!(list.deferred().kept.len(), 2);
+        list.close();
+    }
+
+    #[test]
+    fn fill_scratch_reuses_upload_until_title_copy_and_reset() {
+        let Some(host) = host() else { return };
+        let Ok(list) = host.new_list() else { return };
+        let data = [0x11u8; 64];
+        let a = list.fill_scratch(data.as_ptr(), 64).expect("first fill");
+        let b = list.fill_scratch(data.as_ptr(), 64).expect("cached fill");
+        assert_eq!(a, b);
+        assert_eq!(list.deferred().copies.len(), 1);
+
+        let mut dst = [0u8; 16];
+        list.defer_copy(dst.as_mut_ptr(), data.as_ptr(), 16);
+        let c = list.fill_scratch(data.as_ptr(), 64).expect("after title copy");
+        assert_ne!(a, c);
+        assert_eq!(list.deferred().copies.len(), 3);
+
+        list.close();
+        list.reset();
+        let d = list.fill_scratch(data.as_ptr(), 64).expect("after reset");
+        assert_eq!(d, a, "scratch restarts from chunk 0 after reset");
+        list.close();
+    }
 }
 
 type WidenedWrite = (std::sync::Arc<crate::shadow::Shadow>, usize, usize);
@@ -1245,6 +1296,11 @@ struct Deferred {
     /// descriptor heaps): the title may release its objects before it
     /// submits the list.
     kept: Vec<windows::core::IUnknown>,
+    /// Pipelines [`HostList::bind_pipeline`] already kept and noted since reset.
+    bound_pipelines: std::collections::HashSet<usize>,
+    /// Unaligned root-CBV scratch copies (`(source, bytes)` → host GPU address)
+    /// valid until the next title copy or list reset.
+    filled_scratch: std::collections::HashMap<(usize, usize), u64>,
     /// Buffer ranges refreshed since the last title copy (host copy,
     /// address, bytes): refreshing them again would find the same bytes.
     refreshed: std::collections::HashSet<(usize, usize, usize)>,
@@ -2722,11 +2778,25 @@ impl HostList {
     }
 
     /// Notes a pipeline the list binds.
-    pub(crate) fn used_pipeline(&self, name: &str) {
+    fn used_pipeline(&self, name: &str) {
         let mut pipelines = self.pipelines.lock().unwrap_or_else(|e| e.into_inner());
         if !pipelines.contains(name) {
             pipelines.insert(name.to_owned());
         }
+    }
+
+    /// Keeps `pso` and `root` alive until the list is reset and records `name`,
+    /// deduplicated per pipeline pointer until reset.
+    pub(crate) fn bind_pipeline(&self, name: &str, pso: &ID3D12PipelineState, root: &ID3D12RootSignature) {
+        {
+            let mut deferred = self.deferred();
+            if !deferred.bound_pipelines.insert(pso.as_raw() as usize) {
+                return;
+            }
+            deferred.kept.push(pso.clone().into());
+            deferred.kept.push(root.clone().into());
+        }
+        self.used_pipeline(name);
     }
 
     fn deferred(&self) -> std::sync::MutexGuard<'_, Deferred> {
@@ -2748,6 +2818,7 @@ impl HostList {
         deferred.copies.push(step);
         deferred.refreshed.clear();
         deferred.slots.clear();
+        deferred.filled_scratch.clear();
     }
 
     /// Copies `len` bytes of title memory at `src` into the list's upload
@@ -2756,6 +2827,22 @@ impl HostList {
         self.deferred()
             .copies
             .push(Step::Fill(dst as usize, src as usize, len));
+    }
+
+    /// Host GPU address of scratch memory holding `len` bytes from `src` as of
+    /// submission, reused across draws until a title copy or list reset.
+    pub(crate) fn fill_scratch(&self, src: *const u8, len: u64) -> Option<u64> {
+        let key = (src as usize, len as usize);
+        if let Some(&gpu) = self.deferred().filled_scratch.get(&key) {
+            return Some(gpu);
+        }
+        let (gpu, to) = self.scratch(len)?;
+        let mut deferred = self.deferred();
+        deferred
+            .copies
+            .push(Step::Fill(to as usize, src as usize, len as usize));
+        deferred.filled_scratch.insert(key, gpu);
+        Some(gpu)
     }
 
     /// Brings `[address, address + len)` of a buffer's host copy up to date
