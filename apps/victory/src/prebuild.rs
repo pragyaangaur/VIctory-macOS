@@ -25,6 +25,7 @@ use victory_gpu::pipeline::{self, Prebuild};
 use victory_shader::{Container, FourCC, HwStage, native_programs};
 
 use crate::shader::{MAX_FILE, Source, sources};
+use crate::translate::lock;
 
 /// Where a native program's container is: file, source, and its stage.
 type Found = (usize, usize, HwStage);
@@ -289,8 +290,4 @@ fn program_ids(bytes: &[u8]) -> Vec<([u8; 24], HwStage)> {
                 .collect()
         })
         .unwrap_or_default()
-}
-
-fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    m.lock().unwrap_or_else(|e| e.into_inner())
 }

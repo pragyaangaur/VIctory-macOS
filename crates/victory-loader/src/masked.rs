@@ -10,9 +10,7 @@
 //! instruction's bytes is possible, though rare.
 
 use victory_pe::ImageInfo;
-
-/// `IMAGE_SCN_MEM_EXECUTE`.
-const EXECUTE: u32 = 0x2000_0000;
+use victory_pe::layout::section_flags;
 
 /// One masked store found.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -67,7 +65,7 @@ pub fn masked_stores(info: &ImageInfo, bytes: &[u8]) -> Vec<MaskedStore> {
     for s in info
         .sections
         .iter()
-        .filter(|s| s.characteristics & EXECUTE != 0)
+        .filter(|s| s.characteristics & section_flags::MEM_EXECUTE != 0)
     {
         let start = (s.file_offset as usize).min(bytes.len());
         let end = start.saturating_add(s.file_size as usize).min(bytes.len());
@@ -439,10 +437,11 @@ pub(crate) fn jump(site: u64, len: usize, to: u64) -> Option<Vec<u8>> {
 /// file, and where `rva` is in them.
 #[cfg(windows)]
 fn code_at<'a>(info: &ImageInfo, file: &'a [u8], rva: u32) -> Option<(&'a [u8], usize)> {
-    let s = info
-        .sections
-        .iter()
-        .find(|s| s.characteristics & EXECUTE != 0 && s.rva <= rva && rva - s.rva < s.file_size)?;
+    let s = info.sections.iter().find(|s| {
+        s.characteristics & section_flags::MEM_EXECUTE != 0
+            && s.rva <= rva
+            && rva - s.rva < s.file_size
+    })?;
     let start = s.file_offset as usize;
     let code = file.get(start..start.checked_add(s.file_size as usize)?)?;
     Some((code, (rva - s.rva) as usize))

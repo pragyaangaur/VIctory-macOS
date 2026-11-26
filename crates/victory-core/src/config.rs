@@ -105,14 +105,6 @@ impl Config {
         })
     }
 
-    /// The game directory, or a helpful error if it is not configured.
-    pub fn require_game_dir(&self) -> Result<&Path> {
-        self.game_dir.as_deref().context(
-            "no game directory configured: set VICTORY_GAME_DIR or [paths].game_dir in \
-             victory.toml (see victory.example.toml)",
-        )
-    }
-
     /// Returns `<cache>/<sub>`, creating it, after checking the asset policy.
     pub fn cache_subdir(&self, sub: &str) -> Result<PathBuf> {
         subdir(&self.cache_dir, sub)

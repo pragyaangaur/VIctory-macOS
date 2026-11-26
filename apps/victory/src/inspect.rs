@@ -3,7 +3,7 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 use victory_pe::implib::ImportLibrary;
-use victory_pe::{ImageInfo, layout};
+use victory_pe::{ImageInfo, ImportModule, layout};
 
 pub fn run(file: &Path, list_imports: bool, list_exports: bool) -> Result<()> {
     let data = std::fs::read(file).with_context(|| format!("reading {}", file.display()))?;
@@ -65,24 +65,10 @@ pub fn run(file: &Path, list_imports: bool, list_exports: bool) -> Result<()> {
         info.import_count(),
         info.imports.len()
     );
-    for m in &info.imports {
-        println!("  {:<48} {:>5}", m.dll, m.entries.len());
-        if list_imports {
-            for e in &m.entries {
-                println!("      {}", e.symbol);
-            }
-        }
-    }
+    print_imports(&info.imports, list_imports);
     if !info.delay_imports.is_empty() {
         println!("\ndelay-load imports");
-        for m in &info.delay_imports {
-            println!("  {:<48} {:>5}", m.dll, m.entries.len());
-            if list_imports {
-                for e in &m.entries {
-                    println!("      {}", e.symbol);
-                }
-            }
-        }
+        print_imports(&info.delay_imports, list_imports);
     }
 
     println!("\nexports        {}", info.exports.len());
@@ -129,6 +115,18 @@ pub fn lib_exports(lib: &Path, list: bool) -> Result<()> {
 
 fn yes(b: bool) -> &'static str {
     if b { "yes" } else { "no" }
+}
+
+/// One line per imported DLL, with its functions under it if `list`.
+fn print_imports(modules: &[ImportModule], list: bool) {
+    for m in modules {
+        println!("  {:<48} {:>5}", m.dll, m.entries.len());
+        if list {
+            for e in &m.entries {
+                println!("      {}", e.symbol);
+            }
+        }
+    }
 }
 
 fn dll_flags(v: u16) -> String {

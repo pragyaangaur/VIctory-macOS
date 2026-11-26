@@ -456,12 +456,12 @@ const CLWB_LOOPS: usize = 8;
 /// Nothing is patched, and 0 returned, unless exactly [`CLWB_LOOPS`] loops
 /// are found: the count found is logged otherwise.
 pub fn nop_clwb_loops(base: u64, info: &victory_pe::ImageInfo) -> usize {
+    use victory_pe::layout::section_flags::MEM_EXECUTE;
     use windows_sys::Win32::System::Diagnostics::Debug::FlushInstructionCache;
     use windows_sys::Win32::System::Memory::{PAGE_EXECUTE_READWRITE, VirtualProtect};
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
-    const EXECUTE: u32 = 0x2000_0000;
     let mut sites = Vec::new();
-    for s in info.sections.iter().filter(|s| s.characteristics & EXECUTE != 0) {
+    for s in info.sections.iter().filter(|s| s.characteristics & MEM_EXECUTE != 0) {
         let start = base + u64::from(s.rva);
         let len = s.virtual_size.min(s.file_size) as usize;
         // SAFETY: the mapped section, readable code.

@@ -61,6 +61,11 @@ pub mod dll_flags {
     pub const TERMINAL_SERVER_AWARE: u16 = 0x8000;
 }
 
+/// `IMAGE_SECTION_HEADER::Characteristics` flags.
+pub mod section_flags {
+    pub const MEM_EXECUTE: u32 = 0x2000_0000;
+}
+
 /// `IMAGE_OPTIONAL_HEADER64::Subsystem` values.
 pub mod subsystem {
     pub const WINDOWS_GUI: u16 = 2;
