@@ -26,7 +26,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
 use std::process::{Command, Stdio};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 
 /// One decoded instruction: its RVA, length and text (`mnemonic operands`,
 /// with any `# 0x...` comment `llvm-objdump` adds).
@@ -187,16 +187,20 @@ pub(crate) fn run(image: &Path) -> Result<()> {
     // Where branches land: direct targets, function starts and ends, and
     // anything in the data that looks like an address in the code (switch tables).
     let mut targets: HashSet<u32> = HashSet::new();
-    let (_, vsize, raw, rsize) = section(".pdata")?;
-    for entry in data[raw as usize..][..vsize.min(rsize) as usize]
-        .as_chunks::<12>()
-        .0
-    {
-        targets.insert(u32::from_le_bytes([entry[0], entry[1], entry[2], entry[3]]));
-        targets.insert(u32::from_le_bytes([entry[4], entry[5], entry[6], entry[7]]));
+    // A small DLL may lack any of these sections.
+    if let Ok((_, vsize, raw, rsize)) = section(".pdata") {
+        for entry in data[raw as usize..][..vsize.min(rsize) as usize]
+            .as_chunks::<12>()
+            .0
+        {
+            targets.insert(u32::from_le_bytes([entry[0], entry[1], entry[2], entry[3]]));
+            targets.insert(u32::from_le_bytes([entry[4], entry[5], entry[6], entry[7]]));
+        }
     }
     for name in [".rdata", ".data"] {
-        let (_, _, raw, rsize) = section(name)?;
+        let Ok((_, _, raw, rsize)) = section(name) else {
+            continue;
+        };
         for word in data[raw as usize..][..rsize as usize].as_chunks::<4>().0 {
             let value = u32::from_le_bytes(*word);
             if (tva..tva + tsize).contains(&value) {
@@ -401,8 +405,8 @@ pub(crate) fn run(image: &Path) -> Result<()> {
             String::new()
         }
     );
-    if listed == 0 {
-        bail!("no 256-bit stores found: is this a mapped title image?");
+    if stores.is_empty() {
+        eprintln!("no 256-bit stores in this image");
     }
     Ok(())
 }
