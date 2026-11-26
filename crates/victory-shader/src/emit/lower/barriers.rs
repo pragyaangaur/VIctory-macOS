@@ -116,15 +116,16 @@ pub(crate) fn split_wave_barriers(p: &Program, st: &Structured) -> Option<Set<(u
     }
 }
 
-/// Per block, whether every lane of a group that is one console wave runs it
-/// together, the same number of times, when the host splits the group into
-/// narrower waves: outside the region of every branch whose condition may
-/// differ between them ([`halves::branch_regions`]). That is a per-lane
-/// branch, or one on a scalar not computed alike in every host wave. Every
-/// block each lane runs once ([`once_per_lane`]) is one; so is a loop whose
-/// count every host wave computes alike, from the group's inputs, constants
-/// and scalar loads through scalar code (not from lane masks, other lanes'
-/// values or hardware state).
+/// Per block, whether every lane of the group runs it together, the same
+/// number of times, however the host splits the group into waves, so that a
+/// group barrier can go there: outside the region of every branch whose
+/// condition may differ between waves ([`halves::branch_regions`]). That is
+/// a per-lane branch, or one on a scalar not computed alike in every wave.
+/// Every block each lane runs once ([`once_per_lane`]) is one; so is a loop
+/// whose count every wave computes alike, from the group's inputs,
+/// constants and scalar loads through scalar code (not from lane masks,
+/// other lanes' values or hardware state). Such a scalar is the same in
+/// every console wave of the group too.
 ///
 /// Scalars are assumed alike until shown otherwise (a loop counter needs
 /// itself), and the regions and the scalars are narrowed together to a

@@ -10,8 +10,9 @@
 //! a lane reads of its own half is exact. Reads into the other half pass
 //! between the two host waves through group-shared memory, between group
 //! barriers ([`Lower::exchange_halves`]); barriers need the whole group, so
-//! only in a block each lane of the group runs once ([`once_per_lane`]).
-//! Elsewhere they are refused where they are made:
+//! only in a block every lane of the group runs together, the same number
+//! of times ([`in_step`]: once, or in a loop on a count every host wave
+//! computes alike). Elsewhere they are refused where they are made:
 //!
 //! * within a half, exact: DPP (rows of 16, DPP8 groups of 8), `ds_swizzle`
 //!   (groups of 32 or quads), and `ds_bpermute_b32`, which in wave64 permutes
@@ -23,8 +24,8 @@
 //!   console lane ([`Lower::console_lane`]);
 //! * lane masks read as data (ballots) hold the other half's lanes: unless
 //!   the whole group fits one host wave, the halves pass each other their
-//!   ballots ([`Lower::ballot_across_halves`]), for a mask written in a block
-//!   each lane runs once; elsewhere refused ([`MASK_ACROSS`]);
+//!   ballots ([`Lower::ballot_across_halves`]), for a mask written in such a
+//!   block; elsewhere refused ([`MASK_ACROSS`]);
 //! * `v_readlane_b32` of a lane that may be in the other half (SGPR spills
 //!   read back are not lane reads): each half passes the value of the lane
 //!   with that index in it, and the console lane's half picks
@@ -136,12 +137,12 @@ impl Lower<'_> {
     }
 
     /// Where the halves pass each other a lane mask written in IR block
-    /// `def` (none: a program input, in the entry): there, if each lane of
-    /// the group runs it once ([`once_per_lane`]); in the block being
+    /// `def` (none: a program input, in the entry): there, if every lane of
+    /// the group runs it together ([`in_step`]); in the block being
     /// lowered, where the reading instruction starts ([`Lower::level`],
     /// before any guard of its own).
     pub(super) fn across_at(&self, def: Option<usize>) -> Option<usize> {
-        if !self.once.get(def.unwrap_or(0)).copied().unwrap_or(false) {
+        if !self.step.get(def.unwrap_or(0)).copied().unwrap_or(false) {
             return None;
         }
         match def {
@@ -153,13 +154,13 @@ impl Lower<'_> {
 
     /// Whether the halves can pass each other values where the instruction
     /// being lowered is: in halves, in a group of more than one host wave, in
-    /// a block each lane of the group runs once, before anything of the
-    /// instruction's own split it ([`Lower::level`]).
+    /// a block every lane of the group runs together ([`in_step`]), before
+    /// anything of the instruction's own split it ([`Lower::level`]).
     pub(super) fn across_here(&self) -> bool {
         self.halves
             && !self.one_host_wave()
             && self.cur == self.level
-            && self.once.get(self.cur_ir).copied().unwrap_or(false)
+            && self.step.get(self.cur_ir).copied().unwrap_or(false)
     }
 
     /// The half of the console wave this lane is in: 0 or 1.
@@ -173,7 +174,7 @@ impl Lower<'_> {
     /// Both dwords of the console wave's ballot of `bit`, in halves: each
     /// host wave's own (its half's lanes), passed between them
     /// ([`Lower::exchange_halves`]). A console wave with no upper half has a
-    /// high dword of 0. `at` must be run once by every lane of the group
+    /// high dword of 0. Every lane of the group must run `at` together
     /// ([`Lower::across_at`]).
     pub(super) fn ballot_across_halves(&mut self, bit: V, at: usize) -> Result<(V, V), Why> {
         let i32t = self.s.t.i32;
@@ -193,8 +194,8 @@ impl Lower<'_> {
     /// reads its console wave's two after a group barrier; a barrier before
     /// the store keeps it from overwriting what the other half has not read
     /// of an earlier exchange. A console wave with no upper half (a group not
-    /// a multiple of 64) reads `missing` for it. `at` must be run once by
-    /// every lane of the group, in halves.
+    /// a multiple of 64) reads `missing` for it. Every lane of the group must
+    /// run `at` together ([`in_step`]), in halves.
     pub(super) fn exchange_halves(&mut self, own: V, missing: V, at: usize) -> Result<(V, V), Why> {
         let group: u32 = self.s.threads.map_or(0, |t| t.iter().product());
         // Two dwords per console wave, so the high dword of the last one is
@@ -326,9 +327,9 @@ impl Lower<'_> {
     }
 }
 
-/// Why a lane mask read as data stops in halves: it is written where some
-/// lanes of the group may not be, so no group barrier can pass it between
-/// the halves.
+/// Why a lane mask read as data stops in halves: it is written where the
+/// lanes of the group may not all be, as often, so no group barrier can pass
+/// it between the halves.
 pub(super) const MASK_ACROSS: Why = "a lane mask read as data (wave64 on a 32-lane host)";
 
 /// The group-shared dwords a D3D12 compute program may declare, at most

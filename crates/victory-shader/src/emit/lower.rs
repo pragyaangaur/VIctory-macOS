@@ -24,7 +24,7 @@ mod barriers;
 mod bvh;
 mod halves;
 mod mesh;
-use barriers::{once_per_lane, split_wave_barriers};
+use barriers::{in_step, split_wave_barriers};
 pub(crate) use mesh::KeptOutputs;
 use mesh::prune_signature;
 
@@ -318,9 +318,9 @@ struct Lower<'a> {
     halves_refused: Option<Why>,
     /// [`Lower::relabelled_flat`], once made.
     relabelled: Option<V>,
-    /// In halves: per IR block, whether each lane runs it once
-    /// ([`once_per_lane`]), where lane masks can pass between the halves.
-    once: Vec<bool>,
+    /// In halves: per IR block, whether every lane of the group runs it
+    /// together ([`in_step`]), where values can pass between the halves.
+    step: Vec<bool>,
     /// In halves: the group-shared dwords values pass between the halves
     /// through, once made ([`Lower::exchange_halves`]).
     half_words: Option<V>,
@@ -857,7 +857,7 @@ impl<'a> Lower<'a> {
             halves,
             halves_refused,
             relabelled: None,
-            once: if halves { once_per_lane(p) } else { Vec::new() },
+            step: if halves { in_step(p, x.st) } else { Vec::new() },
             half_words: None,
             level: 0,
             alike: if halves {
