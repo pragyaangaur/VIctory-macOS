@@ -1385,10 +1385,29 @@ pub(crate) mod tests {
     #[test]
     fn a_range_over_foreign_memory_guards_only_the_runtimes() {
         use windows_sys::Win32::System::Memory::{MEMORY_BASIC_INFORMATION, PAGE_READONLY, VirtualQuery};
+        // This test tracks a mostly free address range. In the parallel suite,
+        // other tests can map their views in its holes even after both of our
+        // allocations succeed. Keep those views out of this address space.
+        const CHILD: &str = "VICTORY_TEST_FOREIGN_WINDOW_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let name = "watch::tests::a_range_over_foreign_memory_guards_only_the_runtimes";
+            let result = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", name, "--nocapture"])
+                .env(CHILD, "1")
+                .output()
+                .expect("run foreign-window test in a child");
+            let stdout = String::from_utf8_lossy(&result.stdout);
+            assert!(
+                result.status.success() && stdout.contains("1 passed"),
+                "foreign-window child {}: {stdout}{}",
+                result.status,
+                String::from_utf8_lossy(&result.stderr)
+            );
+            return;
+        }
         const WINDOW: usize = 4 << 20;
         // In a free 4 MiB-aligned window: plain committed memory (as the
-        // process heap's) 1 MiB in, a pool 2 MiB in. Other tests allocate
-        // meanwhile, so a window taken under our feet is tried again.
+        // process heap's) 1 MiB in, a pool 2 MiB in.
         let (base, foreign, pool) = (0..8)
             .find_map(|_| {
                 // SAFETY: a fresh reservation, released at once; then
