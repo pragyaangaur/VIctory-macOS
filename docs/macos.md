@@ -201,6 +201,9 @@ On an M5 Max with D3DMetal 4.0 beta 3 the world-entry hang of #172 still happens
 Two counts of a mesh shader's outputs disagree. `MeshOutputs::bytes` counts four bytes per declared component; the layout Metal allocates puts clip and cull distances first, then the position, then each other output aligned to its own size, the same for primitives, times the declared maxima (the count #172 used, from the older `metal_mesh_bytes`). For 1.0.2.1 the packed count puts every world mesh shader at or under 32,768 bytes, while the aligned layout puts about 20 of them at 34,816 to 38,400, and those are the pipelines in the submission that hangs.
 
 Under Wine, linking is now on by default, and a mesh pipeline that is still over 32 KiB after it, by either count, is refused: its draws are dropped and the queue keeps running. With that, the same run goes past the title card and into the world; 20 to 25 pipelines are refused per run. `VICTORY_LINK_MESH_OUTPUTS=0` turns linking off and `VICTORY_MESH_OVER_LIMIT=1` makes over-limit pipelines anyway.
+The diagnostics switch `VICTORY_PHYSICAL_TILES=1` lets XMem use CPU-visible D3D12 heaps for physical page allocations on Rosetta. Wine supplies its usual placeholder views, and the mapped view and DirectStorage share the heap's bytes. The XMem test checks page aliases, remapping, unmapping, and DirectStorage writes. The GPU probe also checks both directions of a copy through an aliased Windows view, including after that view is unmapped.
+
+A separate 6.10 GiB heap and reserved buffer worked on the same M1 Max. Readback matched data from four sampled tiles, including the last two in the heap. A GPU write reached the final tile's CPU mapping.
 
 ## Host presentation size
 
@@ -247,6 +250,9 @@ None of these changes the default. Each is read from the environment when the ga
 | `VICTORY_READ_STATS=1` | Logs the requests and bytes read from each file, every 30 seconds, for the 30 most read. It shows which files a slow share serves most, so you can copy those to fast local storage. |
 | `VICTORY_GPU_BUDGET_MB=<MB>` | Sets the budget that host textures are kept under, in place of the device's. |
 | `VICTORY_MESH_OVER_LIMIT=1` | Makes mesh pipelines whose outputs are over Metal's 32 KiB anyway (refused under Wine by default, as they hang the queue; see above). |
+| `VICTORY_OUTPUT=<W>x<H>` | Sets the title's output size, one of its own modes: 1280x720, 1664x936, 1920x1080, 2560x1440 or 3840x2160. It patches the title's code at load, only where the bytes match build 1.0.2.1, and logs `resolution: ... Done` for each site. On a 16 GB M4 (Series X), 1280x720 brought the GPU time of a world frame from about 8.4 s to 0.86 s. Ported from avatarmanz/VIctory-7900XTX. |
+| `VICTORY_RENDER_SCALE=<s>` | 0.5 to 1.0: the title's own upscaler's render scale (2/3 by default, Series X). Not yet tested on a Mac. |
+| `VICTORY_UPSCALER=<6\|7>` | Makes the title pick its own upscaler (6) or FidelityFX (7). Not yet tested on a Mac. |
 | `VICTORY_STEP_OVER=pool` | Steps over the title's "no free element" traps: an `int3` followed by `xor r, r`, the shape of a full fixed-size pool's allocator, whose caller then gets the NULL it already checks for. Series 1.0.2.1 hits one at `+0x5149aec` (the instance lists' pool, Marvisak/VIctory#698) about 20 minutes into the opening when frames take seconds. A list of hex offsets also works. |
 | `VICTORY_ALIAS_BUFFERS=1` | Under Rosetta with D3DMetal, points title buffers at the pages of a D3DMetal buffer with `mach_vm_remap`, so they need no host copies (#204). A probe at start-up falls back to the copies if the remap does not work. It has only synthetic tests so far, so it needs a run in the game. |
 | `VICTORY_WINDOW_SECONDARY=1` | Opens the game window on the only non-primary display. |

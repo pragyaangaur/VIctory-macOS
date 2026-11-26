@@ -300,7 +300,7 @@ fn cached(
     )
 }
 
-const MAGIC: &[u8; 4] = b"VSH1";
+const MAGIC: &[u8; 4] = b"VSH2";
 /// A container that does not translate: the reason follows.
 const REFUSED: &[u8; 4] = b"VSHE";
 const STAGES: [HwStage; 8] = [
@@ -356,6 +356,7 @@ fn encode(translation: &Result<HostShader, String>) -> Vec<u8> {
         root_cbvs,
         root_srvs,
         root_uavs,
+        root_srv_bytes,
         memory,
         memory_writes,
         view_addresses,
@@ -403,6 +404,11 @@ fn encode(translation: &Result<HostShader, String>) -> Vec<u8> {
     for slots in [root_cbvs, root_srvs, root_uavs] {
         word(&mut out, slots.len() as u32);
         out.extend(slots);
+    }
+    word(&mut out, root_srv_bytes.len() as u32);
+    for &(slot, end) in root_srv_bytes {
+        word(&mut out, u32::from(slot));
+        word(&mut out, end);
     }
     word(
         &mut out,
@@ -473,6 +479,11 @@ fn decode(bytes: &[u8]) -> Option<Result<HostShader, String>> {
     let root_cbvs = r.list()?;
     let root_srvs = r.list()?;
     let root_uavs = r.list()?;
+    let n = r.word()? as usize;
+    let mut root_srv_bytes = Vec::with_capacity(n.min(256));
+    for _ in 0..n {
+        root_srv_bytes.push((u8::try_from(r.word()?).ok()?, r.word()?));
+    }
     let memory = r.word()?;
     r.0.is_empty().then_some(Ok(HostShader {
         stage,
@@ -483,6 +494,7 @@ fn decode(bytes: &[u8]) -> Option<Result<HostShader, String>> {
         root_cbvs,
         root_srvs,
         root_uavs,
+        root_srv_bytes,
         memory: memory & 1 != 0,
         memory_writes: memory & 2 != 0,
         view_addresses: memory & 4 != 0,
@@ -516,6 +528,7 @@ mod tests {
             root_cbvs: vec![2],
             root_srvs: vec![0, 3],
             root_uavs: vec![4],
+            root_srv_bytes: vec![(1, 48), (5, 16384)],
             memory: true,
             memory_writes: true,
             view_addresses: true,

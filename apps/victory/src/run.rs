@@ -156,6 +156,15 @@ pub fn run(
             None => println!("hang watchdog  left on: unknown build"),
         }
     }
+    // The title's output size, render scale and upscaler (`VICTORY_OUTPUT`,
+    // `VICTORY_RENDER_SCALE`, `VICTORY_UPSCALER`; each
+    // off without it), ported from avatarmanz/VIctory-7900XTX.
+    #[cfg(windows)]
+    if execute {
+        let size = image.info().size_of_image as usize;
+        // SAFETY: the image stays mapped and nothing of it has run yet.
+        unsafe { victory_loader::resolution::apply_asked(image.base(), size) };
+    }
     // Masked stores redone as plain stores Rosetta can resume, so fault
     // tracking (`VICTORY_FAULT_TRACKING=1`) can run under Rosetta (#50).
     if let (Some(which), Some(original)) = (patching, original) {
