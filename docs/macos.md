@@ -194,6 +194,14 @@ On an M1 Max with CrossOver Wine 11.17 and D3DMetal 4.0 beta 3, a reserved buffe
 
 Run the probe under the D3DMetal Wine runner with `tools/macos/test-wine.sh -p victory-gpu --lib inplace_probe_6_remap_cpu_visible_tiles -- --ignored --test-threads=1`.
 
+## Mesh pipelines over 32 KiB hang the queue
+
+On an M5 Max with D3DMetal 4.0 beta 3 the world-entry hang of #172 still happens on current main: a submission that holds the title's indirect mesh draws never completes ("still waiting for the host GPU" without end), right after the "Vice City, two years ago" card. Linking mesh and pixel outputs (#161) was off unless `VICTORY_LINK_MESH_OUTPUTS` was set, and nothing refused a pipeline still over the limit, so the oversized pipelines were made.
+
+Two counts of a mesh shader's outputs disagree. `MeshOutputs::bytes` counts four bytes per declared component; the layout Metal allocates puts clip and cull distances first, then the position, then each other output aligned to its own size, the same for primitives, times the declared maxima (the count #172 used, from the older `metal_mesh_bytes`). For 1.0.2.1 the packed count puts every world mesh shader at or under 32,768 bytes, while the aligned layout puts about 20 of them at 34,816 to 38,400, and those are the pipelines in the submission that hangs.
+
+Under Wine, linking is now on by default, and a mesh pipeline that is still over 32 KiB after it, by either count, is refused: its draws are dropped and the queue keeps running. With that, the same run goes past the title card and into the world; 20 to 25 pipelines are refused per run. `VICTORY_LINK_MESH_OUTPUTS=0` turns linking off and `VICTORY_MESH_OVER_LIMIT=1` makes over-limit pipelines anyway.
+
 ## Host presentation size
 
 Set `VICTORY_PRESENT_MAX=1280x720` to cap the host presentation pass and DXGI swap chain at 720p. Smaller pictures keep their native size. The cap preserves the picture’s aspect ratio and applies after the game’s rendering and upscaling.
@@ -238,6 +246,7 @@ None of these changes the default. Each is read from the environment when the ga
 | `VICTORY_SPILL_SHADERS=1` | Keeps shader containers on disk until they are translated. The title passes tens of thousands of containers and draws with a few hundred, and holding them all took about 700 MB of an 8 GB Mac (#135). |
 | `VICTORY_READ_STATS=1` | Logs the requests and bytes read from each file, every 30 seconds, for the 30 most read. It shows which files a slow share serves most, so you can copy those to fast local storage. |
 | `VICTORY_GPU_BUDGET_MB=<MB>` | Sets the budget that host textures are kept under, in place of the device's. |
+| `VICTORY_MESH_OVER_LIMIT=1` | Makes mesh pipelines whose outputs are over Metal's 32 KiB anyway (refused under Wine by default, as they hang the queue; see above). |
 | `VICTORY_ALIAS_BUFFERS=1` | Under Rosetta with D3DMetal, points title buffers at the pages of a D3DMetal buffer with `mach_vm_remap`, so they need no host copies (#204). A probe at start-up falls back to the copies if the remap does not work. It has only synthetic tests so far, so it needs a run in the game. |
 | `VICTORY_WINDOW_SECONDARY=1` | Opens the game window on the only non-primary display. |
 | `VICTORY_WINDOW_SECONDARY=x,y` | Opens the game window on the display that holds the desktop point `x,y`, for layouts with more than one extra display (a Sidecar iPad beside two monitors, say). |
