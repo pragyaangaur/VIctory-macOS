@@ -49,7 +49,10 @@ rustup show active-toolchain > /dev/null 2>&1 || rustup toolchain install "$(sed
 rustup target add x86_64-pc-windows-gnullvm > /dev/null
 
 # Wine's build breaks on paths with spaces, so the large build folders live
-# under a space-free link in the cache folder.
+# under a space-free link in the cache folder. There is one link for every
+# checkout, so it names whichever checkout ran setup last (a fleet task's
+# too): the build goes through it, and tools/macos/victory.sh and
+# test-wine.sh take this checkout's own target/wine-cx first.
 ALIAS="$HOME/Library/Caches/victory-macos"
 mkdir -p "$ALIAS" "$ROOT/target"
 ln -sfn "$ROOT/target" "$ALIAS/target"

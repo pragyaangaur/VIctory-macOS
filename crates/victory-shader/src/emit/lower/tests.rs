@@ -1342,6 +1342,14 @@ fn wave64(words: &[u32]) -> ir::Program {
     ir::build(&code, true, 256).unwrap()
 }
 
+/// [`super::split_wave_barriers`] of a program.
+fn barriers_at(p: &ir::Program) -> Option<Vec<(usize, usize)>> {
+    let st = structure::structure(p).unwrap();
+    let mut at: Vec<_> = super::split_wave_barriers(p, &st)?.into_iter().collect();
+    at.sort_unstable();
+    Some(at)
+}
+
 /// Lowers a wave64 compute program of `lanes` threads with 512 bytes of
 /// LDS: the barriers it got for narrow host waves.
 fn split_barriers(words: &[u32], lanes: u32, narrow_waves: bool) -> usize {
@@ -1394,8 +1402,7 @@ fn a_read_after_another_lanes_write_syncs_in_a_split_wave() {
     w.extend(DS_WRITE_V1_V0);
     w.extend(DS_READ_V2_V1_4);
     w.push(S_ENDPGM);
-    let at = super::split_wave_barriers(&wave64(&w)).unwrap();
-    assert_eq!(at.into_iter().collect::<Vec<_>>(), [(0, 2)]);
+    assert_eq!(barriers_at(&wave64(&w)).unwrap(), [(0, 2)]);
     assert_eq!(split_barriers(&w, 64, true), 1);
     // Option off, or a group one host wave holds: as before.
     assert_eq!(split_barriers(&w, 64, false), 0);
@@ -1416,7 +1423,7 @@ fn a_divergent_write_syncs_at_the_join_before_the_read() {
     w.extend(DS_READ_V2_V1_4);
     w.push(S_ENDPGM);
     let p = wave64(&w);
-    let at: Vec<_> = super::split_wave_barriers(&p).unwrap().into_iter().collect();
+    let at = barriers_at(&p).unwrap();
     assert_eq!(at.len(), 1);
     let (b, i) = at[0];
     assert!(p.blocks[b].insts[i].name().starts_with("ds_read"));
@@ -1433,7 +1440,7 @@ fn a_write_before_divergent_reads_syncs_where_all_lanes_run() {
     w.push(RESTORE_EXEC);
     w.push(S_ENDPGM);
     let p = wave64(&w);
-    let at: Vec<_> = super::split_wave_barriers(&p).unwrap().into_iter().collect();
+    let at = barriers_at(&p).unwrap();
     assert_eq!(at, [(0, p.blocks[0].insts.len())], "the end of the entry");
     assert_eq!(split_barriers(&w, 64, true), 1);
 }
@@ -1446,8 +1453,133 @@ fn no_barrier_in_divergent_code() {
     w.extend(DS_READ_V2_V1_4);
     w.push(RESTORE_EXEC);
     w.push(S_ENDPGM);
-    assert!(super::split_wave_barriers(&wave64(&w)).is_none());
+    assert!(barriers_at(&wave64(&w)).is_none());
     assert_eq!(split_barriers(&w, 64, true), 0);
+}
+
+const S_MOV_S20_0: u32 = 0xBE94_0380; // s_mov_b32 s20, 0
+const S_ADD_S20_1: u32 = 0x8014_8114; // s_add_u32 s20, s20, 1
+const S_CMP_LT_S20_4: u32 = 0xBF0A_8414; // s_cmp_lt_u32 s20, 4
+const S_CMP_LT_S20_S21: u32 = 0xBF0A_1514; // s_cmp_lt_u32 s20, s21
+const READFIRSTLANE_S21_V0: u32 = 0x7E2A_0500; // v_readfirstlane_b32 s21, v0
+
+/// `body` in a loop on s20, ending at the compare `cmp` (`s_cbranch_scc1`
+/// back to the body's start).
+fn looped(before: &[u32], body: &[u32], cmp: u32) -> Vec<u32> {
+    let mut w = before.to_vec();
+    w.push(S_MOV_S20_0);
+    w.extend(body);
+    let back = -(body.len() as i32 + 3);
+    w.extend([S_ADD_S20_1, cmp, 0xBF85_0000 | (back as u32 & 0xFFFF)]);
+    w.push(S_ENDPGM);
+    w
+}
+
+#[test]
+fn the_loop_programs_are_what_their_comments_say() {
+    let w = looped(
+        &[V_LSHLREV_V1_2_V0, READFIRSTLANE_S21_V0],
+        &[DS_WRITE_V1_V0, DS_READ_V2_V1_4].concat(),
+        S_CMP_LT_S20_S21,
+    );
+    let code: Vec<u8> = w.iter().flat_map(|w| w.to_le_bytes()).collect();
+    let all = crate::gfx10::decode(&code)
+        .unwrap()
+        .iter()
+        .map(|i| i.text(true))
+        .collect::<Vec<_>>()
+        .join("\n");
+    for want in [
+        "v_readfirstlane_b32 s21, v0",
+        "s_mov_b32 s20, 0",
+        "ds_write_b32 v1, v0",
+        "ds_read_b32 v2, v1 offset:4",
+        "s_add_u32 s20, s20, 1",
+        "s_cmp_lt_u32 s20, s21",
+        "s_cbranch_scc1",
+    ] {
+        assert!(all.contains(want), "{want:?} not in:\n{all}");
+    }
+    let w = looped(&[], &[], S_CMP_LT_S20_4);
+    let code: Vec<u8> = w.iter().flat_map(|w| w.to_le_bytes()).collect();
+    let all = crate::gfx10::decode(&code)
+        .unwrap()
+        .iter()
+        .map(|i| i.text(true))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(all.contains("s_cmp_lt_u32 s20, 4"), "{all}");
+}
+
+#[test]
+fn lds_in_a_loop_on_a_scalar_count_syncs_inside_the_loop() {
+    // Each pass writes, then reads what another lane wrote: a barrier
+    // before the read, and one before the write, which the last pass's read
+    // of another lane must not miss.
+    let w = looped(
+        &[V_LSHLREV_V1_2_V0],
+        &[DS_WRITE_V1_V0, DS_READ_V2_V1_4].concat(),
+        S_CMP_LT_S20_4,
+    );
+    let p = wave64(&w);
+    assert!(p.blocks[1].insts[0].name().starts_with("ds_write"));
+    assert_eq!(barriers_at(&p).unwrap(), [(1, 0), (1, 1)]);
+    assert_eq!(split_barriers(&w, 64, true), 2);
+    assert_eq!(lowered(&w, 64, true).wave_size, None);
+}
+
+#[test]
+fn lds_in_a_loop_on_a_lane_value_gets_no_barrier() {
+    // The count comes from a lane (`v_readfirstlane`): the host waves need
+    // not agree on it, so no barrier can go in the loop.
+    let w = looped(
+        &[V_LSHLREV_V1_2_V0, READFIRSTLANE_S21_V0],
+        &[DS_WRITE_V1_V0, DS_READ_V2_V1_4].concat(),
+        S_CMP_LT_S20_S21,
+    );
+    assert!(barriers_at(&wave64(&w)).is_none());
+    assert_eq!(split_barriers(&w, 64, true), 0);
+    // A loop on a lane's own condition (`s_cbranch_vccnz`) neither.
+    let mut w = vec![V_LSHLREV_V1_2_V0];
+    w.extend(DS_WRITE_V1_V0);
+    w.extend(DS_READ_V2_V1_4);
+    w.extend([
+        0x7D88_0480, // v_cmp_gt_u32 vcc, 0, v2
+        0xBF87_FFFA, // s_cbranch_vccnz (back to the write)
+        S_ENDPGM,
+    ]);
+    assert!(barriers_at(&wave64(&w)).is_none());
+}
+
+#[test]
+fn a_write_after_another_lanes_read_syncs_before_it() {
+    let mut w = vec![V_LSHLREV_V1_2_V0];
+    w.extend(DS_WRITE_V1_V0);
+    w.extend(DS_READ_V2_V1_4);
+    w.extend(DS_WRITE_V1_V0);
+    w.extend(DS_READ_V2_V1_4);
+    w.push(S_ENDPGM);
+    assert_eq!(barriers_at(&wave64(&w)).unwrap(), [(0, 2), (0, 3), (0, 4)]);
+}
+
+#[test]
+fn a_read_before_divergent_writes_syncs_where_all_lanes_run() {
+    let mut w = vec![V_LSHLREV_V1_2_V0];
+    w.extend(DS_READ_V2_V1_4);
+    w.extend([SAVE_EXEC, CMPX_V0_EQ_0, skip(2)]);
+    w.extend(DS_WRITE_V1_V0);
+    w.push(RESTORE_EXEC);
+    w.push(S_ENDPGM);
+    let p = wave64(&w);
+    assert_eq!(barriers_at(&p).unwrap(), [(0, p.blocks[0].insts.len())]);
+    // A write after a read, both under the branch: no barrier can go
+    // there, and the program runs as before.
+    let mut w = vec![V_LSHLREV_V1_2_V0, SAVE_EXEC, CMPX_V0_EQ_0, skip(4)];
+    w.extend(DS_READ_V2_V1_4);
+    w.extend(DS_WRITE_V1_V0);
+    w.push(RESTORE_EXEC);
+    w.push(S_ENDPGM);
+    assert_eq!(barriers_at(&wave64(&w)).unwrap(), []);
 }
 
 #[test]

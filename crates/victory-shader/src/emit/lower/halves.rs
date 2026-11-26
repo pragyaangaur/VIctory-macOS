@@ -339,10 +339,11 @@ const GROUP_SHARED_DWORDS: u32 = 8192;
 /// in the other half, and the value is not known to be the same there.
 pub(super) const FIRST_ACROSS: Why = "a first-lane read of a value that may differ between 32-lane halves (wave64 on a 32-lane host)";
 
-/// Every per-lane branch (by its block) with its region: the blocks
-/// reachable from it that do not post-dominate it, which only some lanes
-/// run. Not branches on uniform conditions. None with an indirect exit.
-fn lane_regions(st: &Structured) -> Option<Vec<(usize, Vec<bool>)>> {
+/// Every branch (by its block) with its region: the blocks reachable from
+/// it that do not post-dominate it, which only the lanes taking one side may
+/// run (the branch's own block among them where a cycle leads back to it).
+/// None with an indirect exit.
+pub(super) fn branch_regions(st: &Structured) -> Option<Vec<(usize, Vec<bool>)>> {
     let n = st.exits.len();
     let mut succ: Vec<Vec<usize>> = vec![Vec::new(); n];
     for (b, e) in st.exits.iter().enumerate() {
@@ -394,21 +395,15 @@ fn lane_regions(st: &Structured) -> Option<Vec<(usize, Vec<bool>)>> {
     }
     let mut regions = Vec::new();
     for (d, e) in st.exits.iter().enumerate() {
-        let LaneExit::Branch { when, .. } = *e else {
-            continue;
-        };
-        if st
-            .bools
-            .support(when)
-            .iter()
-            .all(|a| matches!(a, Atom::Uniform(_)))
-        {
+        if !matches!(e, LaneExit::Branch { .. }) {
             continue;
         }
         let mut seen = vec![false; n];
         let mut stack: Vec<usize> = succ[d].clone();
         while let Some(b) = stack.pop() {
-            if seen[b] || pdom[d][b / 64] >> (b % 64) & 1 == 1 {
+            // The branch's own block is in its region if a cycle leads back
+            // to it (a loop's latch): only the lanes going round run it.
+            if seen[b] || b != d && pdom[d][b / 64] >> (b % 64) & 1 == 1 {
                 continue;
             }
             seen[b] = true;
@@ -456,7 +451,7 @@ fn wave_tid(x: &Parts) -> Option<Value> {
 pub(super) fn lane_uniform(x: &Parts) -> HashSet<Value> {
     let (p, st) = (x.p, x.st);
     let wave_tid = wave_tid(x);
-    let regions = lane_regions(st);
+    let regions = branch_regions(st);
     let is_mask = |v: Value| st.masks.contains_key(&v) || st.highs.contains_key(&v);
     let per_lane = |v: Value| x.res.waterfall.reads.contains(&v);
     let mut same: HashSet<Value> = HashSet::new();
