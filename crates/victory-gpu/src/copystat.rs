@@ -118,8 +118,30 @@ pub(crate) enum C {
     BigResized,
     BigResizedBytes,
     BigResizedNs,
+    /// Lists run by those submissions, and the submissions the queue pump
+    /// made (the rest are ours: uploads, clears, captures).
+    ExecuteLists,
+    PumpExecutes,
+    /// Title barriers on buffers (legacy kinds 0 and 2), of those the
+    /// transitions between two read-only states; the global UAV barriers
+    /// they became (one per call), of those the calls whose buffer barriers
+    /// were all such transitions (none of them needed).
+    BufferBarriers,
+    BufferReadOnly,
+    BufferUav,
+    BufferUavSkippable,
+    /// Enhanced barrier calls (each becomes one global UAV barrier), and the
+    /// barriers in their groups.
+    GroupCalls,
+    GroupBarriers,
+    /// Depth twin copies into the depth texture and into the twin, and the
+    /// bytes of the twin's planes they moved.
+    TwinToDepth,
+    TwinToDepthBytes,
+    TwinToTwin,
+    TwinToTwinBytes,
 }
-const COUNTERS: usize = C::BigResizedNs as usize + 1;
+const COUNTERS: usize = C::TwinToTwinBytes as usize + 1;
 static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
 
 pub(crate) fn add(c: C, n: u64) {
@@ -401,6 +423,32 @@ pub(crate) fn log(frames: f64) {
         c[C::BigResized as usize],
         mb(c[C::BigResizedBytes as usize]),
         c[C::BigResizedNs as usize] / 1e6,
+    );
+    tracing::info!(
+        "  host submissions per frame: {:.1} executes ({:.1} from the queue pump), {:.1} lists, {:.1} lists/execute",
+        c[C::Submissions as usize],
+        c[C::PumpExecutes as usize],
+        c[C::ExecuteLists as usize],
+        c[C::ExecuteLists as usize] / c[C::Submissions as usize].max(f64::MIN_POSITIVE),
+    );
+    tracing::info!(
+        "  buffer barriers per frame: {:.1} on title buffers ({:.1} between two read-only states) -> {:.1} global UAV \
+         barriers ({:.1} of them from such transitions only); enhanced barriers: {:.1} calls ({:.1} barriers) -> {:.1} \
+         global UAV barriers",
+        c[C::BufferBarriers as usize],
+        c[C::BufferReadOnly as usize],
+        c[C::BufferUav as usize],
+        c[C::BufferUavSkippable as usize],
+        c[C::GroupCalls as usize],
+        c[C::GroupBarriers as usize],
+        c[C::GroupCalls as usize],
+    );
+    tracing::info!(
+        "  depth twin copies per frame: {:.1} into depth ({:.2} MB), {:.1} into twin ({:.2} MB)",
+        c[C::TwinToDepth as usize],
+        mb(c[C::TwinToDepthBytes as usize]),
+        c[C::TwinToTwin as usize],
+        mb(c[C::TwinToTwinBytes as usize]),
     );
     let mut snapshots: Vec<((u64, u64), u64)> =
         SNAPSHOTS.lock().unwrap_or_else(|e| e.into_inner()).take().into_iter().flatten().collect();

@@ -51,3 +51,21 @@ Screenshots and videos that testers posted in the issues, newest first within ea
   <img src="https://github.com/user-attachments/assets/482a101c-e375-4e35-b5a3-dfc3bd8faf30" width="480" alt="The game's Vice City, two years ago title card on an M3 Max under VIctory" loading="lazy">
 
 - [Video](https://github.com/user-attachments/assets/cfd769c0-5ade-412a-8f5c-766e3e521615): From launch to the freeze on LakshanSivakumar's M5 Pro (48 GB), 25 November 2026 (#65).
+
+- The night street with a subtitle on Stefa008's M4 (16 GB) at 1280x720, 3.6 s per frame, 26 November 2026 (sent by email).
+
+  <img src="https://github.com/pragyaangaur/VIctory-macOS/releases/download/gallery-media/m4-night-street.webp" width="480" alt="A night street scene with a car and a subtitle, on an M4 under VIctory" loading="lazy">
+
+- The HUD with the minimap and the street panel on the same M4, 2.4 s per frame.
+
+  <img src="https://github.com/pragyaangaur/VIctory-macOS/releases/download/gallery-media/m4-hud-minimap.webp" width="480" alt="The game HUD with a minimap on an M4 under VIctory" loading="lazy">
+
+- The same HUD a little later, with the minimap drawn, photographed from the screen.
+
+  <img src="https://github.com/pragyaangaur/VIctory-macOS/releases/download/gallery-media/m4-hud-minimap-photo.webp" width="480" alt="The game HUD with a drawn minimap on an M4 under VIctory" loading="lazy">
+
+- The opening credits on the same M4, at about 2 frames per second.
+
+  <img src="https://github.com/pragyaangaur/VIctory-macOS/releases/download/gallery-media/m4-opening-credits.webp" width="480" alt="The opening credits of the game on an M4 under VIctory" loading="lazy">
+
+- [Video](https://github.com/pragyaangaur/VIctory-macOS/releases/download/gallery-media/macgaming-gta6-progress.mp4): A 27 second clip of the game running through VIctory on a Mac, posted by a user on r/macgaming as "GTA VI progress" (the post's title). Shared here with credit to its author.

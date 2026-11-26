@@ -102,6 +102,16 @@ pub use watch::{
     title_memory_remapped, writing as kernel_will_write,
 };
 
+/// [`shader_cache::under_wine`], asked once: it looks `wine_get_version` up
+/// in ntdll, which takes Wine's loader lock, and draws ask it per descriptor,
+/// barrier and heap write. Not in `shader_cache`, whose bytes key the
+/// translation caches.
+#[cfg(windows)]
+pub(crate) fn under_wine() -> bool {
+    static WINE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *WINE.get_or_init(shader_cache::under_wine)
+}
+
 /// A whole file, read without asking for its size or other metadata.
 /// `std::fs::read` and `read_to_end` call `File::metadata()`, which Wine
 /// answers with `NtQueryVolumeInformationFile`: an ioctl to its mount
