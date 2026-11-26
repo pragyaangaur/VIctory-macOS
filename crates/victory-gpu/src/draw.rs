@@ -4137,11 +4137,7 @@ void main(uint3 id : SV_DispatchThreadID) {
         let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
         let io = io::raise(&p, &native).unwrap();
         let host_shader = emit_with(
-            &Container {
-                digest: [0; 16],
-                version: (1, 0),
-                parts: Vec::new(),
-            },
+            &Container { parts: Vec::new() },
             &native,
             &p,
             &st,

@@ -380,6 +380,25 @@ fn few_atoms(bools: &crate::structure::Bools, b: Bool) -> bool {
     true
 }
 
+/// `words` with each picked one (`Tracer::picked`, `Tracer::lane_picked`) as
+/// its pick takes it where the condition holds (`set`), or where it does not.
+fn picked_side(words: &[Term], picks: &[Option<(Value, Term, Term)>], set: bool) -> Vec<Term> {
+    words
+        .iter()
+        .zip(picks)
+        .map(|(w, p)| match p {
+            Some((_, t, f)) => {
+                if set {
+                    *t
+                } else {
+                    *f
+                }
+            }
+            None => *w,
+        })
+        .collect()
+}
+
 const MAX_ROUNDS: usize = 64;
 const MAX_JOINS: usize = 8;
 
@@ -1172,6 +1191,34 @@ impl<'a> Tracer<'a> {
         })
     }
 
+    /// The block and index of the phi that defines `w`, if one does.
+    fn phi_of(&self, w: &Term) -> Option<(usize, usize)> {
+        match *w {
+            Term::Value(v) => self.phis[v.0 as usize],
+            Term::Const(_) => None,
+        }
+    }
+
+    /// The block whose phis define some of `words` (`None` if none do); an
+    /// error if they are in several blocks, or in one a join in progress
+    /// (`joins`) came through, as a loop makes it.
+    fn joined_block(&self, words: &[Term], joins: &[usize]) -> Result<Option<usize>, &'static str> {
+        let Some((block, _)) = words.iter().find_map(|w| self.phi_of(w)) else {
+            return Ok(None);
+        };
+        if words
+            .iter()
+            .filter_map(|w| self.phi_of(w))
+            .any(|(b, _)| b != block)
+        {
+            return Err("a descriptor joined in several blocks");
+        }
+        if joins.contains(&block) {
+            return Err("a descriptor that changes in a loop");
+        }
+        Ok(Some(block))
+    }
+
     /// Words that phis of one block join, traced per predecessor (words
     /// defined before the join hold on every edge).
     fn phi(
@@ -1180,19 +1227,9 @@ impl<'a> Tracer<'a> {
         joins: &mut Vec<usize>,
         known: &mut Known,
     ) -> Result<Option<Source>, &'static str> {
-        let phi_of = |w: &Term| match *w {
-            Term::Value(v) => self.phis[v.0 as usize],
-            Term::Const(_) => None,
-        };
-        let Some((block, _)) = words.iter().find_map(phi_of) else {
+        let Some(block) = self.joined_block(words, joins)? else {
             return Ok(None);
         };
-        if words.iter().filter_map(phi_of).any(|(b, _)| b != block) {
-            return Err("a descriptor joined in several blocks");
-        }
-        if joins.contains(&block) {
-            return Err("a descriptor that changes in a loop");
-        }
         // Each level multiplies the sources by the predecessor count.
         if joins.len() >= MAX_JOINS {
             return Err("a descriptor joined too often");
@@ -1207,7 +1244,7 @@ impl<'a> Tracer<'a> {
         let edge = |j: usize, joins: &mut Vec<usize>, known: &mut Known| {
             let edge: Vec<Term> = words
                 .iter()
-                .map(|w| match phi_of(w) {
+                .map(|w| match self.phi_of(w) {
                     Some((_, i)) => self.origin(phis[i].args[j]),
                     None => *w,
                 })
@@ -1273,25 +1310,9 @@ impl<'a> Tracer<'a> {
             return Err("a descriptor joined too often");
         }
         joins.push(usize::MAX);
-        let side = |set: bool| -> Vec<Term> {
-            words
-                .iter()
-                .zip(&picks)
-                .map(|(w, p)| match p {
-                    Some((_, t, f)) => {
-                        if set {
-                            *t
-                        } else {
-                            *f
-                        }
-                    }
-                    None => *w,
-                })
-                .collect()
-        };
         let args = [true, false]
             .into_iter()
-            .map(|set| self.classify(&side(set), joins, known))
+            .map(|set| self.classify(&picked_side(words, &picks, set), joins, known))
             .collect::<Result<_, _>>();
         joins.pop();
         Ok(Some(Source::Select { scc, args: args? }))
@@ -1724,28 +1745,12 @@ impl<'a> Tracer<'a> {
         joins.push(usize::MAX);
         // Each side holds where the lane's bit of the mask is set, or clear.
         let bit = self.lanes.and_then(|l| l.masks.get(&mask).copied());
-        let side = |set: bool| -> Vec<Term> {
-            words
-                .iter()
-                .zip(&picks)
-                .map(|(w, p)| match p {
-                    Some((_, t, f)) => {
-                        if set {
-                            *t
-                        } else {
-                            *f
-                        }
-                    }
-                    None => *w,
-                })
-                .collect()
-        };
         let args = [true, false]
             .into_iter()
             .map(|set| {
                 let n = known.len();
                 known.extend(bit.map(|b| (b, set)));
-                let arg = self.per_lane(&side(set), joins, known);
+                let arg = self.per_lane(&picked_side(words, &picks, set), joins, known);
                 known.truncate(n);
                 arg
             })
@@ -1796,19 +1801,9 @@ impl<'a> Tracer<'a> {
         joins: &mut Vec<usize>,
         known: &mut Known,
     ) -> Result<Option<Source>, &'static str> {
-        let phi_of = |w: &Term| match *w {
-            Term::Value(v) => self.phis[v.0 as usize],
-            Term::Const(_) => None,
-        };
-        let Some((block, _)) = words.iter().find_map(phi_of) else {
+        let Some(block) = self.joined_block(words, joins)? else {
             return Ok(None);
         };
-        if words.iter().filter_map(phi_of).any(|(b, _)| b != block) {
-            return Err("a descriptor joined in several blocks");
-        }
-        if joins.contains(&block) {
-            return Err("a descriptor that changes in a loop");
-        }
         let preds = &self.p.blocks[block].preds;
         if preds.iter().any(|&q| self.rpo[q] >= self.rpo[block]) {
             // shortcut: what a lane holds after some passes is not traced.
@@ -1822,7 +1817,7 @@ impl<'a> Tracer<'a> {
         // one the join does not reach.
         for w in words {
             if let Term::Value(v) = *w
-                && phi_of(w).is_none()
+                && self.phi_of(w).is_none()
                 && let Some((d, _)) = self.defs[v.0 as usize]
                 && (d == block || self.reaches(block, d))
             {
@@ -1850,7 +1845,7 @@ impl<'a> Tracer<'a> {
             let arg = if meet(lanes, known) {
                 let edge: Vec<Term> = words
                     .iter()
-                    .map(|w| match phi_of(w) {
+                    .map(|w| match self.phi_of(w) {
                         Some((_, i)) => Term::Value(phis[i].args[j]),
                         None => *w,
                     })
@@ -2825,11 +2820,7 @@ pub(crate) mod tests {
         let st = crate::structure::structure(&p).unwrap();
         let res = track(&p, &native.layout, native.stage, Some(&st)).unwrap();
         let io = crate::io::raise(&p, &native).unwrap();
-        let empty = crate::Container {
-            digest: [0; 16],
-            version: (1, 0),
-            parts: Vec::new(),
-        };
+        let empty = crate::Container { parts: Vec::new() };
         let shader = crate::emit::emit(&empty, &native, &p, &st, &io, &res).unwrap();
         assert!(!shader.memory);
         assert!(shader.user_data.contains(&crate::emit::UserData {

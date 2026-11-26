@@ -42,8 +42,6 @@ pub struct Value(pub u32);
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Program {
     pub wave64: bool,
-    /// VGPRs v0 up to this exist; bounds M0-relative access.
-    pub vgprs: u16,
     /// In code order, then copies made to give every loop one entry; block 0
     /// is the entry.
     pub blocks: Vec<Block>,
@@ -285,10 +283,9 @@ pub fn build_bounded(
             debug_assert!(!phi.args.contains(&NONE), "{phi:?}");
         }
     }
-    remove_trivial_phis(&mut blocks, values);
+    remove_trivial_phis_steps(&mut blocks, values);
     Ok(Program {
         wave64,
-        vgprs,
         blocks,
         inputs,
     })
@@ -660,10 +657,7 @@ fn liveness(blocks: &[Block], order: &[usize]) -> (Vec<RegSet>, Vec<RegSet>) {
 
 /// Phis are placed for every live register at every join; those whose
 /// arguments are all one value (or the phi itself) are replaced by it.
-fn remove_trivial_phis(blocks: &mut [Block], values: u32) {
-    remove_trivial_phis_steps(blocks, values);
-}
-
+/// Returns the steps its union-find took, which a test bounds.
 fn remove_trivial_phis_steps(blocks: &mut [Block], values: u32) -> usize {
     fn find(replaced: &mut [Value], v: Value, steps: &mut usize) -> Value {
         let mut root = v;

@@ -584,7 +584,12 @@ impl<'a> Lanes<'a> {
         for (i, &b) in order.iter().enumerate() {
             index[b] = i;
         }
-        check_reducible(p, &order, &index)?;
+        // `ir::build` splits irreducible loops, and everything here assumes
+        // a reducible graph.
+        debug_assert!(
+            crate::ir::irreducible_edge(blocks, &order, &index).is_none(),
+            "irreducible control flow"
+        );
         let mut incoming = vec![Vec::new(); blocks.len()];
         let (mut defs, mut phis) = (Map::default(), Map::default());
         for (b, block) in blocks.iter().enumerate() {
@@ -1430,18 +1435,6 @@ const TOO_LARGE: ShaderError = ShaderError::Isa {
     offset: 0,
     reason: "lane conditions too large",
 };
-
-/// `ir::build` splits irreducible loops; checked again because everything
-/// here assumes a reducible graph.
-fn check_reducible(p: &Program, order: &[usize], index: &[usize]) -> Result<(), ShaderError> {
-    match crate::ir::irreducible_edge(&p.blocks, order, index) {
-        Some((from, _)) => Err(ShaderError::Unsupported {
-            offset: p.blocks[from].offset,
-            what: "irreducible control flow",
-        }),
-        None => Ok(()),
-    }
-}
 
 #[cfg(test)]
 mod tests {

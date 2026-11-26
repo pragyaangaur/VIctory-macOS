@@ -1003,14 +1003,7 @@ impl<'a> Lower<'a> {
                 Some(h) => {
                     let c = l.cur;
                     let (u, mask, al) = (l.s.m.undef(l.s.t.i32), l.s.m.i8(1), l.s.m.i32(4));
-                    let r = l.s.op(
-                        c,
-                        "rawBufferLoad.f32",
-                        Attr::ReadOnly,
-                        l.s.t.res_ret,
-                        139,
-                        &[h, byte, u, mask, al],
-                    );
+                    let r = l.raw_buffer_load(c, &[h, byte, u, mask, al]);
                     let x = l.s.m.extract(c, r, 0);
                     Ok(l.as_int(x))
                 }
@@ -1158,7 +1151,7 @@ impl<'a> Lower<'a> {
                 }
             }
         };
-        let (iu, void, i32t) = (self.s.m.undef(self.s.t.i32), self.s.t.void, self.s.t.i32);
+        let (iu, void) = (self.s.m.undef(self.s.t.i32), self.s.t.void);
         // Title memory is looked up (and its pages marked written) only in
         // the lanes that write.
         let at = self.begin_guarded(guard);
@@ -1209,14 +1202,7 @@ impl<'a> Lower<'a> {
                 }
             };
             let op = self.s.m.i32(op);
-            let r = self.s.op(
-                self.cur,
-                "atomicBinOp.i32",
-                Attr::NoUnwind,
-                i32t,
-                78,
-                &[h, op, off, iu, iu, value],
-            );
+            let r = self.atomic_bin_op(self.cur, &[h, op, off, iu, iu, value]);
             first.get_or_insert(r);
         }
         let bytes = self.s.m.i32(4);
@@ -1334,9 +1320,7 @@ impl<'a> Lower<'a> {
                 // console rounds each step, in its own order.
                 let low = self.s.m.i32(0xFFFF);
                 let h = self.s.m.bin(c, Bin::And, x, low);
-                let f = self
-                    .s
-                    .op(c, "legacyF16ToF32", Attr::ReadNone, self.s.t.f32, 131, &[h]);
+                let f = self.f16_to_f32(c, h);
                 let (sum, signed) = (self.s.m.i8(0), self.s.m.i8(0));
                 let r = self.s.op(
                     c,
@@ -1346,9 +1330,7 @@ impl<'a> Lower<'a> {
                     119,
                     &[f, sum, signed],
                 );
-                let r = self
-                    .s
-                    .op(c, "legacyF32ToF16", Attr::ReadNone, self.s.t.i32, 130, &[r]);
+                let r = self.f32_to_f16(c, r);
                 let r = self.s.m.bin(c, Bin::And, r, low);
                 // Lane `hi` runs the section on the console even where it is
                 // elsewhere on the host; there it holds the identity.
@@ -2427,6 +2409,70 @@ impl<'a> Lower<'a> {
         )
     }
 
+    /// `dx.op.rawBufferLoad.f32` of the handle, index, offset, mask and
+    /// alignment in `args`, in `block`.
+    fn raw_buffer_load(&mut self, block: usize, args: &[V]) -> V {
+        self.s.op(
+            block,
+            "rawBufferLoad.f32",
+            Attr::ReadOnly,
+            self.s.t.res_ret,
+            139,
+            args,
+        )
+    }
+
+    /// `dx.op.atomicBinOp.i32` of the handle, operation, coordinates and
+    /// value in `args`, in `block`.
+    fn atomic_bin_op(&mut self, block: usize, args: &[V]) -> V {
+        self.s.op(
+            block,
+            "atomicBinOp.i32",
+            Attr::NoUnwind,
+            self.s.t.i32,
+            78,
+            args,
+        )
+    }
+
+    /// The f32 of the f16 in the low bits of `h` (`dx.op.legacyF16ToF32`), in
+    /// `block`.
+    fn f16_to_f32(&mut self, block: usize, h: V) -> V {
+        self.s.op(
+            block,
+            "legacyF16ToF32",
+            Attr::ReadNone,
+            self.s.t.f32,
+            131,
+            &[h],
+        )
+    }
+
+    /// The f16 of the f32 `f`, rounded to nearest even, in the low bits
+    /// (`dx.op.legacyF32ToF16`), in `block`.
+    fn f32_to_f16(&mut self, block: usize, f: V) -> V {
+        self.s.op(
+            block,
+            "legacyF32ToF16",
+            Attr::ReadNone,
+            self.s.t.i32,
+            130,
+            &[f],
+        )
+    }
+
+    /// `dx.op.unaryBits.i32` of `a` as the DXIL opcode `op` says, in `block`.
+    fn unary_bits(&mut self, block: usize, op: u32, a: V) -> V {
+        self.s.op(
+            block,
+            "unaryBits.i32",
+            Attr::ReadNone,
+            self.s.t.i32,
+            op,
+            &[a],
+        )
+    }
+
     /// A 32-bit denormal as the console's float mode reads it: a zero of its
     /// sign, decided on the bits (the host's own denormal mode varies).
     fn ftz(&mut self, f: V) -> V {
@@ -2647,13 +2693,8 @@ impl<'a> Lower<'a> {
     /// also turns an overflow to infinity into the largest finite half).
     fn f16_toward_zero(&mut self, f: V) -> V {
         let c = self.cur;
-        let i32t = self.s.t.i32;
-        let h = self
-            .s
-            .op(c, "legacyF32ToF16", Attr::ReadNone, i32t, 130, &[f]);
-        let back = self
-            .s
-            .op(c, "legacyF16ToF32", Attr::ReadNone, self.s.t.f32, 131, &[h]);
+        let h = self.f32_to_f16(c, f);
+        let back = self.f16_to_f32(c, h);
         let (fa, ba) = (self.unary(6, f), self.unary(6, back));
         // Ordered: never for NaN.
         let away = self.s.m.cmp(c, pred::OGT, ba, fa);
@@ -3977,13 +4018,8 @@ impl<'a> Lower<'a> {
                 }
                 "s_bcnt1_i32_b64" => {
                     let (a, b) = (half(self, 0, 0)?, half(self, 0, 1)?);
-                    let i32t = self.s.t.i32;
-                    let na = self
-                        .s
-                        .op(c, "unaryBits.i32", Attr::ReadNone, i32t, 31, &[a]);
-                    let nb = self
-                        .s
-                        .op(c, "unaryBits.i32", Attr::ReadNone, i32t, 31, &[b]);
+                    let na = self.unary_bits(c, 31, a);
+                    let nb = self.unary_bits(c, 31, b);
                     let r = self.s.m.bin(c, Bin::Add, na, nb);
                     self.set(lo, Val::I32(r));
                     let z = self.s.m.i32(0);
@@ -3994,13 +4030,8 @@ impl<'a> Lower<'a> {
                 "s_ff1_i32_b64" => {
                     // The lowest set bit; -1 for none (as DXIL's first bit low).
                     let (a, b) = (half(self, 0, 0)?, half(self, 0, 1)?);
-                    let i32t = self.s.t.i32;
-                    let fa = self
-                        .s
-                        .op(c, "unaryBits.i32", Attr::ReadNone, i32t, 32, &[a]);
-                    let fb = self
-                        .s
-                        .op(c, "unaryBits.i32", Attr::ReadNone, i32t, 32, &[b]);
+                    let fa = self.unary_bits(c, 32, a);
+                    let fb = self.unary_bits(c, 32, b);
                     let (z, k32) = (self.s.m.i32(0), self.s.m.i32(32));
                     let fb32 = self.s.m.bin(c, Bin::Add, fb, k32);
                     let none = self.s.m.cmp(c, pred::EQ, b, z);
@@ -4174,18 +4205,14 @@ impl<'a> Lower<'a> {
                 // the signed form), -1 for none: DXIL's first-bit-high.
                 let a = src32(self, 0)?;
                 let op = if name == "s_flbit_i32_b32" { 33 } else { 34 };
-                let r = self
-                    .s
-                    .op(c, "unaryBits.i32", Attr::ReadNone, self.s.t.i32, op, &[a]);
+                let r = self.unary_bits(c, op, a);
                 (r, None)
             }
             "s_ff1_i32_b32" | "s_bcnt1_i32_b32" => {
                 // First set bit (-1 for zero, as DXIL's), or the bit count.
                 let a = src32(self, 0)?;
                 let op = if name == "s_ff1_i32_b32" { 32 } else { 31 };
-                let r = self
-                    .s
-                    .op(c, "unaryBits.i32", Attr::ReadNone, self.s.t.i32, op, &[a]);
+                let r = self.unary_bits(c, op, a);
                 (r, None)
             }
             "s_bfe_u32" | "s_bfe_i32" => {
@@ -4447,14 +4474,7 @@ impl<'a> Lower<'a> {
                 let a = self.s.m.bin(c, Bin::Add, addr, off);
                 let mask = self.s.m.i8(1);
                 let (u, al) = (self.s.m.undef(self.s.t.i32), self.s.m.i32(4));
-                let r = self.s.op(
-                    c,
-                    "rawBufferLoad.f32",
-                    Attr::ReadOnly,
-                    self.s.t.res_ret,
-                    139,
-                    &[h, a, u, mask, al],
-                );
+                let r = self.raw_buffer_load(c, &[h, a, u, mask, al]);
                 let x = self.s.m.extract(c, r, 0);
                 let x = self.as_int(x);
                 self.write(inst, Reg::S(code + k as u8), x, None);
@@ -4902,14 +4922,7 @@ impl<'a> Lower<'a> {
             // Frees it only if taken: an `and` with all ones changes nothing.
             let (and, all) = (l.s.m.i32(1), l.s.m.i32(u32::MAX));
             let keep = l.s.m.select(b, won, zero, all);
-            l.s.op(
-                b,
-                "atomicBinOp.i32",
-                Attr::NoUnwind,
-                i32t,
-                78,
-                &[locks, and, lock, iu, iu, keep],
-            );
+            l.atomic_bin_op(b, &[locks, and, lock, iu, iu, keep]);
             (lo, hi)
         };
 
@@ -5056,14 +5069,7 @@ impl<'a> Lower<'a> {
     fn raw_dword(&mut self, h: V, at: V) -> V {
         let c = self.cur;
         let (u, mask, al) = (self.s.m.undef(self.s.t.i32), self.s.m.i8(1), self.s.m.i32(4));
-        let r = self.s.op(
-            c,
-            "rawBufferLoad.f32",
-            Attr::ReadOnly,
-            self.s.t.res_ret,
-            139,
-            &[h, at, u, mask, al],
-        );
+        let r = self.raw_buffer_load(c, &[h, at, u, mask, al]);
         let x = self.s.m.extract(c, r, 0);
         self.as_int(x)
     }
@@ -5128,7 +5134,7 @@ impl<'a> Lower<'a> {
             let inner = self.begin_guarded(Some(clear));
             let iu = self.s.m.undef(self.s.t.i32);
             // Operation 2 is OR.
-            self.s.op(self.cur, "atomicBinOp.i32", Attr::NoUnwind, self.s.t.i32, 78, &[bitmap, k2, word, iu, iu, bit]);
+            self.atomic_bin_op(self.cur, &[bitmap, k2, word, iu, iu, bit]);
             self.end_guarded(inner, &[]);
         }
         self.end_guarded(outer, &[]);
@@ -5319,14 +5325,7 @@ impl<'a> Lower<'a> {
         let word = self.s.m.bin(c, Bin::Shl, word, k2);
         let bit = self.s.m.bin(c, Bin::And, n, k31);
         let bit = self.s.m.bin(c, Bin::Shl, one, bit);
-        self.s.op(
-            c,
-            "atomicBinOp.i32",
-            Attr::NoUnwind,
-            self.s.t.i32,
-            78,
-            &[bitmap, k2, word, iu, iu, bit],
-        );
+        self.atomic_bin_op(c, &[bitmap, k2, word, iu, iu, bit]);
     }
 
     /// The level-2 page-table index, block, and level-1 index of title
@@ -5510,14 +5509,7 @@ impl<'a> Lower<'a> {
         let (u, align) = (self.s.m.undef(self.s.t.i32), self.s.m.i32(4));
         let load = |l: &mut Self, at: V, n: u32| -> Vec<V> {
             let mask = l.s.m.i8((1u8 << n) - 1);
-            let r = l.s.op(
-                c,
-                "rawBufferLoad.f32",
-                Attr::ReadOnly,
-                l.s.t.res_ret,
-                139,
-                &[h, at, u, mask, align],
-            );
+            let r = l.raw_buffer_load(c, &[h, at, u, mask, align]);
             (0..n)
                 .map(|k| {
                     let x = l.s.m.extract(c, r, k);
@@ -5628,9 +5620,7 @@ impl<'a> Lower<'a> {
                             self.s.m.bin(c, Bin::Shl, field, sh)
                         }
                     };
-                    let f = self
-                        .s
-                        .op(c, "legacyF16ToF32", Attr::ReadNone, f32t, 131, &[h]);
+                    let f = self.f16_to_f32(c, h);
                     float(self, f)
                 }
             };
@@ -5798,9 +5788,8 @@ impl<'a> Lower<'a> {
                 let m = self.s.m.i32(0xFFFF);
                 self.s.m.bin(c, Bin::And, x, m)
             } else {
-                let (f, i32t) = (self.as_float(x), self.s.t.i32);
-                self.s
-                    .op(c, "legacyF32ToF16", Attr::ReadNone, i32t, 130, &[f])
+                let f = self.as_float(x);
+                self.f32_to_f16(c, f)
             });
         }
         let mut out = Vec::new();
@@ -5831,6 +5820,16 @@ impl<'a> Lower<'a> {
             }
             _ => Ok((0, None)),
         }
+    }
+
+    /// The byte stride of the structured buffer that the used-resource entry
+    /// `used` describes; an error unless it is a whole number of dwords.
+    fn structured_stride(used: Option<&UsedResource>) -> Result<u32, Why> {
+        let stride = used.map_or(0, |u| u.stride);
+        if stride < 4 || !stride.is_multiple_of(4) {
+            return Err("a structured buffer of unknown stride");
+        }
+        Ok(stride)
     }
 
     /// The byte stride of the buffer view a heap-indexed descriptor names
@@ -5864,14 +5863,7 @@ impl<'a> Lower<'a> {
         let table = self.s.root_srv_handle(VIEW_STRIDES);
         let iu = self.s.m.undef(self.s.t.i32);
         let mask = self.s.m.i8(1);
-        let r = self.s.op(
-            c,
-            "rawBufferLoad.f32",
-            Attr::ReadOnly,
-            self.s.t.res_ret,
-            139,
-            &[table, at, iu, mask, four],
-        );
+        let r = self.raw_buffer_load(c, &[table, at, iu, mask, four]);
         let x = self.s.m.extract(c, r, 0);
         let word = self.as_int(x);
         let bits = self.s.m.i32(VIEW_STRIDE_BITS);
@@ -6151,7 +6143,7 @@ impl<'a> Lower<'a> {
         let at = self.s.m.bin(c, Bin::Mul, index, four);
         let table = self.s.root_srv_handle(VIEW_STRIDES);
         let (iu, mask) = (self.s.m.undef(self.s.t.i32), self.s.m.i8(1));
-        let r = self.s.op(c, "rawBufferLoad.f32", Attr::ReadOnly, self.s.t.res_ret, 139, &[table, at, iu, mask, four]);
+        let r = self.raw_buffer_load(c, &[table, at, iu, mask, four]);
         let x = self.s.m.extract(c, r, 0);
         let stride = self.as_int(x);
         let zero = self.s.m.i32(0);
@@ -6768,9 +6760,7 @@ impl<'a> Lower<'a> {
                 // Counted from the top bit, -1 when none (DXIL's too).
                 let a = s(self, 0)?;
                 let op = if name == "v_ffbh_u32" { 33 } else { 34 };
-                let r = self
-                    .s
-                    .op(c, "unaryBits.i32", Attr::ReadNone, self.s.t.i32, op, &[a]);
+                let r = self.unary_bits(c, op, a);
                 int(self, r)
             }
             "v_dot4c_i32_i8" => {
@@ -7038,8 +7028,7 @@ impl<'a> Lower<'a> {
                         } else {
                             x
                         };
-                        self.s
-                            .op(c, "legacyF16ToF32", Attr::ReadNone, self.s.t.f32, 131, &[h])
+                        self.f16_to_f32(c, h)
                     } else {
                         self.as_float(x)
                     };
@@ -7495,10 +7484,7 @@ impl<'a> Lower<'a> {
             unreachable!()
         };
         let h = self.half_src(inst, k)?;
-        let f32t = self.s.t.f32;
-        let mut f = self
-            .s
-            .op(self.cur, "legacyF16ToF32", Attr::ReadNone, f32t, 131, &[h]);
+        let mut f = self.f16_to_f32(self.cur, h);
         if v.abs >> k & 1 != 0 {
             f = self.unary(6, f);
         }
@@ -7566,9 +7552,7 @@ impl<'a> Lower<'a> {
         ];
         const FLOAT3: &[&str] = &[
             "v_fma_f16",
-            "v_mad_f16",
             "v_fmac_f16",
-            "v_mac_f16",
             "v_max3_f16",
             "v_min3_f16",
             "v_med3_f16",
@@ -7592,7 +7576,6 @@ impl<'a> Lower<'a> {
         const INT: &[&str] = &[
             "v_add_nc_u16",
             "v_sub_nc_u16",
-            "v_subrev_nc_u16",
             "v_mul_lo_u16",
             "v_lshlrev_b16",
             "v_lshrrev_b16",
@@ -7663,7 +7646,7 @@ impl<'a> Lower<'a> {
         }
         if float3.contains(&name) {
             let (a, b) = (self.half_fsrc(inst, 0)?, self.half_fsrc(inst, 1)?);
-            let acc = if matches!(name, "v_fmac_f16" | "v_mac_f16") {
+            let acc = if name == "v_fmac_f16" {
                 // The accumulator is the destination's half that is written.
                 let Some(Operand::Vector { reg, .. }) = v.dst else {
                     return Err("an accumulator");
@@ -7677,8 +7660,7 @@ impl<'a> Lower<'a> {
                 };
                 let m = self.s.m.i32(0xFFFF);
                 let x = self.s.m.bin(c, Bin::And, x, m);
-                self.s
-                    .op(c, "legacyF16ToF32", Attr::ReadNone, f32t, 131, &[x])
+                self.f16_to_f32(c, x)
             } else {
                 self.half_fsrc(inst, 2)?
             };
@@ -7692,7 +7674,7 @@ impl<'a> Lower<'a> {
             let r = match name {
                 // shortcut: fused f16 multiply-adds as FMad in f32 (the
                 // product is exact; the sum rounds twice).
-                "v_fma_f16" | "v_fmac_f16" | "v_mad_f16" | "v_mac_f16" => self.fmad(a, b, acc),
+                "v_fma_f16" | "v_fmac_f16" => self.fmad(a, b, acc),
                 "v_max3_f16" => {
                     let t = self.max_min(true, a, b);
                     self.max_min(true, t, acc)
@@ -7794,7 +7776,6 @@ impl<'a> Lower<'a> {
                 match name {
                     "v_add_nc_u16" => self.s.m.bin(c, Bin::Add, a, b),
                     "v_sub_nc_u16" => self.s.m.bin(c, Bin::Sub, a, b),
-                    "v_subrev_nc_u16" => self.s.m.bin(c, Bin::Sub, b, a),
                     "v_mul_lo_u16" => self.s.m.bin(c, Bin::Mul, a, b),
                     "v_lshlrev_b16" | "v_lshrrev_b16" | "v_ashrrev_i16" => {
                         // src0 is the shift (4 bits), src1 the value.
@@ -7967,7 +7948,6 @@ impl<'a> Lower<'a> {
             return Err("modifiers on a packed integer operation");
         }
         let c = self.cur;
-        let f32t = self.s.t.f32;
         let mut halves = Vec::new();
         for high in [false, true] {
             let mut xs = Vec::new();
@@ -7978,9 +7958,7 @@ impl<'a> Lower<'a> {
                     self.packed_src(inst, k, high, float)?
                 };
                 if float {
-                    let mut f = self
-                        .s
-                        .op(c, "legacyF16ToF32", Attr::ReadNone, f32t, 131, &[h]);
+                    let mut f = self.f16_to_f32(c, h);
                     let neg = if high { v.neg_hi } else { v.neg };
                     if neg >> k & 1 != 0 {
                         let z = self.s.m.f32(0x8000_0000);
@@ -8234,9 +8212,7 @@ impl<'a> Lower<'a> {
             }
             "v_bcnt_u32_b32" => {
                 let (a, b) = (s(self, 0)?, s(self, 1)?);
-                let n = self
-                    .s
-                    .op(c, "unaryBits.i32", Attr::ReadNone, self.s.t.i32, 31, &[a]);
+                let n = self.unary_bits(c, 31, a);
                 self.s.m.bin(c, Bin::Add, n, b)
             }
             "v_mad_u32_u24" | "v_mad_i32_i24" => {
@@ -8443,8 +8419,7 @@ impl<'a> Lower<'a> {
             "v_ffbl_b32" => {
                 // -1 for zero, as DXIL's first-bit-low.
                 let a = s(self, 0)?;
-                self.s
-                    .op(c, "unaryBits.i32", Attr::ReadNone, self.s.t.i32, 32, &[a])
+                self.unary_bits(c, 32, a)
             }
             "v_mbcnt_lo_u32_b32" | "v_mbcnt_hi_u32_b32" => {
                 // Bits of the mask's low (high) half below this lane, plus src1:
@@ -8490,9 +8465,7 @@ impl<'a> Lower<'a> {
                 let full = self.s.m.cmp(c, pred::IUGE, below, k32);
                 let m = self.s.m.select(c, full, ones, m);
                 let x = self.s.m.bin(c, Bin::And, a, m);
-                let n = self
-                    .s
-                    .op(c, "unaryBits.i32", Attr::ReadNone, self.s.t.i32, 31, &[x]);
+                let n = self.unary_bits(c, 31, x);
                 self.s.m.bin(c, Bin::Add, n, b)
             }
             _ => return Err(name),
@@ -8969,10 +8942,7 @@ impl<'a> Lower<'a> {
             return h;
         }
         let c = self.cur;
-        let f32t = self.s.t.f32;
-        let mut f = self
-            .s
-            .op(c, "legacyF16ToF32", Attr::ReadNone, f32t, 131, &[h]);
+        let mut f = self.f16_to_f32(c, h);
         if v.omod != 0 {
             let factor = [1.0f32, 2.0, 4.0, 0.5][usize::from(v.omod)];
             let k = self.s.m.f32(factor.to_bits());
@@ -8981,8 +8951,7 @@ impl<'a> Lower<'a> {
         if v.clamp {
             f = self.unary(7, f);
         }
-        self.s
-            .op(c, "legacyF32ToF16", Attr::ReadNone, self.s.t.i32, 130, &[f])
+        self.f32_to_f16(c, f)
     }
 
     /// An image instruction, its reads of texture views marked (module
@@ -9022,7 +8991,7 @@ impl<'a> Lower<'a> {
         let at = self.begin_guarded(Some(clear));
         let iu = self.s.m.undef(self.s.t.i32);
         // Operation 2 is OR.
-        self.s.op(self.cur, "atomicBinOp.i32", Attr::NoUnwind, self.s.t.i32, 78, &[bitmap, k2, word, iu, iu, bit]);
+        self.atomic_bin_op(self.cur, &[bitmap, k2, word, iu, iu, bit]);
         self.end_guarded(at, &[]);
     }
 
@@ -9308,9 +9277,7 @@ impl<'a> Lower<'a> {
                         let k16 = self.s.m.i32(16);
                         x = self.s.m.bin(self.cur, Bin::LShr, x, k16);
                     }
-                    let f32t = self.s.t.f32;
-                    self.s
-                        .op(self.cur, "legacyF16ToF32", Attr::ReadNone, f32t, 131, &[x])
+                    self.f16_to_f32(self.cur, x)
                 } else {
                     self.float_of(v)?
                 };
@@ -9432,8 +9399,7 @@ impl<'a> Lower<'a> {
             // With a16, sampling coordinates and LOD are f16.
             let to_float = |l: &mut Self, x: V| {
                 if *a16 {
-                    let f = l.s.t.f32;
-                    l.s.op(l.cur, "legacyF16ToF32", Attr::ReadNone, f, 131, &[x])
+                    l.f16_to_f32(l.cur, x)
                 } else {
                     l.as_float(x)
                 }
@@ -9735,9 +9701,7 @@ impl<'a> Lower<'a> {
             xs.push(if *d16 {
                 // shortcut: d16 results are taken as floats (rounded to
                 // nearest even); integer formats would keep 16 bits.
-                let i32t = self.s.t.i32;
-                self.s
-                    .op(c, "legacyF32ToF16", Attr::ReadNone, i32t, 130, &[x])
+                self.f32_to_f16(c, x)
             } else {
                 self.as_int(x)
             });
@@ -10211,7 +10175,7 @@ impl<'a> Lower<'a> {
                     let a = self.s.m.bin(c, Bin::Add, byte, four);
                     let (mask, al) = (self.s.m.i8(1), self.s.m.i32(4));
                     let u = self.s.m.undef(self.s.t.i32);
-                    let r = self.s.op(c, "rawBufferLoad.f32", Attr::ReadOnly, self.s.t.res_ret, 139, &[h, a, u, mask, al]);
+                    let r = self.raw_buffer_load(c, &[h, a, u, mask, al]);
                     let x = self.s.m.extract(c, r, 0);
                     let x = self.as_int(x);
                     self.write(inst, Reg::V(reg + k as u8), x, guard);
@@ -10250,10 +10214,7 @@ impl<'a> Lower<'a> {
             let vals = self.vgprs(inst, d, if op == u32::MAX { 2 } else { 1 })?;
             let (h, coords, byte) = match index {
                 Some(index) => {
-                    let stride = used.map_or(0, |u| u.stride);
-                    if stride < 4 || !stride.is_multiple_of(4) {
-                        return Err("a structured buffer of unknown stride");
-                    }
+                    let stride = Self::structured_stride(used)?;
                     let h = self.handle(site, src, false, (12 | u, stride))?;
                     let s = self.s.m.i32(stride);
                     let row = self.s.m.bin(self.cur, Bin::Mul, index, s);
@@ -10292,8 +10253,7 @@ impl<'a> Lower<'a> {
                 let mut args = vec![h, self.s.m.i32(op)];
                 args.extend(coords);
                 args.push(vals[0]);
-                self.s
-                    .op(self.cur, "atomicBinOp.i32", Attr::NoUnwind, i32t, 78, &args)
+                self.atomic_bin_op(self.cur, &args)
             };
             let bytes = self.s.m.i32(4);
             self.mark_view_write(h, byte, bytes, None);
@@ -10324,11 +10284,9 @@ impl<'a> Lower<'a> {
             let keep = self.s.m.bin(c, Bin::Xor, mask, all);
             let (h, at) = self.raw_view(site, src, at, 4, (11 | 0x1000, 0), true, guard)?;
             let begin = self.begin_guarded(guard);
-            let i32t = self.s.t.i32;
             for (op, v) in [(1, keep), (2, x)] {
                 let args = [h, self.s.m.i32(op), at, iu, iu, v];
-                self.s
-                    .op(self.cur, "atomicBinOp.i32", Attr::NoUnwind, i32t, 78, &args);
+                self.atomic_bin_op(self.cur, &args);
             }
             let bytes = self.s.m.i32(4);
             self.mark_view_write(h, at, bytes, None);
@@ -10359,10 +10317,7 @@ impl<'a> Lower<'a> {
                         let k16 = self.s.m.i32(16);
                         x = self.s.m.bin(c, Bin::LShr, x, k16);
                     }
-                    let f32t = self.s.t.f32;
-                    let f = self
-                        .s
-                        .op(c, "legacyF16ToF32", Attr::ReadNone, f32t, 131, &[x]);
+                    let f = self.f16_to_f32(c, x);
                     let mut w = self.as_int(f);
                     if let Some((int, signed)) = integer {
                         let (k16, low) = (self.s.m.i32(16), self.s.m.i32(0xFFFF));
@@ -10498,10 +10453,7 @@ impl<'a> Lower<'a> {
             } else {
                 match index {
                     Some(index) => {
-                        let stride = used.map_or(0, |u| u.stride);
-                        if stride < 4 || !stride.is_multiple_of(4) {
-                            return Err("a structured buffer of unknown stride");
-                        }
+                        let stride = Self::structured_stride(used)?;
                         args.push(self.handle(site, src, false, (12 | u, stride))?);
                         args.extend([index, off]);
                         let s = self.s.m.i32(stride);
@@ -10561,14 +10513,7 @@ impl<'a> Lower<'a> {
             let (h, at) = self.raw_view(site, src, at, 4, (11 | u, 0), false, guard)?;
             let c = self.cur;
             let (mask, align) = (self.s.m.i8(1), self.s.m.i32(4));
-            let r = self.s.op(
-                c,
-                "rawBufferLoad.f32",
-                Attr::ReadOnly,
-                self.s.t.res_ret,
-                139,
-                &[h, at, iu, mask, align],
-            );
+            let r = self.raw_buffer_load(c, &[h, at, iu, mask, align]);
             let w = self.s.m.extract(c, r, 0);
             let w = self.as_int(w);
             let byte = self.s.m.bin(c, Bin::And, off, three);
@@ -10646,32 +10591,15 @@ impl<'a> Lower<'a> {
             let align = self.s.m.i32(4);
             match index {
                 Some(index) => {
-                    let stride = used.map_or(0, |u| u.stride);
-                    if stride < 4 || !stride.is_multiple_of(4) {
-                        return Err("a structured buffer of unknown stride");
-                    }
+                    let stride = Self::structured_stride(used)?;
                     let h = self.handle(site, src, false, (12 | u, stride))?;
-                    self.s.op(
-                        c,
-                        "rawBufferLoad.f32",
-                        Attr::ReadOnly,
-                        self.s.t.res_ret,
-                        139,
-                        &[h, index, off, mask, align],
-                    )
+                    self.raw_buffer_load(c, &[h, index, off, mask, align])
                 }
                 None => {
                     let bytes = 4 * count;
                     let (h, off) =
                         self.raw_view(site, src, off, bytes, (11 | u, 0), false, guard)?;
-                    self.s.op(
-                        self.cur,
-                        "rawBufferLoad.f32",
-                        Attr::ReadOnly,
-                        self.s.t.res_ret,
-                        139,
-                        &[h, off, iu, mask, align],
-                    )
+                    self.raw_buffer_load(self.cur, &[h, off, iu, mask, align])
                 }
             }
         };
@@ -10691,14 +10619,11 @@ impl<'a> Lower<'a> {
             let integer = typed_h.and_then(|h| self.integer_view(h));
             let c = self.cur;
             let k16 = self.s.m.i32(16);
-            let i32t = self.s.t.i32;
             for k in 0..count.div_ceil(2) {
                 let mut x = None;
                 for ch in (2 * k..(2 * k + 2).min(count)).rev() {
                     let f = self.s.m.extract(c, r, ch);
-                    let mut h = self
-                        .s
-                        .op(c, "legacyF32ToF16", Attr::ReadNone, i32t, 130, &[f]);
+                    let mut h = self.f32_to_f16(c, f);
                     if let Some((int, _)) = integer {
                         let bits = self.as_int(f);
                         let low = self.s.m.i32(0xFFFF);
@@ -10904,10 +10829,7 @@ impl<'a> Lower<'a> {
                     let k16 = self.s.m.i32(16);
                     x = self.s.m.bin(c, Bin::LShr, x, k16);
                 }
-                let f32t = self.s.t.f32;
-                let f = self
-                    .s
-                    .op(c, "legacyF16ToF32", Attr::ReadNone, f32t, 131, &[x]);
+                let f = self.f16_to_f32(c, x);
                 x = self.as_int(f);
             }
             let el = &mut elements(self, primitive)[id];

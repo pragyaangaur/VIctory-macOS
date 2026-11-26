@@ -47,7 +47,7 @@
 //! public); programs use the ratios and the denominator's sign.
 
 use super::{Lower, Why};
-use crate::emit::bitcode::{Attr, Bin, Cast, V, pred};
+use crate::emit::bitcode::{Bin, Cast, V, pred};
 use crate::gfx10::{Fields, Operand};
 use crate::ir::{Inst, Reg};
 use crate::resource::Source;
@@ -238,14 +238,7 @@ impl Lower<'_> {
             let off = self.s.m.i32(4 * (from + k));
             let off = self.s.m.bin(c, Bin::Add, at, off);
             let mask = self.s.m.i8((1u8 << m) - 1);
-            let r = self.s.op(
-                c,
-                "rawBufferLoad.f32",
-                Attr::ReadOnly,
-                self.s.t.res_ret,
-                139,
-                &[h, off, u, mask, align],
-            );
+            let r = self.raw_buffer_load(c, &[h, off, u, mask, align]);
             for j in 0..m {
                 let x = self.s.m.extract(c, r, j);
                 out.push(self.as_int(x));
@@ -278,14 +271,7 @@ impl Lower<'_> {
             let o = self.s.m.i32(4 * k);
             let o = self.s.m.bin(c, Bin::Add, at, o);
             let mask = self.s.m.i8((1u8 << m) - 1);
-            let r = self.s.op(
-                c,
-                "rawBufferLoad.f32",
-                Attr::ReadOnly,
-                self.s.t.res_ret,
-                139,
-                &[h, o, u, mask, align],
-            );
+            let r = self.raw_buffer_load(c, &[h, o, u, mask, align]);
             for j in 0..m {
                 let x = self.s.m.extract(c, r, j);
                 out.push(self.as_int(x));
@@ -300,7 +286,6 @@ impl Lower<'_> {
         let c = self.cur;
         let four = self.s.m.i32(4);
         let is16 = self.s.m.cmp(c, pred::EQ, ty, four);
-        let f32t = self.s.t.f32;
         let zero = self.s.m.f32(0);
         let (inf, ninf) = (
             self.s.m.f32(f32::INFINITY.to_bits()),
@@ -322,9 +307,7 @@ impl Lower<'_> {
                 } else {
                     half
                 };
-                let half = self
-                    .s
-                    .op(c, "legacyF16ToF32", Attr::ReadNone, f32t, 131, &[half]);
+                let half = self.f16_to_f32(c, half);
                 *x = self.s.m.select(c, is16, half, wide);
             }
             let mut nan = self.s.m.bool(false);
