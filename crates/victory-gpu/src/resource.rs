@@ -2104,9 +2104,10 @@ fn one_memory(uma: bool, local: f64, non_local: f64) -> bool {
 /// The card's budget in MB that [`evict_unused`] keeps host textures under:
 /// `VICTORY_GPU_BUDGET_MB` when set, else the device's (`device`). Under
 /// D3DMetal the device's is about four fifths of the Mac's memory, which the
-/// title's own memory shares, and memory freed through D3DMetal stays with
-/// the process for its next resources: on a Mac with 8 GB, unused textures
-/// filled memory into swap long before the pass would start (#135).
+/// title's own memory shares: on a Mac with 8 GB, unused textures filled
+/// memory into swap long before the pass would start (#135). Memory freed
+/// through D3DMetal leaves the process at the next submission, and the
+/// device's use follows it (`footprint_probe`).
 #[cfg(windows)]
 fn budget_mb(device: f64) -> f64 {
     static SET: std::sync::OnceLock<Option<f64>> = std::sync::OnceLock::new();
