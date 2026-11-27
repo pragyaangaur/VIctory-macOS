@@ -3,23 +3,26 @@
 # for x86_64 under Rosetta and installs it into target/wine-cx. D3DMetal is
 # made for this Wine, and its memory APIs are new enough for VIctory.
 #
-# DEPS names an x86_64 prefix with FreeType and GnuTLS, such as the
-# build/deps folder of the Minecraft Bedrock macOS setup.
+# DEPS names an x86_64 prefix with FreeType, GnuTLS and SDL2, as
+# tools/macos/build-deps.sh builds it.
 #
 # The patches in tools/macos/patches are applied to the source. A Wine that
-# is already installed gets only its server and ntdll rebuilt (see below), and
+# is already installed gets only its server, ntdll and HID bus rebuilt (see
+# below), and
 #   tools/macos/build-crossover-wine.sh --stamp
-# prints the stamp of the patches that setup.sh compares with the install's.
-# The stamp of the patches baked into the cached source tree is kept inside
-# the tree, and the tree is recreated from the cached tarball when the two
-# differ, so a patch that was removed or edited cannot stay in the cache.
+# prints the stamp of the patches and the SDL2 build that setup.sh compares
+# with the install's. The stamp baked into the cached source tree is kept
+# inside the tree, and the tree is recreated from the cached tarball when the
+# two differ, so a patch that was removed or edited cannot stay in the cache.
 set -eu
 VERSION="${CROSSOVER_VERSION:-26.3.0}"
 ROOT="${0:A:h:h:h}"
 PATCHES=("${0:A:h}"/patches/*.patch(N))
-stamp() { (( ${#PATCHES} )) && cat "${PATCHES[@]}" | shasum -a 256 | cut -c1-64 || true; }
+# "with SDL2" marks the installs whose HID bus has SDL, so setup.sh rebuilds
+# the ones from before it.
+stamp() { { cat "${PATCHES[@]}" /dev/null; print 'with SDL2'; } | shasum -a 256 | cut -c1-64; }
 if [[ ${1-} == --stamp ]]; then stamp; exit 0; fi
-DEPS_REAL="${DEPS:?set DEPS to an x86_64 prefix with FreeType and GnuTLS}"
+DEPS_REAL="${DEPS:?set DEPS to an x86_64 prefix with FreeType, GnuTLS and SDL2}"
 # Wine's build splits flags at spaces, and both the project and the deps
 # can live under folders with spaces in their names. Space-free links to
 # them keep every path in the build free of spaces. The build's own link is
@@ -37,7 +40,8 @@ BUILD="$ALIAS/target-$BUILD"
 # The deps are copied, and each library's recorded path is pointed at the
 # copy, because a prefix built elsewhere may record a folder that is gone.
 DEPS="$BUILD/deps"
-if [[ ! -f $DEPS/.relinked ]]; then
+# A copy from before SDL2 was in the deps is made again.
+if [[ ! -f $DEPS/.relinked || ! -f $DEPS/lib/libSDL2-2.0.0.dylib ]]; then
   rm -rf "$DEPS"
   ditto "$DEPS_REAL" "$DEPS"
   for lib in "$DEPS"/lib/*.dylib(.N); do
@@ -51,6 +55,7 @@ if [[ ! -f $DEPS/.relinked ]]; then
   done
   touch "$DEPS/.relinked"
 fi
+[[ -f $DEPS/lib/libSDL2-2.0.0.dylib ]] || { echo "$DEPS_REAL has no SDL2: build it with tools/macos/build-deps.sh" >&2; exit 1; }
 WORK="$BUILD/crossover"
 OBJ="$WORK/build"
 PREFIX="$BUILD/wine-cx"
@@ -109,11 +114,12 @@ fi
 patch_paths() { grep -h '^+++ ' "$@" /dev/null | awk '{sub(/^b\//, "", $2); print $2}' | sort -u; }
 
 # An installed Wine has D3DMetal's DLLs copied over Wine's own, and make
-# install would put Wine's back. So it gets only its server and ntdll's Unix
-# library rebuilt, which D3DMetal does not replace. That is enough only
-# while neither the patches baked into the installed Wine nor the current
-# ones change anything but those: the sorted paths of the applied patches
-# are recorded next to the install stamp, and a path outside server/ and
+# install would put Wine's back. So it gets only its server, ntdll's Unix
+# library and the HID bus's (winebus.so, where SDL2 support lives) rebuilt,
+# which D3DMetal does not replace. That is enough only while neither the
+# patches baked into the installed Wine nor the current ones change anything
+# but the server and ntdll: the sorted paths of the applied patches are
+# recorded next to the install stamp, and a path outside server/ and
 # dlls/ntdll/unix/ on either side forces a full reinstall.
 installed=0
 PATCH_PATHS="$PREFIX/.victory-patch-paths"
@@ -140,7 +146,8 @@ done
 stamp > "$SRC_STAMP"
 
 cd "$OBJ"
-if [[ ! -f Makefile ]]; then
+# A build configured before SDL2 was in the deps is configured again.
+if [[ ! -f Makefile ]] || ! grep -q '^#define SONAME_LIBSDL2 ' include/config.h 2> /dev/null; then
   echo "configuring CrossOver Wine"
   # The prefix has spaces in it, so autoconf's default site file path would
   # be split at the first one. No site file is needed.
@@ -155,18 +162,26 @@ if [[ ! -f Makefile ]]; then
     PKG_CONFIG_PATH="$DEPS/lib/pkgconfig" \
     FREETYPE_CFLAGS="-I$DEPS/include/freetype2" FREETYPE_LIBS="-L$DEPS/lib -lfreetype" \
     GNUTLS_CFLAGS="-I$DEPS/include" GNUTLS_LIBS="-L$DEPS/lib -lgnutls" \
-    --without-gstreamer --without-sdl --without-cups --without-sane --without-krb5 \
+    SDL2_CFLAGS="-I$DEPS/include/SDL2 -D_THREAD_SAFE" SDL2_LIBS="-L$DEPS/lib -lSDL2" \
+    --without-gstreamer --without-cups --without-sane --without-krb5 \
     --without-netapi --without-pcap --without-usb --without-v4l2 --without-capi \
     --without-gphoto --without-x --without-wayland --without-pulse --without-alsa \
     --without-oss --without-udev --without-inotify --without-vulkan --without-opencl \
     --without-ffmpeg > configure.log 2>&1 || { tail -20 configure.log; exit 1; }
+  # Without SDL2 the HID bus drops game controllers: their IOHID devices
+  # are left to SDL, so XInput would see none.
+  grep -q '^#define SONAME_LIBSDL2 ' include/config.h || { echo "configure did not find SDL2 in $DEPS, see $OBJ/configure.log" >&2; exit 1; }
 fi
 if (( installed )); then
-  echo "rebuilding the server and ntdll of the installed CrossOver Wine"
-  x86 make -j"$(sysctl -n hw.ncpu)" server/wineserver dlls/ntdll/ntdll.so > make.log 2>&1 || { grep -E 'error:|\*\*\*' make.log | grep -v Wno-error | head -5; exit 1; }
+  echo "rebuilding the server, ntdll and HID bus of the installed CrossOver Wine"
+  x86 make -j"$(sysctl -n hw.ncpu)" server/wineserver dlls/ntdll/ntdll.so dlls/winebus.sys/winebus.so > make.log 2>&1 || { grep -E 'error:|\*\*\*' make.log | grep -v Wno-error | head -5; exit 1; }
   rm -f "$PREFIX/.victory-patches" "$PATCH_PATHS"
   install -m 755 server/wineserver "$PREFIX/bin/wineserver"
   install -m 755 dlls/ntdll/ntdll.so "$PREFIX/lib/wine/x86_64-unix/ntdll.so"
+  install -m 755 dlls/winebus.sys/winebus.so "$PREFIX/lib/wine/x86_64-unix/winebus.so"
+  # install removes the old file first. A dylib written over in place keeps
+  # its old code signature in the kernel, and Rosetta then fails to load it.
+  install -m 755 "$DEPS/lib/libSDL2-2.0.0.dylib" "$PREFIX/lib/"
 else
   echo "building CrossOver Wine"
   x86 make -j"$(sysctl -n hw.ncpu)" > make.log 2>&1 || { grep -E 'error:|\*\*\*' make.log | grep -v Wno-error | head -5; exit 1; }
@@ -176,7 +191,11 @@ else
   rm -f "$PREFIX/.victory-patches" "$PATCH_PATHS"
   rm -rf "$PREFIX/lib/external/D3DMetal.framework"
   x86 make install > install.log 2>&1
-  cp -f "$DEPS"/lib/lib{gmp.10,nettle.8,hogweed.6,gnutls.30,freetype.6}.dylib "$PREFIX/lib/"
+  # A full reinstall can run over an existing prefix, whose libraries must
+  # be replaced with install (see above), not written over in place.
+  for lib in gmp.10 nettle.8 hogweed.6 gnutls.30 freetype.6 SDL2-2.0.0; do
+    install -m 755 "$DEPS/lib/lib$lib.dylib" "$PREFIX/lib/"
+  done
 fi
 patch_paths "${PATCHES[@]}" > "$PATCH_PATHS"
 stamp > "$PREFIX/.victory-patches"
