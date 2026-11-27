@@ -266,6 +266,7 @@ fn fill(rig: &mut Rig, targets: &[ID3D12Resource], textures: bool) {
             // SAFETY: live resources.
             unsafe {
                 if textures {
+                    let d = t.GetDesc();
                     let src = D3D12_TEXTURE_COPY_LOCATION {
                         pResource: std::mem::ManuallyDrop::new(Some(upload.clone())),
                         Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
@@ -274,10 +275,10 @@ fn fill(rig: &mut Rig, targets: &[ID3D12Resource], textures: bool) {
                                 Offset: 0,
                                 Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
                                     Format: DXGI_FORMAT_R8G8B8A8_UNORM,
-                                    Width: SIDE,
-                                    Height: SIDE,
+                                    Width: d.Width as u32,
+                                    Height: d.Height,
                                     Depth: 1,
-                                    RowPitch: SIDE * 4,
+                                    RowPitch: d.Width as u32 * 4,
                                 },
                             },
                         },
@@ -504,4 +505,191 @@ fn footprint_probe() {
     // Wait longer, for anything given back late.
     std::thread::sleep(Duration::from_secs(15));
     steps.mark("released, 15 s later");
+}
+
+/// One heap of the model below: its id, heap and free ranges.
+type ModelHeap = (u64, ID3D12Heap, std::collections::BTreeMap<u64, u64>);
+
+/// `crate::heap_fit`'s model (`emptying_sparse_heaps_holds_fewer_heaps_in_the_model`)
+/// on real heaps of 64 MiB and placed textures written by copies: a
+/// world's worth of textures (2 GiB), then fewer (0.7 GiB), each used in
+/// half the passes and given up after three idle ones, with or without one
+/// sparse heap emptied a pass (`crate::heap_fit::to_empty`). Empty heaps
+/// past two are released, as `crate::placement` does. Returns the heaps
+/// held at the end.
+fn sparse_heaps(rig: &mut Rig, emptying: bool) -> Vec<ModelHeap> {
+    use crate::heap_fit::{HeapUse, give, pick, take, to_empty};
+    const K: u64 = 64 << 10;
+    let device = rig.device.clone();
+    let mut rng = 42u64;
+    let mut next = move || {
+        rng ^= rng << 13;
+        rng ^= rng >> 7;
+        rng ^= rng << 17;
+        rng
+    };
+    let mut heaps: Vec<ModelHeap> = Vec::new();
+    let mut ids = 0;
+    // (heap id, offset, size, last pass used, texture).
+    let mut held: Vec<(u64, u64, u64, u64, ID3D12Resource)> = Vec::new();
+    let mut live = 0;
+    let at = |heaps: &[ModelHeap], id| heaps.iter().position(|h| h.0 == id).unwrap();
+    // Places a texture of `side` x `side`, written later; its heap and offset.
+    let mut place = |heaps: &mut Vec<ModelHeap>, side: u32, avoid: Option<u64>| {
+        let desc = texture_desc_sized(side);
+        // SAFETY: a plain query.
+        let size = unsafe { device.GetResourceAllocationInfo(0, &[desc]) }
+            .SizeInBytes
+            .next_multiple_of(K);
+        let skip = avoid.map(|a| at(heaps, a));
+        let i = pick(heaps.iter().map(|h| &h.2), size, K, skip).unwrap_or_else(|| {
+            heaps.push((
+                ids,
+                heap(&device, D3D12_HEAP_FLAG_ALLOW_ONLY_NON_RT_DS_TEXTURES),
+                [(0, CHUNK)].into(),
+            ));
+            ids += 1;
+            heaps.len() - 1
+        });
+        let offset = take(&mut heaps[i].2, size, K).unwrap();
+        let t = placed(
+            &device,
+            &heaps[i].1,
+            offset,
+            &desc,
+            D3D12_RESOURCE_STATE_COPY_DEST,
+        );
+        (heaps[i].0, offset, size, t)
+    };
+    let rounds = 60;
+    for round in 0..=rounds {
+        let target = if round < rounds / 2 {
+            2048
+        } else {
+            2048 - 1300 * (round - rounds / 2) / (rounds / 2)
+        } * MB;
+        let mut i = 0;
+        while i < held.len() {
+            if next() % 2 == 0 {
+                held[i].3 = round;
+            }
+            if round > 0 && round - held[i].3 >= 3 {
+                let (h, offset, size, ..) = held.swap_remove(i);
+                let h = at(&heaps, h);
+                give(&mut heaps[h].2, offset, size);
+                live -= size;
+            } else {
+                i += 1;
+            }
+        }
+        let mut emptied = None;
+        let mut fresh = Vec::new();
+        if emptying {
+            let uses: Vec<HeapUse> = heaps
+                .iter()
+                .map(|(id, _, free)| HeapUse {
+                    id: *id,
+                    free: free.values().sum(),
+                    may_go: held
+                        .iter()
+                        .filter(|t| t.0 == *id && t.3 < round)
+                        .map(|t| t.2)
+                        .sum(),
+                })
+                .collect();
+            emptied = to_empty(&uses, CHUNK);
+            if let Some(e) = emptied {
+                let (gone, kept): (Vec<_>, Vec<_>) = held.drain(..).partition(|t| t.0 == e);
+                held = kept;
+                for (h, offset, size, last, t) in gone {
+                    let side = t_side(&t);
+                    drop(t);
+                    let h = at(&heaps, h);
+                    give(&mut heaps[h].2, offset, size);
+                    if next() % 100 < 85 {
+                        let (h, offset, size, t) = place(&mut heaps, side, emptied);
+                        fresh.push(t.clone());
+                        held.push((h, offset, size, last, t));
+                    } else {
+                        live -= size;
+                    }
+                }
+            }
+        }
+        while live < target {
+            // 128 to 2048 texels square: 64 KiB to 16 MiB, small ones most often.
+            let side = 128u32 << (next() % 5).min(next() % 5);
+            let (h, offset, size, t) = place(&mut heaps, side, emptied);
+            fresh.push(t.clone());
+            held.push((h, offset, size, round, t));
+            live += size;
+        }
+        for chunk in fresh.chunks(256) {
+            fill(rig, chunk, true);
+        }
+        let mut spare = 0;
+        heaps.retain(|(_, _, free)| {
+            if free.get(&0) == Some(&CHUNK) {
+                spare += 1;
+                spare <= 2
+            } else {
+                true
+            }
+        });
+    }
+    drop(held);
+    heaps
+}
+
+fn texture_desc_sized(side: u32) -> D3D12_RESOURCE_DESC {
+    D3D12_RESOURCE_DESC {
+        Width: side.into(),
+        Height: side,
+        ..texture_desc(D3D12_RESOURCE_FLAG_NONE)
+    }
+}
+
+fn t_side(t: &ID3D12Resource) -> u32 {
+    // SAFETY: a live resource.
+    unsafe { t.GetDesc() }.Height
+}
+
+#[test]
+#[ignore = "probe: run under Wine on a Mac with tools/macos/footprint-probe.sh footprint_of_sparse_heaps"]
+fn footprint_of_sparse_heaps() {
+    let Some(device) = crate::host::host().map(|h| h.device.clone()) else {
+        eprintln!("FOOTPRINT skipped: no host GPU here");
+        return;
+    };
+    let mut steps = Steps {
+        dir: std::env::var_os("VICTORY_FOOTPRINT_DIR").map(PathBuf::from),
+        n: 0,
+    };
+    let mut rig = Rig::new(&device).expect("rig");
+    let quiet = |rig: &mut Rig| {
+        for _ in 0..2 {
+            rig.run(|_| {}).expect("empty");
+        }
+        settle();
+    };
+    quiet(&mut rig);
+    steps.mark("baseline");
+    for emptying in [false, true] {
+        let heaps = sparse_heaps(&mut rig, emptying);
+        let free: u64 = heaps.iter().flat_map(|h| h.2.values()).sum();
+        quiet(&mut rig);
+        steps.mark(&format!(
+            "model ended, {}: {} heaps, {} MB of them free",
+            if emptying {
+                "emptying sparse heaps"
+            } else {
+                "first fit only"
+            },
+            heaps.len(),
+            free / MB
+        ));
+        drop(heaps);
+        quiet(&mut rig);
+        steps.mark("heaps released");
+    }
 }

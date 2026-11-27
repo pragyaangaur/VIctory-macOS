@@ -2,16 +2,18 @@
 # Runs victory-gpu's footprint probe under Wine and D3DMetal and reads
 # `footprint -p` of its Wine process at each step: the rows of graphics
 # memory and the whole footprint, in MB.
-# Usage: tools/macos/footprint-probe.sh [out.tsv]
+# Usage: tools/macos/footprint-probe.sh [test name] [out.tsv]
+# The test is footprint_probe (the default) or footprint_of_sparse_heaps.
 # WINE and WINEPREFIX are passed to tools/macos/test-wine.sh.
 set -e
 cd "$(dirname "$0")/../.."
-OUT="${1:-target/footprint-probe.tsv}"
+TEST="${1:-footprint_probe}"
+OUT="${2:-target/$TEST.tsv}"
 DIR="$(mktemp -d /tmp/victory-footprint.XXXXXX)"
 trap 'rm -rf "$DIR"' EXIT
 VICTORY_FOOTPRINT_DIR="Z:$(printf '%s' "$DIR" | tr / '\\')"
 export VICTORY_FOOTPRINT_DIR
-tools/macos/test-wine.sh -p victory-gpu --lib footprint_probe -- --ignored --nocapture --test-threads=1 &
+tools/macos/test-wine.sh -p victory-gpu --lib "footprint_probe::$TEST" -- --exact --ignored --nocapture --test-threads=1 &
 RUN=$!
 
 # A footprint size ("7177 MB", "2160 KB", "0 B") in MB.

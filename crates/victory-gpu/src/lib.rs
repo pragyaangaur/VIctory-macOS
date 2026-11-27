@@ -59,6 +59,8 @@ pub mod frame;
 #[cfg(windows)]
 mod heap_worker;
 #[cfg(any(windows, test))]
+mod heap_fit;
+#[cfg(any(windows, test))]
 mod hdr_probe;
 mod hold;
 #[cfg(windows)]

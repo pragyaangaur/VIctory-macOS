@@ -5856,13 +5856,15 @@ impl Meter {
             let (heaps, heap_used, heap_free) = crate::placement::stats();
             tracing::info!(
                 "host textures: {textures} ({:.0} MB, {:.0} MB of them used by lists), title textures sharing one {shared} (saving {:.0} MB), replacing one {replaced}; \
-                 heaps of textures {heaps} ({:.0} MB used, {:.0} MB free); \
+                 heaps of textures {heaps} ({:.0} MB used, {:.0} MB free, {} emptied giving up {:.0} MB); \
                  copies between textures of one memory {:.1}/frame, depth twin copies {:.1}/frame",
                 bytes as f64 / 1e6,
                 used as f64 / 1e6,
                 saved as f64 / 1e6,
                 heap_used as f64 / 1e6,
                 heap_free as f64 / 1e6,
+                crate::resource::HEAPS_EMPTIED[0].load(Ordering::Relaxed),
+                crate::resource::HEAPS_EMPTIED[1].load(Ordering::Relaxed) as f64 / 1e6,
                 crate::texture::ALIAS_COPIES.swap(0, Ordering::Relaxed) as f64 / report_frames,
                 crate::twin::COPIES.swap(0, Ordering::Relaxed) as f64 / report_frames,
             );
