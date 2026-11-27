@@ -4740,6 +4740,95 @@ void main(uint3 id : SV_DispatchThreadID) {
         }
     }
 
+    /// Packed targets and their sampled aliases may have different host
+    /// row pitches before promotion is accounted for (5120 vs 10240).
+    #[test]
+    fn a_packed_target_is_sampled_through_its_placed_view() {
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        let slots = Slots::new(2);
+        let read = compile_cs(READ, READS);
+        let write = compile_cs(
+            r#"
+RWTexture2D<float4> target : register(u0);
+[numthreads(8, 8, 1)]
+void main(uint3 id : SV_DispatchThreadID) { target[id.xy] = float4(1, 0, 1, 1); }
+"#,
+            WRITES,
+        );
+        let expected = [1.0f32, 0.0, 1.0, 1.0];
+        let mut samples = Vec::new();
+        for format in [86, 115] {
+            for flags in [1, 4] {
+                let address = title_memory(1 << 20);
+                let view = placed_view(address, texture_words(2560, 8, format, 0x105, 0));
+                if flags == 4 {
+                    // A sampled view created before the target starts in its native format.
+                    let Some(View::Shader(early, _)) =
+                        crate::descriptor::host::placed_texture(&view)
+                    else {
+                        panic!("missing initial packed texture");
+                    };
+                    let native = crate::resource::host_resource(early as This).unwrap();
+                    // SAFETY: a live texture.
+                    assert_eq!(unsafe { native.GetDesc() }.Format.0 as u32, format);
+                }
+                let target =
+                    texture_at_address(address, &texture_words(2560, 8, format, 0x105, flags));
+                let gpu = crate::resource::host_resource(target).expect("host render target");
+                let Some(View::Shader(placed, _)) = crate::descriptor::host::placed_texture(&view)
+                else {
+                    panic!("format {format}, flags {flags}: placed texture missing");
+                };
+                let sampled =
+                    crate::resource::host_resource(placed as This).expect("host sample texture");
+                if crate::resource::target_format(format) != format {
+                    assert!(
+                        crate::descriptor::host::make_view(
+                            &View::Shader(placed, None),
+                            host.cpu_view()
+                        )
+                        .is_some()
+                    );
+                    let other = if format == 86 { 115 } else { 86 };
+                    let wrong = View::Shader(placed, Some([other, 4, 0x1688, 0, 0, 1, 0, 0, 0, 0]));
+                    assert!(crate::descriptor::host::make_view(&wrong, host.cpu_view()).is_none());
+                }
+                slots.make(1, &view);
+                let list = host.new_list().unwrap();
+                if flags == 1 {
+                    crate::list::ensure_state(&list, target, 0x4);
+                    let rtv = host.rtv(&gpu, None);
+                    // SAFETY: a live render target in the writable state.
+                    unsafe { list.list.ClearRenderTargetView(rtv, &expected, None) };
+                } else {
+                    let uav = View::Unordered(
+                        target as usize,
+                        0,
+                        Some([format, 4, 0, 0, 0, 0, 0, 0, 0, 0]),
+                    );
+                    slots.make(0, &uav);
+                    readable(&list, &used(ResourceType::Uav), &uav, false);
+                    run(&list, &slots, &write, 0, None, (1, 1));
+                }
+                let (out, data) = host.shared_buffer(64 * 8 * 16).unwrap();
+                readable(&list, &used(ResourceType::Srv), &view, false);
+                run(&list, &slots, &read, 1, Some(&out), (1, 1));
+                list.close();
+                host.execute(&[&list]);
+                // SAFETY: execute waits for the single dispatch to fill the mapped output.
+                let got = unsafe { data.add((3 * 64 + 5) * 16).cast::<[f32; 4]>().read() };
+                // SAFETY: both resources are live.
+                let (written_format, sampled_format) =
+                    unsafe { (gpu.GetDesc().Format.0, sampled.GetDesc().Format.0) };
+                samples.push((format, flags, written_format, sampled_format, got));
+            }
+        }
+        eprintln!("packed target GPU samples {samples:?}");
+        assert!(samples.iter().all(|s| s.4 == expected), "{samples:?}");
+    }
+
     /// A texture the title wrote, read through tables by two lists of one
     /// submission, is uploaded once; the next submission uploads it again
     /// only after the title writes it (run perf7 uploaded the same textures

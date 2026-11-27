@@ -359,9 +359,12 @@ pub(crate) const SRGB: [(u32, u32); 3] = [(29, 28), (91, 87), (93, 88)];
 #[cfg(windows)]
 pub(crate) fn view_format(this: This) -> Option<u32> {
     let own = pc_format(resource(this).desc.format);
-    let host = host_resource(this)?;
+    let host = host_copy(this)?;
+    if host.promoted_from == Some(own) {
+        return None;
+    }
     // SAFETY: a live resource.
-    let format = unsafe { host.GetDesc() }.Format.0 as u32;
+    let format = unsafe { host.texture.GetDesc() }.Format.0 as u32;
     (format != own).then_some(own)
 }
 
@@ -916,6 +919,8 @@ pub(crate) struct HostTexture {
     /// Formats views may take besides the texture's own family: the host
     /// took them as castable formats when it made the texture.
     pub(crate) castable: Vec<u32>,
+    /// Original packed encoding when the host renders these texels as RGBA8.
+    pub(crate) promoted_from: Option<u32>,
     /// A host copy or resolve wrote it: its contents are the host's, not
     /// title memory's (`crate::texture`).
     pub(crate) host_written: std::sync::atomic::AtomicBool,
@@ -973,6 +978,7 @@ impl HostTexture {
             texture,
             state: state.into(),
             castable,
+            promoted_from: None,
             host_written: false.into(),
             gpu_written: false.into(),
             heap_writable: false.into(),
@@ -1343,13 +1349,11 @@ fn host_desc(desc: &ResourceDesc) -> Option<ResourceDesc> {
     if d.flags & DEPTH != 0 {
         d.flags &= !UNORDERED;
     }
-    const RENDER_TARGET: u32 = 1;
     d.format = if d.flags & (RENDER_TARGET | UNORDERED) != 0 {
         target_format(d.format)
     } else {
         pc_format(d.format)
     };
-    const DENY_SHADER_RESOURCE: u32 = 8;
     if d.flags & DENY_SHADER_RESOURCE == 0
         && let Some(&(_, typeless)) = DEPTH_FORMATS.iter().find(|&&(f, _)| f == d.format)
     {
@@ -1363,9 +1367,13 @@ fn host_desc(desc: &ResourceDesc) -> Option<ResourceDesc> {
     Some(d)
 }
 
+#[cfg(windows)]
+const RENDER_TARGET: u32 = 1;
 const DEPTH: u32 = 2;
 #[cfg(windows)]
 const UNORDERED: u32 = 4;
+#[cfg(windows)]
+const DENY_SHADER_RESOURCE: u32 = 8;
 /// Render target, depth, unordered access: what a host texture allows.
 #[cfg(windows)]
 const USES: u32 = 0x7;
@@ -1433,6 +1441,20 @@ pub(crate) fn castable(format: u32) -> Vec<u32> {
         .collect()
 }
 
+/// [`castable`] under D3DMetal: Metal views a block-compressed texture only
+/// in its own compression, sRGB on or off, and aborts the process on any
+/// other view (a BC7 view of BC5 memory in Series 1.0.2.1's world, M1 Max),
+/// so a block format keeps only its sRGB partner. Memory the title reuses in
+/// another block format gets its own host texture instead (`takes`).
+pub(crate) fn castable_metal(format: u32) -> Vec<u32> {
+    const SRGB_PAIRS: [u32; 8] = [71, 72, 74, 75, 77, 78, 98, 99];
+    let mut c = castable(format);
+    if element(format).is_some_and(|(_, texels)| texels > 1) {
+        c.retain(|&f| SRGB_PAIRS.contains(&format) && SRGB_PAIRS.contains(&f) && family(f) == family(format));
+    }
+    c
+}
+
 /// Live host textures by texture memory: title textures (resource objects
 /// and placed views) of one memory share one.
 #[cfg(windows)]
@@ -1451,12 +1473,13 @@ fn shared_texture(
     clear: *const c_void,
 ) -> Option<std::sync::Arc<HostTexture>> {
     let d = host_desc(desc)?;
+    let title_format = pc_format(desc.format);
     let key = memory_key(address, desc);
     let mut map = MEMORY.lock().unwrap_or_else(|e| e.into_inner());
     let map = map.get_or_insert_with(Default::default);
     let live = key.and_then(|k| map.get(&k)?.upgrade());
     if let Some(t) = &live
-        && takes(t, &d)
+        && takes(t, &d, title_format)
     {
         SHARED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if let Some(host) = crate::host::host() {
@@ -1475,7 +1498,9 @@ fn shared_texture(
     if let Some(k) = key {
         let at = TEXTURES_AT.lock().unwrap_or_else(|e| e.into_inner());
         for r in at.get(&address).into_iter().flatten().map(|&r| resource(r as This)) {
-            if memory_key(address, &r.desc) == Some(k) {
+            if memory_key(address, &r.desc) == Some(k)
+                && (!PACKED_16.contains(&title_format) || pc_format(r.desc.format) == title_format)
+            {
                 d.flags |= host_desc(&r.desc).map_or(0, |h| h.flags & USES);
             }
         }
@@ -1483,7 +1508,14 @@ fn shared_texture(
     // shortcut: title textures of a replaced host texture keep it (placed
     // views move to the new one, `texture_at`); copies (`alias_source`)
     // bridge the two where the shapes allow.
+    // A placed SRV can be the first alias materialized for a known target.
+    if PACKED_16.contains(&title_format) && d.flags & (RENDER_TARGET | UNORDERED) != 0 {
+        d.format = target_format(title_format);
+    }
     let mut t = make_texture(&d, state, clear)?;
+    if PACKED_16.contains(&title_format) && d.format == RGBA8_UNORM {
+        t.promoted_from = Some(title_format);
+    }
     t.key = key;
     let t = std::sync::Arc::new(t);
     if let Some(k) = key {
@@ -1504,13 +1536,19 @@ fn shared_texture(
 /// `d` at its memory: its uses, and a view format of its family or
 /// castable list.
 #[cfg(windows)]
-fn takes(t: &HostTexture, d: &ResourceDesc) -> bool {
+fn takes(t: &HostTexture, d: &ResourceDesc, title_format: u32) -> bool {
     // SAFETY: a live resource.
     let td = unsafe { t.texture.GetDesc() };
     let (flags, own) = (td.Flags.0 as u32, td.Format.0 as u32);
-    d.flags & USES & !flags == 0
-        && (family(d.format) == family(own)
-            || t.castable.iter().any(|&c| family(c) == family(d.format)))
+    if d.flags & USES & !flags != 0 {
+        return false;
+    }
+    if let Some(packed) = t.promoted_from {
+        let permits_sampling = flags & DENY_SHADER_RESOURCE == 0 || d.flags & DENY_SHADER_RESOURCE != 0;
+        return packed == title_format && permits_sampling;
+    }
+    family(d.format) == family(own)
+        || t.castable.iter().any(|&c| family(c) == family(d.format))
 }
 
 /// Whether `this`'s host texture is still its memory's (not replaced by one
@@ -1557,7 +1595,11 @@ fn make_texture(d: &ResourceDesc, state: u32, clear: *const c_void) -> Option<Ho
         ..Default::default()
     };
     let mut texture: Option<ID3D12Resource> = None;
-    let mut castable_formats = if d.flags & DEPTH == 0 { castable(d.format) } else { Vec::new() };
+    let mut castable_formats = match () {
+        () if d.flags & DEPTH != 0 => Vec::new(),
+        () if crate::shader_cache::under_wine() => castable_metal(d.format),
+        () => castable(d.format),
+    };
     let mut initial = crate::host::legal_for(d.flags, crate::host::texture_state(state));
     // In a heap of textures if it fits there (`crate::placement`).
     // SAFETY: the description has the host layout (checked size).
@@ -3283,6 +3325,16 @@ mod tests {
         assert!(castable(98).contains(&95) && castable(98).contains(&77));
         assert!(castable(53).contains(&56) && !castable(53).contains(&55));
         assert!(castable(57).contains(&56) && !castable(57).contains(&68) && !castable(57).contains(&69));
+    }
+
+    /// Under D3DMetal a block format casts only to its sRGB partner; other
+    /// formats keep the whole list.
+    #[test]
+    fn metal_casts_block_formats_only_to_their_srgb_partner() {
+        assert_eq!(castable_metal(98), vec![99]);
+        assert_eq!(castable_metal(72), vec![71]);
+        assert!(castable_metal(83).is_empty() && castable_metal(95).is_empty() && castable_metal(80).is_empty());
+        assert_eq!(castable_metal(42), castable(42));
     }
 
     #[test]

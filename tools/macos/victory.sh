@@ -57,4 +57,16 @@ export WINEDEBUG="${WINEDEBUG:--all}"
 export WINEDLLOVERRIDES="mscoree,mshtml=;winedbg.exe=d;d3d12,d3d12core,dxgi=b${WINEDLLOVERRIDES:+;$WINEDLLOVERRIDES}"
 # Rosetta tells the game about AVX and AVX2, which it may check for.
 export ROSETTA_ADVERTISE_AVX=1
+# macOS 15's Rosetta runs AVX2 but its CPUID leaves it out, so victory's
+# AVX2 check refuses a Mac that can run the game (M1 Max, 15.7.3).
+if [ "$(sw_vers -productVersion | cut -d. -f1)" -ge 15 ]; then
+    export VICTORY_SKIP_CPU_CHECK="${VICTORY_SKIP_CPU_CHECK:-1}"
+fi
+# A game left in the prefix (hung, or its window closed while it still ran)
+# keeps its GPU memory; a second one on top ran a 32 GB Mac out of it and
+# froze the whole display. End it first.
+if [ "${1:-}" = run ]; then
+    "$(dirname "$WINE")/wineserver" -k 2>/dev/null || true
+    "$(dirname "$WINE")/wineserver" -w 2>/dev/null || true
+fi
 exec "$WINE" "$target_dir/$TARGET/release/victory.exe" "$@"
