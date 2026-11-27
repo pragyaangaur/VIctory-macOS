@@ -28,6 +28,8 @@ mod bvh;
 #[path = "half_views.rs"]
 mod half_views;
 mod halves;
+mod packed;
+mod round_mode;
 mod mesh;
 mod predicate;
 #[cfg(test)]
@@ -35,6 +37,8 @@ use barriers::split_wave_barriers;
 use barriers::{in_step, split_wave_barriers_with_step, step_and_cap};
 pub(crate) use mesh::KeptOutputs;
 use mesh::prune_signature;
+use packed::packed_half;
+use round_mode::{round16, round16_after};
 
 type Why = &'static str;
 
@@ -543,65 +547,6 @@ struct Lower<'a> {
     mode16: Option<u8>,
 }
 
-/// The 16/64-bit round mode (MODE bits 3:2: 0 nearest even, 3 toward zero)
-/// after `inst`, from `mode` before it (`None`: not known).
-fn round16_after(inst: &Inst, mode: Option<u8>) -> Option<u8> {
-    match (inst.name(), &inst.fields) {
-        ("s_round_mode", Fields::Sopp { imm }) => Some((imm >> 2 & 3) as u8),
-        (
-            "s_setreg_imm32_b32" | "s_setreg_b32",
-            Fields::Sop {
-                src, imm: Some(h), ..
-            },
-        ) => {
-            let (id, off, size) = (h & 0x3F, h >> 6 & 0x1F, (h >> 11 & 0x1F) + 1);
-            if id != 1 || off >= 4 || off + size <= 2 {
-                return mode;
-            }
-            match src.first() {
-                Some(&Operand::Literal(x)) if off <= 2 && off + size >= 4 => {
-                    Some((x >> (2 - off) & 3) as u8)
-                }
-                _ => None,
-            }
-        }
-        _ => mode,
-    }
-}
-
-/// The 16/64-bit round mode each block starts with: nearest even at the
-/// program's start, then as the MODE writes on the way set it; `None` where
-/// paths that set it differently join (or a write is not a constant).
-fn round16(p: &crate::ir::Program) -> Vec<Option<u8>> {
-    // None: not reached yet; Some(m): the mode (m None: not known).
-    let mut entry: Vec<Option<Option<u8>>> = vec![None; p.blocks.len()];
-    entry[0] = Some(Some(0));
-    let order = crate::ir::reverse_postorder(&p.blocks);
-    loop {
-        let mut changed = false;
-        for &b in &order {
-            let Some(mut m) = entry[b] else { continue };
-            for inst in &p.blocks[b].insts {
-                m = round16_after(inst, m);
-            }
-            for s in p.blocks[b].exit.successors() {
-                let new = match entry[s] {
-                    None => Some(m),
-                    Some(old) if old == m => continue,
-                    Some(_) => Some(None),
-                };
-                if entry[s] != new {
-                    entry[s] = new;
-                    changed = true;
-                }
-            }
-        }
-        if !changed {
-            return entry.into_iter().map(Option::flatten).collect();
-        }
-    }
-}
-
 /// Iterations after which a loop is left (per entry into it), unless
 /// [`super::loop_limit`] says otherwise. The console runs a loop as long as
 /// its data says; data the host has not mirrored yet (a null view reads
@@ -685,43 +630,6 @@ fn reads_mask_as_data(st: &Structured, i: &Inst) -> bool {
         Operand::Scalar { code, .. } if code != NULL => i.read(Reg::S(code)).is_some_and(is_mask),
         _ => false,
     })
-}
-
-/// Where half `h` (dword h / 2, the high half when odd) of the parameter
-/// whose first element is in row `a` comes from, when the console packs
-/// 16-bit values two per dword: a row and channel of `elements`, none for
-/// padding. The console fills its parameters with the 16-bit elements taken
-/// by first channel, then row: each takes whole dwords of the first
-/// parameter with room for it (four dwords each), its channels in order.
-fn packed_half(elements: &[SigElement], a: u8, h: u8) -> Option<(u8, u8)> {
-    let mut halves: Vec<&SigElement> = elements
-        .iter()
-        .filter(|e| e.half && e.kind == 0 && e.row.is_some())
-        .collect();
-    halves.sort_by_key(|e| (e.col, e.row));
-    // (first element's row, (row, channel) per half)
-    type Param = (Option<u32>, Vec<Option<(u8, u8)>>);
-    let mut params: Vec<Param> = Vec::new();
-    for e in halves {
-        let need = usize::from(e.cols.div_ceil(2) * 2);
-        let i = match params.iter().position(|p| p.1.len() + need <= 8) {
-            Some(i) => i,
-            None => {
-                params.push((e.row, Vec::new()));
-                params.len() - 1
-            }
-        };
-        let row = u8::try_from(e.row?).ok()?;
-        let slots = &mut params[i].1;
-        slots.extend((0..e.cols).map(|c| Some((row, e.col + c))));
-        slots.resize(slots.len().next_multiple_of(2), None);
-    }
-    // Two parameters starting in one row would leave the half ambiguous.
-    let mut found = params.iter().filter(|p| p.0 == Some(u32::from(a)));
-    match (found.next(), found.next()) {
-        (Some(p), None) => p.1.get(usize::from(h)).copied().flatten(),
-        _ => None,
-    }
 }
 
 /// Vertex or mesh outputs of 16-bit values (see [`Lower::half_outputs`]),
