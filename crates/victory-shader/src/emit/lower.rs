@@ -465,6 +465,10 @@ struct Lower<'a> {
     balloting: Set<Value>,
     /// Block writing each value.
     def_block: Map<Value, usize>,
+    /// Index in its block of the instruction writing each value (phis have
+    /// none): [`Lower::def_site`] without walking the block, which made
+    /// lowering quadratic in a long block's length.
+    def_index: Map<Value, usize>,
     /// IR block being lowered.
     cur_ir: usize,
     /// Whole-wave sections by block and start index.
@@ -981,6 +985,18 @@ impl<'a> Lower<'a> {
                         .chain(block.phis.iter().map(move |phi| (phi.value, b)))
                 })
                 .collect(),
+            def_index: {
+                let mut at = Map::default();
+                for block in &p.blocks {
+                    for (i, inst) in block.insts.iter().enumerate() {
+                        for w in &inst.writes {
+                            // The first writer, as a walk from the start finds.
+                            at.entry(w.1).or_insert(i);
+                        }
+                    }
+                }
+                at
+            },
             cur_ir: 0,
             sections: HashMap::new(),
             section_out: Set::default(),
@@ -2378,12 +2394,7 @@ impl<'a> Lower<'a> {
         {
             return Err("a register joining a lane mask and data, read as data");
         }
-        let &b = self.def_block.get(&lo).ok_or(ELSEWHERE)?;
-        let inst = p.blocks[b]
-            .insts
-            .iter()
-            .find(|i| i.writes.iter().any(|w| w.1 == lo))
-            .ok_or(ELSEWHERE)?;
+        let (b, _, inst) = self.def_site(lo).ok_or(ELSEWHERE)?;
         let Fields::Sop {
             dst: Some(Operand::Scalar { code, .. }),
             src,
@@ -3345,11 +3356,7 @@ impl<'a> Lower<'a> {
                 .find(|q| q.reg == h)
                 .map(|q| q.value);
         }
-        let b = *self.def_block.get(&lo)?;
-        let inst = p.blocks[b]
-            .insts
-            .iter()
-            .find(|i| i.writes.iter().any(|w| w.1 == lo))?;
+        let (_, _, inst) = self.def_site(lo)?;
         let &(reg, _) = inst.writes.iter().find(|w| w.1 == lo)?;
         inst.write(pick(reg)?)
     }
@@ -10444,11 +10451,7 @@ impl<'a> Lower<'a> {
             let io = self.x.io.inputs.iter().any(|i| i.0 == v);
             return (vgpr && !io).then_some(true);
         };
-        let (i, inst) = p.blocks[b]
-            .insts
-            .iter()
-            .enumerate()
-            .find(|(_, i)| i.writes.iter().any(|w| w.1 == v))?;
+        let (_, i, inst) = self.def_site(v)?;
         let Fields::Valu(f) = &inst.fields else {
             return None;
         };
@@ -11580,11 +11583,9 @@ impl<'a> Lower<'a> {
     /// The block, instruction index, and instruction writing `v`.
     fn def_site(&self, v: Value) -> Option<(usize, usize, &'a Inst)> {
         let b = *self.def_block.get(&v)?;
-        let (i, inst) = self.x.p.blocks[b]
-            .insts
-            .iter()
-            .enumerate()
-            .find(|(_, inst)| inst.writes.iter().any(|w| w.1 == v))?;
+        let i = *self.def_index.get(&v)?;
+        let inst = self.x.p.blocks[b].insts.get(i)?;
+        debug_assert!(inst.writes.iter().any(|w| w.1 == v));
         Some((b, i, inst))
     }
 
