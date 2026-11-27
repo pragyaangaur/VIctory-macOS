@@ -1367,6 +1367,14 @@ extern "system" fn present(
     }
     #[cfg(windows)]
     crate::hdr_probe::on_present(frame);
+    // Draws on the host so far, for the frame recorder's world frames
+    // (`VICTORY_RECORD_AT=w<n>`) and the benchmark: read where
+    // `capture::presented` reads them, so that both tell the same frame as
+    // the world's first.
+    #[cfg(windows)]
+    let drawn = crate::draw::drawn();
+    #[cfg(not(windows))]
+    let drawn = 0;
     #[cfg(all(windows, feature = "diagnostics"))]
     {
         crate::capture::presented(frame);
@@ -1410,17 +1418,18 @@ extern "system" fn present(
             crate::resource::host_transition(*o, s);
         }
         crate::resource::host_transition(resource, state);
+        // The frame recorder's end of a frame (`VICTORY_RECORD`): the picture
+        // is in `state` again.
+        crate::replay::record::present(frame, Some((&texture, state)), drawn);
         #[cfg(feature = "diagnostics")]
         blinks(frame, resource, state, shown);
         #[cfg(not(feature = "diagnostics"))]
         let _ = shown;
+    } else {
+        crate::replay::record::present(frame, None, drawn);
     }
     #[cfg(not(windows))]
     let _ = (planes, plane_parameters);
-    #[cfg(windows)]
-    let drawn = crate::draw::drawn();
-    #[cfg(not(windows))]
-    let drawn = 0;
     crate::bench::on_present(drawn, black_frame);
     S_OK
 }

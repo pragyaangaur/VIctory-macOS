@@ -497,6 +497,9 @@ fn create() -> windows::core::Result<Host> {
             crate::tdr::log();
         }
         let device = device.ok_or_else(windows::core::Error::empty)?;
+        // The frame recorder (`VICTORY_RECORD`, docs/replay.md), before
+        // anything is made with the device: it sees what the device makes.
+        crate::replay::record::from_env(&device);
         let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS2::default();
         let depth_bounds_supported = device
             .CheckFeatureSupport(
@@ -1994,8 +1997,20 @@ pub(crate) fn markers() -> bool {
 }
 
 /// Names a host object for the device-removed report, which names the
-/// allocations a page fault hit (only with device-removed data on).
+/// allocations a page fault hit (only with device-removed data on), and for
+/// the frame recorder (`VICTORY_RECORD`), whose reports name pipelines and
+/// resources by it.
 pub(crate) fn name(object: &impl Interface, text: impl FnOnce() -> String) {
+    if crate::replay::record::on() {
+        let text = text();
+        crate::replay::record::name(object, &text);
+        return name_it(object, || text);
+    }
+    name_it(object, text);
+}
+
+/// [`name`] for the device-removed report alone.
+fn name_it(object: &impl Interface, text: impl FnOnce() -> String) {
     if dred_on()
         && let Ok(object) = object.cast::<ID3D12Object>()
     {

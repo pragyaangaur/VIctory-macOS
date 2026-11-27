@@ -116,6 +116,10 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
     #[cfg(windows)]
     if created {
         spill(&shader, full.as_bytes());
+        // With the frame recorder asked for (`VICTORY_RECORD`), the container
+        // is kept beside its captures, so that a replay can translate it
+        // again (`--retranslate`); without it, one look at a flag.
+        crate::replay::record::container(&full.to_hex()[..16], bytes);
     }
     #[cfg(not(windows))]
     let _ = created;
