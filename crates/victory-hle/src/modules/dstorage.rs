@@ -960,6 +960,8 @@ impl Lanes {
         if elapsed.as_secs() >= 5 {
             let waiting: usize = self.lanes.values().map(|l| l.reads.len()).sum();
             let reading = READING.swap(0, Ordering::Relaxed) as f64 / 1e9;
+            let inflating = INFLATING.swap(0, Ordering::Relaxed) as f64 / 1e9;
+            let inflated = INFLATED.swap(0, Ordering::Relaxed);
             tracing::debug!(
                 requests = *requests,
                 mb_per_s = format_args!("{:.1}", *bytes as f64 / elapsed.as_secs_f64() / 1e6),
@@ -969,6 +971,8 @@ impl Lanes {
                 bcpack_mb = self.bcpack.0 / 1_000_000,
                 bcpack_workers =
                     format_args!("{:.2}", self.bcpack.1.as_secs_f64() / elapsed.as_secs_f64()),
+                zlib_mb = inflated / 1_000_000,
+                zlib_workers = format_args!("{:.2}", inflating / elapsed.as_secs_f64()),
                 page_destinations = std::mem::take(&mut self.pages),
                 waiting,
                 "dstorage: last {:.1} s",
@@ -1499,12 +1503,30 @@ fn execute(request: &Request) -> Result<(), HRESULT> {
 /// that ends short of `out` passes: the title's chunks fill it exactly, and
 /// nothing says that is required.
 fn inflate(source: &[u8], out: &mut [u8]) -> Result<usize, HRESULT> {
-    miniz_oxide::inflate::decompress_slice_iter_to_slice(out, std::iter::once(source), true, false)
-        .map_err(|status| {
-            tracing::debug!(?status, "dstorage: zlib stream");
-            INVALID_DATA
-        })
+    let started = std::time::Instant::now();
+    let inflated = miniz_oxide::inflate::decompress_slice_iter_to_slice(
+        out,
+        std::iter::once(source),
+        true,
+        false,
+    )
+    .map_err(|status| {
+        tracing::debug!(?status, "dstorage: zlib stream");
+        INVALID_DATA
+    });
+    INFLATING.fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    if let Ok(n) = inflated {
+        INFLATED.fetch_add(n as u64, Ordering::Relaxed);
+    }
+    inflated
 }
+
+/// Nanoseconds the workers spent inflating zlib streams, and the bytes they
+/// inflated, since the last debug summary: whether inflating is a part of
+/// streaming worth making faster (under Rosetta `miniz_oxide` inflates about
+/// 380 MB/s a worker on an M5).
+static INFLATING: AtomicU64 = AtomicU64::new(0);
+static INFLATED: AtomicU64 = AtomicU64::new(0);
 
 /// The BCPack format's constant tables, parsed once for the process. If
 /// they do not parse every BCPack request fails: one warning, then debug.
