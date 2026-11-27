@@ -92,7 +92,7 @@ struct Last {
     /// the memory as it was then.
     uploaded: bool,
     /// Tracked memory: the hash of each subresource's bytes last detiled.
-    hashes: Vec<Option<blake3::Hash>>,
+    hashes: Vec<Option<u128>>,
 }
 
 /// Per subresource of `layout` (`mips` per array slice; a 3D texture's
@@ -114,6 +114,58 @@ fn spans(layout: &victory_formats::texture::Layout, count: u32, mips: u32) -> Ve
         })
         .collect::<Option<Vec<_>>>()
         .unwrap_or_default()
+}
+
+/// A 128-bit digest of `bytes`, to tell whether a subresource's bytes changed:
+/// four lanes of folded 64-bit multiplications, 64 bytes a step. It is plain
+/// integer code with no AVX path (blake3 takes its AVX2 code under Rosetta).
+/// It is not cryptographic: the title writes its own textures, and a collision
+/// only leaves a subresource stale until its next change. A change inside one
+/// lane's 16-byte columns must also repeat that lane's 64-bit state, so a
+/// random function would repeat the old digest with probability about 2^-64.
+fn digest(bytes: &[u8]) -> u128 {
+    const K: [u64; 8] = [
+        0xa076_1d64_78bd_642f,
+        0xe703_7ed1_a0b4_28db,
+        0x8ebc_6af0_9c88_c6e3,
+        0x5899_65cc_7537_4cc3,
+        0x1d8e_4e27_c47d_124f,
+        0xeb44_acca_b455_d165,
+        0x9e37_79b9_7f4a_7c15,
+        0xc2b2_ae3d_27d4_eb4f,
+    ];
+    let fold = |a: u64, b: u64| {
+        let p = u128::from(a) * u128::from(b);
+        p as u64 ^ (p >> 64) as u64
+    };
+    let word = |b: &[u8]| {
+        let mut w = [0; 8];
+        w[..b.len()].copy_from_slice(b);
+        u64::from_le_bytes(w)
+    };
+    let mut lanes = [K[0], K[1], K[2], K[3]];
+    let mut step = |block: &[u8; 64]| {
+        for (i, lane) in lanes.iter_mut().enumerate() {
+            let a = word(&block[16 * i..16 * i + 8]);
+            let b = word(&block[16 * i + 8..16 * i + 16]);
+            // A product with a zero factor folds to zero, but the lane still
+            // keeps its rotation and the block's word: neither is forgotten.
+            let rotated = a.rotate_left(23) ^ lane.rotate_left(41);
+            *lane = fold(a ^ K[4 + i], b ^ *lane).wrapping_add(rotated) ^ b;
+        }
+    };
+    let (blocks, rest) = bytes.as_chunks::<64>();
+    for block in blocks {
+        step(block);
+    }
+    let mut last = [0u8; 64];
+    last[..rest.len()].copy_from_slice(rest);
+    step(&last);
+    let len = bytes.len() as u64;
+    let low = fold(lanes[0] ^ K[1], lanes[1] ^ len) ^ fold(lanes[2] ^ K[3], lanes[3] ^ K[5]);
+    let high = fold(lanes[0].rotate_left(32) ^ K[6], lanes[2] ^ len)
+        ^ fold(lanes[1].rotate_left(32) ^ K[7], lanes[3] ^ K[2]);
+    u128::from(low) << 64 | u128::from(high)
 }
 
 /// Staging buffers for detiles to reuse, by size: the menu movie rewrites
@@ -693,7 +745,7 @@ impl Staging {
                         last.hashes[i] = None;
                         return true;
                     }
-                    let hash = blake3::hash(&read[a..b]);
+                    let hash = digest(&read[a..b]);
                     last.hashes[i].replace(hash) != Some(hash)
                 })
                 .map(|i| i as u32)
@@ -1513,5 +1565,56 @@ mod tests {
         assert!(skip_same_frame(&uploaded, &checked, 10));
         assert!(!skip_same_frame(&uploaded, &checked, 11));
         assert!(skip_same_frame(&uploaded, &checked, 11));
+    }
+
+    #[test]
+    fn digest_tells_bytes_and_lengths_apart() {
+        let zeros = vec![0u8; 400];
+        let mut seen: Vec<u128> = (0..400).map(|n| digest(&zeros[..n])).collect();
+        for at in 0..400 {
+            for value in [1u8, 0x80, 0xff] {
+                let mut bytes = zeros.clone();
+                bytes[at] = value;
+                seen.push(digest(&bytes));
+            }
+        }
+        let text: Vec<u8> = (0..400u32).map(|i| ((i * 37) >> 2) as u8).collect();
+        for at in 0..399 {
+            let mut bytes = text.clone();
+            bytes.swap(at, at + 1);
+            if bytes != text {
+                seen.push(digest(&bytes));
+            }
+        }
+        seen.push(digest(&text));
+        let n = seen.len();
+        seen.sort_unstable();
+        seen.dedup();
+        assert_eq!(seen.len(), n);
+        assert_eq!(digest(&text), digest(&text.clone()));
+    }
+
+    #[test]
+    fn digest_is_equal_for_equal_bytes_and_changes_with_each_edit() {
+        // A fixed xorshift sequence: the same edits on every run.
+        let mut state = 0x2545_f491_4f6c_dd1du64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for _ in 0..10_000 {
+            let len = (next() % 600) as usize;
+            let bytes: Vec<u8> = (0..len).map(|_| next() as u8).collect();
+            assert_eq!(digest(&bytes), digest(&bytes.clone()));
+            if len == 0 {
+                continue;
+            }
+            let mut edited = bytes.clone();
+            let at = next() as usize % len;
+            edited[at] ^= 1 + (next() % 255) as u8;
+            assert_ne!(digest(&bytes), digest(&edited), "a byte at {at} changed");
+        }
     }
 }
