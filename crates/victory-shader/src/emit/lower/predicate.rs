@@ -630,10 +630,24 @@ fn match_skip_guard(
         return None;
     }
     // Only predicate if at least one block in `region_set` needs `in_step`.
-    if !region_set.iter().any(|&b| needs[b] && !plan.step[b]) {
+    if !region_set.iter().any(|&b| needs[b] && !plan.step[b])
+        || has_writelane(p, &region_set)
+    {
         return None;
     }
     Some(body)
+}
+
+/// `v_writelane_b32` ignores `EXEC` on hardware: linearizing a branch and
+/// selecting at the merge would discard writes to lanes that were inactive
+/// in the branch (#497).
+fn has_writelane(p: &Program, blocks: &Set<usize>) -> bool {
+    blocks.iter().any(|&b| {
+        p.blocks[b]
+            .insts
+            .iter()
+            .any(|inst| inst.name() == "v_writelane_b32")
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -722,7 +736,9 @@ fn match_sese_diamond(
     {
         return None;
     }
-    if !region_set.iter().any(|&b| needs[b] && !plan.step[b]) {
+    if !region_set.iter().any(|&b| needs[b] && !plan.step[b])
+        || has_writelane(p, &region_set)
+    {
         return None;
     }
     let mut region: Vec<usize> = region_set.into_iter().collect();
@@ -840,7 +856,7 @@ fn match_lockstep_loop(
     if eff_preds(exits, &plan.dead_blocks, exit) != [latch] {
         return None;
     }
-    if !body.iter().any(|&b| needs[b] && !plan.step[b]) {
+    if !body.iter().any(|&b| needs[b] && !plan.step[b]) || has_writelane(p, &body) {
         return None;
     }
 

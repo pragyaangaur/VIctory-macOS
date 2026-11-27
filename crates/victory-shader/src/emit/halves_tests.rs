@@ -1103,6 +1103,7 @@ fn differences_in(
 
 /// [`differences_in`] with custom contents for the structured SRV buffer at
 /// table dword 8.
+#[cfg(windows)]
 #[allow(clippy::too_many_arguments)]
 fn differences_with_buffer(
     wave64: bool,
@@ -2419,6 +2420,7 @@ fn the_predication_test_programs_are_what_their_comments_say() {
 }
 
 #[test]
+#[cfg(windows)]
 fn predicated_early_out_matches_the_console_on_every_gpu() {
     let mut failed = Vec::new();
     for (keep_below, limit) in [(true, 40), (false, 35)] {
@@ -2441,6 +2443,7 @@ fn predicated_early_out_matches_the_console_on_every_gpu() {
 }
 
 #[test]
+#[cfg(windows)]
 fn predicated_diamond_matches_the_console_on_every_gpu() {
     let words = diamond_program();
     let n = native(&words, true, 64, 256);
@@ -2456,6 +2459,7 @@ fn predicated_diamond_matches_the_console_on_every_gpu() {
 }
 
 #[test]
+#[cfg(windows)]
 fn half_add_reduction_across_halves_matches_the_console_on_every_gpu() {
     let words = half_add_reduction();
     let mut failed = Vec::new();
@@ -2483,6 +2487,7 @@ fn half_add_reduction_across_halves_matches_the_console_on_every_gpu() {
 }
 
 #[test]
+#[cfg(windows)]
 fn uniform_buffer_load_loop_across_halves_matches_the_console_on_every_gpu() {
     let words = buffer_load_uniform_loop();
     let mut failed = Vec::new();
@@ -2723,6 +2728,7 @@ fn the_extended_halves_programs_are_what_their_comments_say() {
 }
 
 #[test]
+#[cfg(windows)]
 fn skip_guard_with_uniform_loop_matches_the_console_on_every_gpu() {
     let mut failed = Vec::new();
     for keep_from in [20u32, 36u32] {
@@ -2753,6 +2759,7 @@ fn skip_guard_with_uniform_loop_matches_the_console_on_every_gpu() {
 }
 
 #[test]
+#[cfg(windows)]
 fn wave_scalarization_lockstep_loop_matches_the_console_on_every_gpu() {
     let words = wave_scalarization_loop_program();
     let mut failed = Vec::new();
@@ -2785,6 +2792,7 @@ fn wave_scalarization_lockstep_loop_matches_the_console_on_every_gpu() {
 }
 
 #[test]
+#[cfg(windows)]
 fn trampoline_early_out_and_mask_data_match_the_console_on_every_gpu() {
     let words = trampoline_early_out_mask_program();
     let n = native(&words, true, 64, 0);
@@ -2824,6 +2832,7 @@ fn thread_ticket_env_toggle_defaults_on() {
 /// blocks from the group-shared ticket counter so every console thread id in
 /// the group is executed once on 32-lane hardware (issue #1243).
 #[test]
+#[cfg(windows)]
 fn thread_ticket_relabels_2d_and_partial_tail_groups_bijectively() {
     // Console wave32 program: triggers `console_lanes` via `v_mbcnt_lo_u32_b32`,
     // computes `slot = (y * 32 + x) * 4`, and stores `1` to raw UAV `s[40:43]`.
@@ -2940,4 +2949,35 @@ fn thread_ticket_relabels_2d_and_partial_tail_groups_bijectively() {
 
     let got_40 = run(lowered_40, 40);
     assert_eq!(got_40, vec![1u32; 40], "all 40 threads (32 full + 8 partial) must run once");
+}
+
+/// A divergent branch containing `v_writelane_b32` must not be predicated:
+/// `v_writelane_b32` ignores `EXEC` on hardware, whereas a linear merge
+/// `select` discards the write for lanes inactive in the branch (#497).
+#[test]
+fn predicated_branch_refuses_writelane_so_whole_wave_retry_can_take_it() {
+    // if (v0 >= 40) { v_writelane_b32 v5, 0x777, 5; v_readlane_b32 s8, v5, 5; }
+    // store s8 to UAV so the cross-half read and writelane stay live.
+    let mut w = PROLOGUE.to_vec();
+    w.extend([
+        0x7E0A_0280, // v_mov_b32 v5, 0
+        0x7E10_0280, // v_mov_b32 v8, 0
+        0x7D86_00A8, // v_cmp_le_u32 vcc, 40, v0
+        0xBE94_246A, // s_and_saveexec_b64 s[20:21], vcc
+        0xBF88_0006, // s_cbranch_execz +6
+        0xD761_0005,
+        0x0001_0AFF,
+        0x0000_0777, // v_writelane_b32 v5, 0x777, 5
+        0xD760_0008,
+        0x0001_0B05, // v_readlane_b32 s8, v5, 5
+        0x7E10_0208, // v_mov_b32 v8, s8
+        0x87FE_147E, // s_or_b64 exec, exec, s[20:21]
+    ]);
+    w.extend(store(8, 0));
+    w.push(S_ENDPGM);
+    let n = native(&w, true, 64, 0);
+    // Per-lane halves lowering must NOT predicate the skip-guard around
+    // v_writelane_b32; it refuses the cross-half read instead, leaving
+    // whole-wave retry (#435) to handle it.
+    assert!(lowered_with(&n, true, true).is_err());
 }
