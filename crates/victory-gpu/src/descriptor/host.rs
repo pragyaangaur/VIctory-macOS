@@ -54,8 +54,8 @@ pub(crate) struct HostHeap {
     /// [`HostHeap::remake_unordered`] once shaders write through heaps.
     nulled_unordered: Mutex<Vec<u32>>,
     /// Where the search for free dynamic slots starts, and which are taken
-    /// (by lists not yet reset).
-    next: Mutex<(u32, Vec<bool>)>,
+    /// (by lists not yet reset), a bit for each.
+    next: Mutex<(u32, Vec<u64>)>,
     /// Slot pairs kept for host copies' views (`crate::memory`), past the
     /// dynamic slots and below the null buffer views: the next never
     /// taken, those given back, and where they end.
@@ -242,7 +242,7 @@ impl HostHeap {
             ready: (0..count).map(|_| AtomicU64::new(0)).collect(),
             kept: Mutex::new(Paged::new((count + extra) as usize)),
             nulled_unordered: Mutex::new(Vec::new()),
-            next: Mutex::new((0, vec![false; extra as usize])),
+            next: Mutex::new((0, vec![0; (extra as usize).div_ceil(64)])),
             pairs: Mutex::new((count + extra, Vec::new())),
             null_root_srv: None,
             pairs_end: match victory_shader::emit::NULL_BUFFER_VIEW {
@@ -373,6 +373,70 @@ pub(crate) fn fallback_samplers() -> Option<&'static HostHeap> {
     .as_ref()
 }
 
+/// The first of `n` clear bits in a row within `[from, to)` of `taken`
+/// (a set of slots, a bit each), if there are any. A word's bits are
+/// looked at together.
+fn free_run(taken: &[u64], from: usize, to: usize, n: usize) -> Option<usize> {
+    let (mut at, mut run) = (from, 0);
+    while at < to {
+        let room = (64 - at % 64).min(to - at);
+        let window = u64::MAX >> (64 - room);
+        // Bit p: slot `at + p` is clear.
+        let free = !(taken[at / 64] >> (at % 64)) & window;
+        // The clear slots from `at` on, which go on a run begun before `at`.
+        let lead = ((!free).trailing_zeros() as usize).min(room);
+        if run + lead >= n {
+            return Some(at - run);
+        }
+        if n <= 64 {
+            let fits = starts(free, n);
+            if fits != 0 {
+                return Some(at + fits.trailing_zeros() as usize);
+            }
+        }
+        if lead == room {
+            run += room;
+        } else {
+            run = (free << (64 - room)).leading_ones() as usize;
+        }
+        at += room;
+    }
+    None
+}
+
+/// Bit p set when bits p to p + n - 1 of `free` are all set (n <= 64):
+/// runs of 1, 2, 4... bits are joined until they make n.
+fn starts(free: u64, n: usize) -> u64 {
+    let (mut acc, mut len, mut cur, mut pow, mut rem) = (u64::MAX, 0usize, free, 1usize, n);
+    while rem > 0 {
+        if rem & 1 == 1 {
+            acc = if len == 0 { cur } else { acc & (cur >> len) };
+            len += pow;
+        }
+        rem >>= 1;
+        if rem > 0 {
+            cur &= cur >> pow;
+            pow *= 2;
+        }
+    }
+    acc
+}
+
+/// Sets (`on`) or clears the bits of `taken` from `from` to `to`.
+fn set_taken(taken: &mut [u64], from: usize, to: usize, on: bool) {
+    let mut at = from;
+    while at < to {
+        let (bit, room) = (at % 64, (64 - at % 64).min(to - at));
+        let mask = (u64::MAX >> (64 - room)) << bit;
+        if on {
+            taken[at / 64] |= mask;
+        } else {
+            taken[at / 64] &= !mask;
+        }
+        at += room;
+    }
+}
+
 impl HostHeap {
     /// `n` consecutive free dynamic slots (view heaps only), taken until
     /// [`HostHeap::release`]: the first's index.
@@ -388,30 +452,16 @@ impl HostHeap {
         let cursor = *next as usize;
         let end = self.dynamic as usize;
         let second_end = cursor.saturating_add(n.saturating_sub(1)).min(end);
-        let starts = (cursor..end).chain(0..second_end);
-        let mut run = 0;
-        let mut found = None;
-        let mut last = usize::MAX;
-        for at in starts {
-            // A run cannot wrap past the end.
-            if at != last.wrapping_add(1) {
-                run = 0;
-            }
-            last = at;
-            run = if taken[at] { 0 } else { run + 1 };
-            if run == n {
-                found = Some(at + 1 - n);
-                break;
-            }
-        }
-        let Some(first) = found else {
+        let Some(first) =
+            free_run(taken, cursor, end, n).or_else(|| free_run(taken, 0, second_end, n))
+        else {
             static ONCE: std::sync::Once = std::sync::Once::new();
             ONCE.call_once(|| {
                 tracing::warn!(n, "no free dynamic descriptor slots: a table is not made")
             });
             return None;
         };
-        taken[first..first + n].fill(true);
+        set_taken(taken, first, first + n, true);
         *next = ((first + n) % self.dynamic as usize) as u32;
         Some(self.count + first as u32)
     }
@@ -462,9 +512,7 @@ impl HostHeap {
         };
         let mut guard = self.next.lock().unwrap_or_else(|e| e.into_inner());
         let end = (at + n).min(self.dynamic) as usize;
-        if let Some(slots) = guard.1.get_mut(at as usize..end) {
-            slots.fill(false);
-        }
+        set_taken(&mut guard.1, at as usize, end, false);
     }
 
     /// Makes slot `index` (a dynamic one) from `view`; a null view if the
@@ -2849,6 +2897,47 @@ mod tests {
         heap.release(a, 50);
         assert_eq!(heap.dynamic(50), Some(4));
         assert_eq!(heap.dynamic(40), Some(4 + heap.dynamic - 40));
+    }
+
+    #[test]
+    fn free_runs_are_found_across_words() {
+        // Slots 0-69, 100-109 and 201-255 taken: free runs 70-99, 110-200
+        // and 256-300 (the last one past a word's end, `to` at 301).
+        let mut taken = vec![0u64; 5];
+        set_taken(&mut taken, 0, 70, true);
+        set_taken(&mut taken, 100, 110, true);
+        set_taken(&mut taken, 201, 256, true);
+        assert_eq!(free_run(&taken, 0, 301, 30), Some(70));
+        assert_eq!(free_run(&taken, 0, 301, 31), Some(110));
+        assert_eq!(free_run(&taken, 0, 301, 91), Some(110));
+        assert_eq!(free_run(&taken, 0, 301, 92), None);
+        assert_eq!(free_run(&taken, 0, 200, 91), None, "a run ends before `to`");
+        assert_eq!(free_run(&taken, 0, 201, 91), Some(110));
+        assert_eq!(free_run(&taken, 120, 301, 81), Some(120));
+        assert_eq!(free_run(&taken, 120, 301, 82), None);
+        // Every other slot taken: no two clear in a row.
+        let alternate = [0x5555_5555_5555_5555u64; 2];
+        assert_eq!(free_run(&alternate, 0, 128, 2), None);
+        assert_eq!(free_run(&alternate, 0, 128, 1), Some(1));
+        assert_eq!(free_run(&alternate, 3, 128, 1), Some(3));
+        // A word's last (or first) slot taken ends the run there.
+        assert_eq!(free_run(&[1 << 63, 0], 0, 128, 63), Some(0));
+        assert_eq!(free_run(&[1 << 63, 0], 0, 128, 64), Some(64));
+        assert_eq!(free_run(&[0, 1], 0, 128, 64), Some(0));
+        assert_eq!(free_run(&[0, 1], 0, 128, 65), None);
+        // Runs longer than a word, from a clear word on.
+        assert_eq!(free_run(&[0u64; 2], 10, 128, 118), Some(10));
+        assert_eq!(free_run(&[0u64; 2], 10, 128, 119), None);
+        assert_eq!(free_run(&[0u64; 2], 10, 128, 100), Some(10));
+        // 128-191 is a whole free word between taken ones.
+        set_taken(&mut taken, 128, 192, true);
+        assert_eq!(free_run(&taken, 0, 301, 45), Some(256));
+        assert_eq!(free_run(&taken, 0, 301, 46), None);
+        assert_eq!(free_run(&taken, 100, 301, 20), Some(256));
+        set_taken(&mut taken, 128, 192, false);
+        assert_eq!(free_run(&taken, 128, 301, 64), Some(128));
+        set_taken(&mut taken, 128, 192, true);
+        assert_eq!(free_run(&taken, 128, 301, 1), Some(192));
     }
 
     #[test]
