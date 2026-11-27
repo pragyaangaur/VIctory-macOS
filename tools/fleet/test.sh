@@ -155,6 +155,21 @@ no "extra count field" bad '.native.note = 1'
 no "bad setup value" bad '.setup = "maybe"'
 no "array instead of object" validate_result '[1]' "$SHA" m3
 no "not JSON" validate_result 'nope' "$SHA" m3
+no "null chip is rejected" bad '.chip = null'
+no "array chip is rejected" bad '.chip = []'
+no "null macOS version is rejected" bad '.macos = null'
+no "null failures are rejected" bad '.failures = null'
+no "null binaries are rejected" bad '.binaries = null'
+no "multiple JSON documents are rejected" validate_result "$good"$'\n'"$good" "$SHA" m3
+ok "trailing whitespace after one document is accepted" validate_result "$good"$'\n \t' "$SHA" m3
+# jq execution errors must fail validation even when they print no diagnostics.
+validator_error() {
+    (
+        jq() { if [ "${1:-}" = -r ]; then return 5; else command jq "$@"; fi; }
+        validate_result "$good" "$SHA" m3
+    )
+}
+no "validator execution failure is rejected" validator_error
 no "too large" validate_result "$(printf '%9000s' x)" "$SHA" m3
 ok "null suites when setup failed" bad '.setup = "failed" | .native = null | .wine = null | .failures = [] | .binaries = []'
 ok "unknown toolkit version" bad '.gptk = "unknown"'

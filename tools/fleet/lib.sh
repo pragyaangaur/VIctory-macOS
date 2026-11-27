@@ -195,11 +195,15 @@ validate_result() { # JSON COMMIT CHIP [MACOS_MAJOR]
         echo "result is larger than $RESULT_MAX_BYTES bytes"
         return 1
     fi
-    if ! jq -e . > /dev/null 2>&1 <<< "$1"; then
+    # jq normally accepts a stream; a fleet result must be one JSON value.
+    if ! jq -es 'length == 1' > /dev/null 2>&1 <<< "$1"; then
         echo "result is not valid JSON"
         return 1
     fi
-    errors=$(jq -r --arg commit "$2" --arg chip "$3" --arg want_macos "${4:-}" --arg topics "$FLEET_TOPICS" "$FLEET_VALIDATE_JQ" <<< "$1")
+    if ! errors=$(jq -r --arg commit "$2" --arg chip "$3" --arg want_macos "${4:-}" --arg topics "$FLEET_TOPICS" "$FLEET_VALIDATE_JQ" <<< "$1"); then
+        echo "result schema validation failed"
+        return 1
+    fi
     if [ -n "$errors" ]; then
         printf '%s\n' "$errors"
         return 1
