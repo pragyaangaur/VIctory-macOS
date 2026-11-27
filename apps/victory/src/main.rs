@@ -98,7 +98,10 @@ enum Command {
         list: bool,
         /// Translate for a host whose waves have at most 32 lanes (NVIDIA,
         /// Intel), as `run` does there: wave64 compute programs in halves.
-        /// With `--pipelines`, set by the GPU that makes them.
+        /// Under Wine (D3DMetal) also as `run` does there: a group that is
+        /// one wave64 with LDS gets barriers between its halves
+        /// (`VICTORY_NARROW_WAVES=0` or `1` overrides). With `--pipelines`,
+        /// set by the GPU that makes them.
         #[arg(long, conflicts_with = "cache")]
         wave32: bool,
         /// Positive worker thread count (default: every logical core).

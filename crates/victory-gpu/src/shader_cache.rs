@@ -157,8 +157,9 @@ fn bias_as_gradients() -> bool {
 
 /// Whether translations take wave64 programs to run in 32-lane host waves:
 /// under Wine, whose D3DMetal reports 32 lanes and ignores `WaveSize(64)`.
-/// `VICTORY_NARROW_WAVES=0` or `1` overrides.
-fn narrow_waves() -> bool {
+/// `VICTORY_NARROW_WAVES=0` or `1` overrides. Also what the offline
+/// `translate --wave32` follows, so its results match `run`'s.
+pub fn narrow_waves() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| match std::env::var("VICTORY_NARROW_WAVES").as_deref() {
         Ok("0") => false,
