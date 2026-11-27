@@ -1151,6 +1151,19 @@ enum WidenedEvent {
     Heap(std::sync::Arc<crate::bindless::Viewed>),
 }
 
+/// The position of each heap's last event, by heap address (the events hold
+/// the heaps, so no address is reused).
+fn last_heap_events(events: &[WidenedEvent]) -> std::collections::HashMap<usize, usize> {
+    events
+        .iter()
+        .enumerate()
+        .filter_map(|(index, event)| match event {
+            WidenedEvent::Heap(heap) => Some((std::sync::Arc::as_ptr(heap) as usize, index)),
+            WidenedEvent::Write(_) => None,
+        })
+        .collect()
+}
+
 /// A host command list and its allocator, always used together.
 pub(crate) struct HostList {
     allocator: ID3D12CommandAllocator,
@@ -2796,16 +2809,21 @@ impl HostList {
     pub(crate) fn sync_widened(&self) {
         let mut pending = self.widened_pending.lock().unwrap_or_else(|e| e.into_inner());
         let events = std::mem::take(&mut *pending);
+        // Every event of a heap expands to the same ranges (read now), and
+        // the last one's copies come after, so over, the earlier ones'.
+        let last = last_heap_events(&events);
         let mut expanded = Vec::new();
-        for event in events {
+        for (index, event) in events.into_iter().enumerate() {
             match event {
                 WidenedEvent::Write(write) => expanded.push(WidenedEvent::Write(write)),
                 WidenedEvent::Heap(heap) => {
-                    expanded.extend(
-                        crate::bindless::widened_writes(&heap)
-                            .into_iter()
-                            .map(WidenedEvent::Write),
-                    );
+                    if last.get(&(std::sync::Arc::as_ptr(&heap) as usize)) == Some(&index) {
+                        expanded.extend(
+                            crate::bindless::widened_writes(&heap)
+                                .into_iter()
+                                .map(WidenedEvent::Write),
+                        );
+                    }
                 }
             }
         }
@@ -5456,6 +5474,29 @@ mod withholding {
             drop(copy);
             crate::watch::tests::free(p);
         }
+    }
+}
+
+#[cfg(test)]
+mod heap_events {
+    use super::{WidenedEvent, last_heap_events};
+    use crate::bindless::Viewed;
+    use std::sync::Arc;
+
+    /// A sync expands a heap at its last event only: a later write of the
+    /// same heap overrides its earlier ones.
+    #[test]
+    fn a_heap_is_expanded_at_its_last_event() {
+        let (a, b) = (Arc::new(Viewed::default()), Arc::new(Viewed::default()));
+        let events = [
+            WidenedEvent::Heap(a.clone()),
+            WidenedEvent::Heap(b.clone()),
+            WidenedEvent::Heap(a.clone()),
+        ];
+        let last = last_heap_events(&events);
+        assert_eq!(last.len(), 2);
+        assert_eq!(last.get(&(Arc::as_ptr(&a) as usize)), Some(&2));
+        assert_eq!(last.get(&(Arc::as_ptr(&b) as usize)), Some(&1));
     }
 }
 
