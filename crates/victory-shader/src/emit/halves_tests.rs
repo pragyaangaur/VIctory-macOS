@@ -1867,7 +1867,7 @@ fn literal_wave64_recovers_refusals_in_exactly_one_wave() {
         (literal_lane_reads(false), 0, "a lane read that may cross"),
         (literal_lane_reads(true), 0, "a first-lane read"),
         (literal_exec_dwords(), 0, "a lane mask holding lanes elsewhere read as data"),
-        (literal_lane_write(), 0, "a lane read that may cross"),
+        (literal_lane_write(), 0, "a lane write in a predicated block"),
         (literal_mask_loop(false), 0, "a lane read that may cross"),
         (literal_mask_loop(true), 0, "a lane read that may cross"),
         (literal_swizzles(), 0, "a lane read that may cross"),
