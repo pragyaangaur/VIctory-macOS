@@ -242,7 +242,8 @@ pub(crate) fn lower_pruned(
                     | halves::LDS_ACROSS
                     | halves::REDUCTION_ACROSS
                     | halves::FIRST_ACROSS
-                    | halves::READ_ACROSS,
+                    | halves::READ_ACROSS
+                    | halves::WRITE_ACROSS,
                 ..
             })
         )
@@ -4219,7 +4220,7 @@ impl<'a> Lower<'a> {
                 // A lane may have left the program early at a capped back
                 // edge's iteration limit before this block; a group barrier
                 // here would wait for lanes that are gone.
-                if self.cap_escaped.get(b).copied().unwrap_or(false) {
+                if self.cap_escaped.get(b).copied().unwrap_or(false) && super::cap_barriers_refused() {
                     Err("an s_barrier where a lane may have left the program early at a loop's iteration limit")
                 } else {
                     self.group_barrier();
@@ -7586,6 +7587,9 @@ impl<'a> Lower<'a> {
                 int(self, r)
             }
             "v_writelane_b32" => {
+                if !self.x.st.literal && self.pred_active(self.cur_ir).is_some() {
+                    return Err(halves::WRITE_ACROSS);
+                }
                 // The lane given takes the scalar; the others keep their value.
                 let (a, lane) = (s(self, 0)?, s(self, 1)?);
                 let Some(Operand::Vector { reg, .. }) = v.dst else {

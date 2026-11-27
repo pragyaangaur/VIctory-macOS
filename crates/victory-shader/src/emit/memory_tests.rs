@@ -164,6 +164,7 @@ fn typed_store_program(soffset: u8) -> Result<HostShader, crate::ShaderError> {
         view_addresses: lowered.view_addresses,
         heap: lowered.heap,
         heap_writes: lowered.heap_writes,
+        heap_index_sources: Vec::new(),
         view_marks: lowered.view_marks,
         half_views: lowered.half_views,
     };
@@ -331,6 +332,7 @@ fn program() -> HostShader {
         view_addresses: l.view_addresses,
         heap: l.heap,
         heap_writes: l.heap_writes,
+        heap_index_sources: Vec::new(),
         view_marks: l.view_marks,
         half_views: l.half_views,
     };
@@ -546,6 +548,7 @@ fn runs_from_just_before_a_copy_read_its_first_dwords() {
         heap_writes: l.heap_writes,
         view_marks: l.view_marks,
         half_views: l.half_views,
+        heap_index_sources: Vec::new(),
     };
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
         v.validate(&mut shader.dxil.clone())
@@ -749,6 +752,7 @@ fn root_views_read_their_copy_and_zeros_past_it() {
         view_addresses: l.view_addresses,
         heap: l.heap,
         heap_writes: l.heap_writes,
+        heap_index_sources: Vec::new(),
         view_marks: l.view_marks,
         half_views: l.half_views,
     };
@@ -895,6 +899,7 @@ fn writes_through_views_mark_their_pages() {
         view_addresses: l.view_addresses,
         heap: l.heap,
         heap_writes: l.heap_writes,
+        heap_index_sources: Vec::new(),
         view_marks: l.view_marks,
         half_views: l.half_views,
     };
@@ -1157,6 +1162,7 @@ fn heap_direct_texture_reads_mark_their_heap_index() {
         view_addresses: l.view_addresses,
         heap: l.heap,
         heap_writes: l.heap_writes,
+        heap_index_sources: Vec::new(),
         view_marks: l.view_marks,
         half_views: l.half_views,
     };
@@ -1274,6 +1280,7 @@ fn straddling_writes_across_256mib_and_4gib_boundaries_mark_exact_pages() {
         view_addresses: l.view_addresses,
         heap: l.heap,
         heap_writes: l.heap_writes,
+        heap_index_sources: Vec::new(),
         view_marks: l.view_marks,
         half_views: l.half_views,
     };
@@ -1478,6 +1485,7 @@ fn early_depth_stencil_skips_occluded_read_mark_pixel_shaders() {
         view_addresses: vs_lowered.view_addresses,
         heap: vs_lowered.heap,
         heap_writes: vs_lowered.heap_writes,
+        heap_index_sources: Vec::new(),
         view_marks: vs_lowered.view_marks,
         half_views: vs_lowered.half_views,
     };
@@ -1558,6 +1566,7 @@ fn early_depth_stencil_skips_occluded_read_mark_pixel_shaders() {
         view_addresses: ps_lowered.view_addresses,
         heap: ps_lowered.heap,
         heap_writes: ps_lowered.heap_writes,
+        heap_index_sources: Vec::new(),
         view_marks: ps_lowered.view_marks,
         half_views: ps_lowered.half_views,
     };

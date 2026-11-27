@@ -714,6 +714,17 @@ impl Staging {
             || self.tracked.as_ref().is_none_or(|t| !t.clean())
     }
 
+    /// Whether readable title memory has already been uploaded and no tracked
+    /// pages have changed since.
+    pub(crate) fn is_ready(&self) -> bool {
+        use std::sync::atomic::Ordering::Relaxed;
+        if self.tracked.is_some() {
+            self.uploads.load(Relaxed) > 0 && !self.maybe_changed()
+        } else {
+            self.uploaded_once.load(Relaxed)
+        }
+    }
+
     /// A staging buffer with the texture memory detiled into it if it
     /// changed since the last time (and is mapped at all), and the
     /// subresources that changed (only those are detiled and to be copied).

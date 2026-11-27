@@ -23,6 +23,8 @@ use crate::host::HostList;
 use crate::object::This;
 use crate::pipeline::host::HostPipeline;
 
+mod bake_sources;
+
 /// A root argument as the title set it.
 #[derive(Debug, Clone, Default)]
 enum Root {
@@ -1312,6 +1314,9 @@ impl State {
                     }
                 }
             }
+        }
+        if !compute {
+            bake_sources::prepare_bake_sources(self, list, p);
         }
         #[cfg(feature = "diagnostics")]
         crate::capture::binding("");
@@ -3796,7 +3801,7 @@ uint ps() : SV_Target { return 1; }
     }
 
     /// A title buffer of `bytes` in memory of its own.
-    fn buffer(bytes: u64) -> This {
+    pub(super) fn buffer(bytes: u64) -> This {
         let desc: [u32; 14] = [1, 0, 0, 0, bytes as u32, (bytes >> 32) as u32, 1, 1 | 1 << 16, 0, 1, 0, 1, 0, 0];
         let properties = [1u32, 0, 0, 0, 0];
         let mut out = std::ptr::null();

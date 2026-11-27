@@ -20,7 +20,9 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use victory_pipeline::{Cache, Converter};
-use victory_shader::emit::{HostShader, StaticSampler, UserData};
+use victory_shader::emit::{
+    BufferBinding, HeapIndexSource, HostShader, ScalarSource, StaticSampler, UserData,
+};
 use victory_shader::{HwStage, RootType};
 
 static CACHE: OnceLock<Cache> = OnceLock::new();
@@ -275,10 +277,11 @@ pub(crate) fn translation_build(options: victory_shader::emit::Options) -> &'sta
     let no_literal = options.host_wave32 && options.disable_literal_halves;
     // Only where programs run in halves does the rendezvous change them.
     let apart = options.host_wave32 && !options.halves_rendezvous;
-    if !locks && !bias && !narrow && !no_literal && !uav_level0 && !apart {
+    let cap_barriers = victory_shader::emit::cap_barriers_refused();
+    if !locks && !bias && !narrow && !no_literal && !uav_level0 && !apart && !cap_barriers {
         return build();
     }
-    static BUILDS: [OnceLock<[u8; 32]>; 256] = [const { OnceLock::new() }; 256];
+    static BUILDS: [OnceLock<[u8; 32]>; 512] = [const { OnceLock::new() }; 512];
     let n = usize::from(locks)
         | usize::from(bias) << 1
         | usize::from(narrow) << 2
@@ -286,7 +289,8 @@ pub(crate) fn translation_build(options: victory_shader::emit::Options) -> &'sta
         | usize::from(umax) << 4
         | usize::from(no_literal) << 5
         | usize::from(uav_level0) << 6
-        | usize::from(apart) << 7;
+        | usize::from(apart) << 7
+        | usize::from(cap_barriers) << 8;
     BUILDS[n].get_or_init(|| {
         let mut h = blake3::Hasher::new();
         h.update(build());
@@ -313,6 +317,9 @@ pub(crate) fn translation_build(options: victory_shader::emit::Options) -> &'sta
         }
         if apart {
             h.update(b"no halves rendezvous");
+        }
+        if cap_barriers {
+            h.update(b"cap barriers refused");
         }
         *h.finalize().as_bytes()
     })
@@ -498,6 +505,7 @@ fn encode(translation: &Result<HostShader, String>) -> Vec<u8> {
         view_addresses,
         heap,
         heap_writes,
+        heap_index_sources,
         view_marks,
         half_views,
     } = s;
@@ -556,6 +564,74 @@ fn encode(translation: &Result<HostShader, String>) -> Vec<u8> {
             | u32::from(*heap_writes) << 4
             | u32::from(*view_marks) << 5,
     );
+    let encode_binding = |out: &mut Vec<u8>, b: BufferBinding| match b {
+        BufferBinding::Table {
+            slot,
+            table_offset_dwords,
+        } => {
+            word(out, 0);
+            word(out, u32::from(slot));
+            word(out, table_offset_dwords);
+        }
+        BufferBinding::RootDescriptor { slot } => {
+            word(out, 1);
+            word(out, u32::from(slot));
+        }
+    };
+    let encode_scalar = |out: &mut Vec<u8>, sc: ScalarSource| match sc {
+        ScalarSource::Const(v) => {
+            word(out, 0);
+            word(out, v);
+        }
+        ScalarSource::BufferWord {
+            binding,
+            byte_offset,
+        } => {
+            word(out, 1);
+            encode_binding(out, binding);
+            word(out, byte_offset);
+        }
+        ScalarSource::RootConstant { slot, dword } => {
+            word(out, 2);
+            word(out, u32::from(slot));
+            word(out, dword);
+        }
+    };
+    word(&mut out, heap_index_sources.len() as u32);
+    for src in heap_index_sources {
+        match *src {
+            HeapIndexSource::CbvWord {
+                binding,
+                byte_offset,
+                index_offset,
+            } => {
+                word(&mut out, 0);
+                encode_binding(&mut out, binding);
+                word(&mut out, byte_offset);
+                word(&mut out, index_offset);
+            }
+            HeapIndexSource::StructuredLoopField {
+                buffer,
+                stride,
+                field_byte_offset,
+                start,
+                end,
+                end_is_count,
+                inclusive_extra,
+                index_offset,
+            } => {
+                word(&mut out, 1);
+                encode_binding(&mut out, buffer);
+                word(&mut out, stride.unwrap_or(0));
+                word(&mut out, field_byte_offset);
+                encode_scalar(&mut out, start);
+                encode_scalar(&mut out, end);
+                word(&mut out, u32::from(end_is_count));
+                word(&mut out, inclusive_extra);
+                word(&mut out, index_offset);
+            }
+        }
+    }
     word(&mut out, half_views.len() as u32);
     for &(slot, dword) in half_views {
         word(&mut out, u32::from(slot));
@@ -627,6 +703,72 @@ fn decode(bytes: &[u8]) -> Option<Result<HostShader, String>> {
         root_srv_bytes.push((u8::try_from(r.word()?).ok()?, r.word()?));
     }
     let memory = r.word()?;
+    let decode_binding = |r: &mut Reader<'_>| -> Option<BufferBinding> {
+        match r.word()? {
+            0 => Some(BufferBinding::Table {
+                slot: u8::try_from(r.word()?).ok()?,
+                table_offset_dwords: r.word()?,
+            }),
+            1 => Some(BufferBinding::RootDescriptor {
+                slot: u8::try_from(r.word()?).ok()?,
+            }),
+            _ => None,
+        }
+    };
+    let decode_scalar = |r: &mut Reader<'_>| -> Option<ScalarSource> {
+        match r.word()? {
+            0 => Some(ScalarSource::Const(r.word()?)),
+            1 => Some(ScalarSource::BufferWord {
+                binding: decode_binding(r)?,
+                byte_offset: r.word()?,
+            }),
+            2 => Some(ScalarSource::RootConstant {
+                slot: u8::try_from(r.word()?).ok()?,
+                dword: r.word()?,
+            }),
+            _ => None,
+        }
+    };
+    let n = r.word()? as usize;
+    let mut heap_index_sources = Vec::with_capacity(n.min(256));
+    for _ in 0..n {
+        let src = match r.word()? {
+            0 => HeapIndexSource::CbvWord {
+                binding: decode_binding(&mut r)?,
+                byte_offset: r.word()?,
+                index_offset: r.word()?,
+            },
+            1 => {
+                let buffer = decode_binding(&mut r)?;
+                let stride = match r.word()? {
+                    0 => None,
+                    s => Some(s),
+                };
+                let field_byte_offset = r.word()?;
+                let start = decode_scalar(&mut r)?;
+                let end = decode_scalar(&mut r)?;
+                let end_is_count = match r.word()? {
+                    0 => false,
+                    1 => true,
+                    _ => return None,
+                };
+                let inclusive_extra = r.word()?;
+                let index_offset = r.word()?;
+                HeapIndexSource::StructuredLoopField {
+                    buffer,
+                    stride,
+                    field_byte_offset,
+                    start,
+                    end,
+                    end_is_count,
+                    inclusive_extra,
+                    index_offset,
+                }
+            }
+            _ => return None,
+        };
+        heap_index_sources.push(src);
+    }
     let n = r.word()? as usize;
     let mut half_views = Vec::with_capacity(n.min(256));
     for _ in 0..n {
@@ -647,6 +789,7 @@ fn decode(bytes: &[u8]) -> Option<Result<HostShader, String>> {
         view_addresses: memory & 4 != 0,
         heap: memory & 8 != 0,
         heap_writes: memory & 16 != 0,
+        heap_index_sources,
         view_marks: memory & 32 != 0,
         half_views,
     }))
@@ -739,6 +882,41 @@ mod tests {
             view_addresses: true,
             heap: true,
             heap_writes: true,
+            heap_index_sources: vec![
+                HeapIndexSource::CbvWord {
+                    binding: BufferBinding::Table {
+                        slot: 1,
+                        table_offset_dwords: 0,
+                    },
+                    byte_offset: 16,
+                    index_offset: 0,
+                },
+                HeapIndexSource::StructuredLoopField {
+                    buffer: BufferBinding::Table {
+                        slot: 1,
+                        table_offset_dwords: 8,
+                    },
+                    stride: Some(64),
+                    field_byte_offset: 12,
+                    start: ScalarSource::BufferWord {
+                        binding: BufferBinding::Table {
+                            slot: 1,
+                            table_offset_dwords: 0,
+                        },
+                        byte_offset: 4,
+                    },
+                    end: ScalarSource::BufferWord {
+                        binding: BufferBinding::Table {
+                            slot: 1,
+                            table_offset_dwords: 0,
+                        },
+                        byte_offset: 8,
+                    },
+                    end_is_count: false,
+                    inclusive_extra: 1,
+                    index_offset: 0,
+                },
+            ],
             view_marks: true,
             half_views: vec![(0, 8), (4, 0)],
         }

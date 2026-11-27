@@ -118,6 +118,11 @@ impl Heap {
             .as_ref()
     }
 
+    /// Number of descriptors in this heap.
+    pub(crate) fn count(&self) -> u32 {
+        self.desc.count
+    }
+
     /// The descriptor index of `handle` in this heap, if it lies in it.
     pub(crate) fn index(&self, handle: u64) -> Option<u32> {
         let step = u64::from(increment(self.desc.kind)?);
@@ -1072,6 +1077,23 @@ pub(crate) fn view(handle: u64) -> Option<ViewPin> {
     }
     // SAFETY: the handle is a descriptor slot the title passes back.
     let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
+    (tag == VIEW_TAG).then(|| view_at(i, generation)).flatten()
+}
+
+/// Like [`view`], but reads the title descriptor slot through
+/// [`crate::host::read_into`] so unmapped heap pages never fault.
+#[cfg(windows)]
+pub(crate) fn view_safe(handle: u64) -> Option<ViewPin> {
+    if handle == 0 {
+        return None;
+    }
+    let mut raw = [0u8; 12];
+    if !crate::host::read_into(handle as *const u8, &mut raw) {
+        return None;
+    }
+    let tag = u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]);
+    let i = u32::from_le_bytes([raw[4], raw[5], raw[6], raw[7]]);
+    let generation = u32::from_le_bytes([raw[8], raw[9], raw[10], raw[11]]);
     (tag == VIEW_TAG).then(|| view_at(i, generation)).flatten()
 }
 

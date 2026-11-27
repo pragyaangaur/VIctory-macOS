@@ -247,8 +247,10 @@ mod crosslane_tests;
 mod diff_tests;
 #[cfg(all(test, windows))]
 mod flow_tests;
-#[cfg(test)]
+#[cfg(all(test, windows))]
 mod halves_tests;
+pub mod heap_sources;
+pub use heap_sources::{BufferBinding, HeapIndexSource, ScalarSource};
 #[cfg(all(windows, any(test, feature = "host")))]
 pub mod host;
 #[cfg(all(test, windows))]
@@ -417,6 +419,10 @@ pub struct HostShader {
     /// Whether some of those are unordered access views: it may write
     /// through any of the heap's.
     pub heap_writes: bool,
+    /// Generic sources of `ResourceDescriptorHeap` texture indices extracted
+    /// from pixel-shader IR, for pre-uploading urgent bindless sources ahead
+    /// of one-time composite/bake draws.
+    pub heap_index_sources: Vec<HeapIndexSource>,
     /// Whether it marks the pages it writes through buffer views: the host
     /// binds the view-mark table `t`[`VIEW_MARKS`] and the bitmap
     /// `u`[`VIEW_WRITES`] in [`MEMORY_SPACE`] (module notes, "Write
@@ -477,6 +483,30 @@ pub struct UserData {
     /// [`ROOT_SRV_VIEW`], [`ROOT_UAV_VIEW`] or [`ROOT_VIEW_OFFSET`] name
     /// its view's heap index or its offset in that view instead.
     pub dword: u32,
+}
+
+/// Whether an `s_barrier` that a lane may miss at a capped loop's iteration
+/// limit makes the shader untranslatable (`VICTORY_CAP_BARRIERS=1`). Off by
+/// default: the refusal added with the loop-cap analysis left the tile-list,
+/// lighting and temporal anti-aliasing programs out and the world was drawn
+/// black on M3 Max and M5 Pro Macs (#497), where keeping their barrier, as
+/// before, drew it. Tests always run with the refusal on.
+pub fn cap_barriers_refused() -> bool {
+    #[cfg(test)]
+    {
+        true
+    }
+    #[cfg(not(test))]
+    {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| cap_barriers_from(std::env::var("VICTORY_CAP_BARRIERS").ok().as_deref()))
+    }
+}
+
+/// `VICTORY_CAP_BARRIERS`'s value as a switch: only `1` turns the refusal on.
+#[cfg_attr(test, allow(dead_code))]
+fn cap_barriers_from(value: Option<&str>) -> bool {
+    value == Some("1")
 }
 
 /// How a translation is made.
@@ -1067,9 +1097,7 @@ fn emit_pruned(
         uav_size_level0: options.uav_size_level0,
         halves_rendezvous: options.halves_rendezvous,
     };
-    let l = match lower::lower_pruned(
-        &parts(st, res),
-        keep,
+    let (l, heap_index_sources) = match lower::lower_pruned(&parts(st, res), keep,
         options.per_vertex_center,
         !options.disable_literal_halves,
     ) {
@@ -1102,9 +1130,23 @@ fn emit_pruned(
         Err(_) if !st.discards.is_empty() => {
             let st = structure::killing(p)?;
             let res = resource::track(p, &native.layout, native.stage, Some(&st))?;
-            lower::lower_pruned(&parts(&st, &res), keep, options.per_vertex_center, false)?
+            let l = lower::lower_pruned(&parts(&st, &res), keep, options.per_vertex_center, false)?;
+            let sources = if pixel && l.heap {
+                heap_sources::extract(native, p, &res)
+            } else {
+                Vec::new()
+            };
+            (l, sources)
         }
-        l => l?,
+        l => {
+            let l = l?;
+            let sources = if pixel && l.heap {
+                heap_sources::extract(native, p, res)
+            } else {
+                Vec::new()
+            };
+            (l, sources)
+        }
     };
     Ok(HostShader {
         stage: native.stage,
@@ -1132,6 +1174,7 @@ fn emit_pruned(
         view_addresses: l.view_addresses,
         heap: l.heap,
         heap_writes: l.heap_writes,
+        heap_index_sources,
         view_marks: l.view_marks,
         half_views: l.half_views,
     })
@@ -1231,6 +1274,15 @@ fn signature(part: &[u8]) -> Result<Vec<container::SigElement>, ShaderError> {
 
 #[cfg(test)]
 mod tests {
+    /// The loop-cap barrier refusal is off unless the switch says `1`.
+    #[test]
+    fn the_cap_barrier_refusal_is_opt_in() {
+        assert!(!super::cap_barriers_from(None));
+        assert!(!super::cap_barriers_from(Some("0")));
+        assert!(!super::cap_barriers_from(Some("")));
+        assert!(super::cap_barriers_from(Some("1")));
+    }
+
     use super::bitcode::Attr;
     use super::lower::LOOP_LIMIT;
     use super::parse_loop_limit;
@@ -1784,6 +1836,7 @@ mod tests {
             view_addresses: false,
             heap: false,
             heap_writes: false,
+            heap_index_sources: Vec::new(),
             view_marks: false,
             half_views: Vec::new(),
         };
@@ -1803,6 +1856,7 @@ mod tests {
                 view_addresses: false,
                 heap: false,
                 heap_writes: false,
+                heap_index_sources: Vec::new(),
                 view_marks: false,
                 half_views: Vec::new(),
             })

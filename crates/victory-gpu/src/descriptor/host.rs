@@ -2347,8 +2347,7 @@ impl HostHeap {
         self.made.lock().unwrap_or_else(|e| e.into_inner())[index as usize] != 0
     }
 
-    /// Whether slot `index` holds a host view of a resource (tests).
-    #[cfg(test)]
+    /// Whether slot `index` holds a host view of a resource.
     pub(crate) fn kept(&self, index: u32) -> bool {
         self.kept.lock().unwrap_or_else(|e| e.into_inner()).get(index as usize).is_some()
     }
@@ -2456,7 +2455,7 @@ fn uav_desc(words: &[u32; 10]) -> D3D12_UNORDERED_ACCESS_VIEW_DESC {
 
 /// The byte stride of a buffer view (its element size, at least 1), 0 for
 /// other views: what the view-stride table holds for it.
-fn view_stride(view: &View) -> u32 {
+pub(crate) fn view_stride(view: &View) -> u32 {
     let (unordered, words): (bool, &[u32; 10]) = match view {
         // Read as raw buffers (`make`).
         View::Constant(..) => return 4,
@@ -3287,7 +3286,7 @@ fn is_unordered_texture(view: &View) -> bool {
 }
 
 /// Whether `view` is a view of a texture the title placed in memory itself.
-fn is_placed_texture(view: &View) -> bool {
+pub(crate) fn is_placed_texture(view: &View) -> bool {
     matches!(view, View::Placed(_, resource, _) if resource[0] != 1)
 }
 
@@ -3312,7 +3311,7 @@ fn prepare(view: &View) {
 
 /// Whether `view` is a shader view of a texture (one placed in memory, or a
 /// resource object's): such a slot left null is made when read.
-fn is_texture(view: &View) -> bool {
+pub(crate) fn is_texture(view: &View) -> bool {
     is_placed_texture(view)
         || matches!(view, View::Shader(r, _) if crate::resource::texture_memory(*r as crate::object::This).is_some())
 }

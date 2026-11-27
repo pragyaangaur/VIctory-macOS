@@ -4700,6 +4700,36 @@ pub(crate) fn read_into(src: *const u8, dst: &mut [u8]) -> bool {
     read(src, dst.as_mut_ptr(), dst.len())
 }
 
+/// Whether any page in `[addr, addr + len)` is mapped and readable.
+pub(crate) fn has_mapped_memory(addr: u64, len: u64) -> bool {
+    if addr == 0 || len == 0 {
+        return false;
+    }
+    let mut probe = [0u8; 4];
+    if read_into(addr as *const u8, &mut probe[..len.min(4) as usize]) {
+        return true;
+    }
+    let start = addr as usize;
+    let end = start.saturating_add(usize::try_from(len).unwrap_or(usize::MAX));
+    let mut at = start;
+    while at < end {
+        let (region_end, readable) = source_region(at);
+        if readable && read_into(at as *const u8, &mut probe[..1]) {
+            return true;
+        }
+        at = region_end.min(end);
+    }
+    // Wine's VirtualQuery can omit host mappings: probe the tail too
+    // (streamed textures often populate lower mips at the end first).
+    if len > 4 {
+        let tail = end.saturating_sub(4);
+        if read_into(tail as *const u8, &mut probe) {
+            return true;
+        }
+    }
+    false
+}
+
 /// Copies `len` bytes from `src` to `dst` in the kernel: false if a source
 /// page is not readable or a destination page not writable (the bytes
 /// before that page may have been copied).

@@ -567,6 +567,11 @@ pub(super) const LDS_ACROSS: Why =
     "LDS one console wave64 shares without barriers, on a host of 32-lane waves";
 pub(super) const REDUCTION_ACROSS: Why =
     "a wave reduction over both 32-lane halves (wave64 on a 32-lane host)";
+/// A `v_writelane_b32` in a block the predication runs in every lane: the
+/// lane it names may be inactive there, and the merge after the block keeps
+/// that lane's old value (the console writes it whatever EXEC holds).
+pub(super) const WRITE_ACROSS: Why =
+    "a lane write in a predicated block (wave64 on a 32-lane host)";
 pub(super) const READ_ACROSS: Why =
     "a lane read that may cross 32-lane halves (wave64 on a 32-lane host)";
 
