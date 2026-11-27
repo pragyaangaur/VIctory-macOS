@@ -1,0 +1,55 @@
+name: build-victory-mac
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust 1.98.1 with windows-gnullvm target
+        run: |
+          rustup toolchain install 1.98.1 --profile minimal --component rustfmt --component clippy
+          rustup target add --toolchain 1.98.1 x86_64-pc-windows-gnullvm
+
+      - name: Install llvm-mingw 20261117
+        run: |
+          mkdir -p "$HOME/llvm-mingw"
+          cd "$HOME/llvm-mingw"
+          curl -L --fail \
+            -o llvm-mingw.tar.xz \
+            https://github.com/mstorsjo/llvm-mingw/releases/download/20261117/llvm-mingw-20261117-ucrt-ubuntu-22.04-x86_64.tar.xz
+          tar -xJf llvm-mingw.tar.xz --strip-components=1
+          echo "toolchain root: $HOME/llvm-mingw"
+          ls "$HOME/llvm-mingw/bin/x86_64-w64-mingw32-clang"
+
+      - name: Build victory.exe (release)
+        env:
+          LLVM_MINGW_ROOT: $HOME/llvm-mingw
+        run: |
+          cargo build --locked \
+            --target x86_64-pc-windows-gnullvm \
+            --release \
+            -p victory
+          ls -lh target/x86_64-pc-windows-gnullvm/release/victory.exe
+
+      - name: Stage release DLLs alongside victory.exe
+        run: |
+          mkdir -p target/x86_64-pc-windows-gnullvm/release
+          cp "$HOME/llvm-mingw/x86_64-w64-mingw32/bin/libunwind.dll" \
+             target/x86_64-pc-windows-gnullvm/release/
+
+      - name: Upload archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: victory-mac-binaries
+          path: |
+            target/x86_64-pc-windows-gnullvm/release/victory.exe
+            target/x86_64-pc-windows-gnullvm/release/libunwind.dll
+          if-no-files-found: error
