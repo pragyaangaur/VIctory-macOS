@@ -947,6 +947,7 @@ fn fmad_probe() -> Result<HostShader, crate::ShaderError> {
         host_wave32: false,
         narrow_waves: false,
         uav_size_level0: false,
+        halves_rendezvous: false,
         view_marks: false,
     })?;
     Ok(HostShader {

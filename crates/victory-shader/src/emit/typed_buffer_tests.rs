@@ -101,6 +101,7 @@ fn lowered() -> lower::Lowered {
     let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("track");
     let io = io::raise(&p, &native).expect("io::raise");
     lower::lower(&lower::Parts {
+        halves_rendezvous: false,
         native: &native,
         p: &p,
         st: &st,

@@ -135,6 +135,7 @@ fn lowered(native: &NativeProgram) -> Result<lower::Lowered, crate::ShaderError>
     let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("track");
     let io = io::raise(&p, native).expect("io::raise");
     lower::lower(&lower::Parts {
+        halves_rendezvous: false,
         native,
         p: &p,
         st: &st,
@@ -926,6 +927,7 @@ fn pops_wait_loop_exits_immediately_for_inactive_lanes() {
         let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("resource");
         let io = io::raise(&p, native).expect("io");
         let l = lower::lower(&lower::Parts {
+            halves_rendezvous: false,
             native,
             p: &p,
             st: &st,

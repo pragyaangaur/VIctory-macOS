@@ -28,13 +28,26 @@ mod bvh;
 #[path = "half_views.rs"]
 mod half_views;
 mod halves;
+mod meet;
+mod packed;
+mod round_mode;
 mod mesh;
 mod predicate;
+mod retry;
 #[cfg(test)]
 use barriers::split_wave_barriers;
 use barriers::{in_step, split_wave_barriers_with_step, step_and_cap};
 pub(crate) use mesh::KeptOutputs;
 use mesh::prune_signature;
+pub(crate) use meet::MeetSite;
+use super::bitcode::Rmw;
+use packed::packed_half;
+use round_mode::{round16, round16_after};
+#[cfg(any(test, all(windows, feature = "host")))]
+pub(crate) use retry::lower;
+#[cfg(all(test, windows))]
+pub(crate) use retry::lower_literal;
+pub(crate) use retry::lower_pruned;
 
 type Why = &'static str;
 
@@ -192,6 +205,9 @@ pub(crate) struct Parts<'a> {
     pub bias_as_gradients: bool,
     /// The host's waves have at most 32 lanes (`emit::Options::host_wave32`).
     pub host_wave32: bool,
+    /// In halves, the two halves of a console wave meet in divergent code
+    /// ([`Options::halves_rendezvous`](super::Options), `lower::meet`).
+    pub halves_rendezvous: bool,
     /// See [`Options::narrow_waves`](super::Options).
     pub narrow_waves: bool,
     /// A size query on a writable image asks for level 0, not an undefined
@@ -203,99 +219,6 @@ enum Stop {
     /// A phi whose incoming value has no DXIL form was read: redo with it missing.
     Retry(Value, Why),
     Fail(ShaderError),
-}
-
-#[cfg(any(test, all(windows, feature = "host")))]
-pub(crate) fn lower(parts: &Parts) -> Result<Lowered, ShaderError> {
-    lower_pruned(parts, None, false, false)
-}
-
-pub(crate) fn lower_pruned(
-    parts: &Parts,
-    keep: Option<&KeptOutputs>,
-    per_vertex_center: bool,
-    literal_halves: bool,
-) -> Result<Lowered, ShaderError> {
-    // Retry refusals from the legacy cross-half gates with whole-wave control flow.
-    let original = lower_with_structure(parts, keep, per_vertex_center);
-    if !literal_halves
-        || !parts.host_wave32
-        || !parts.native.wave64
-        || !matches!(&parts.native.io, StageIo::Cs(cs) if cs.threads.iter().product::<u32>() == 64)
-        || !matches!(
-            &original,
-            Err(ShaderError::Unsupported {
-                what: halves::MASK_ACROSS
-                    | LANE_MASK
-                    | MASK_CYCLE
-                    | MASK_ELSEWHERE
-                    | halves::LDS_ACROSS
-                    | halves::REDUCTION_ACROSS
-                    | halves::FIRST_ACROSS
-                    | halves::READ_ACROSS
-                    | halves::WRITE_ACROSS,
-                ..
-            })
-        )
-    {
-        return original;
-    }
-    lower_literal(parts, keep, per_vertex_center)
-}
-
-/// The whole-wave translation of a 64-thread wave64 compute program on a
-/// 32-lane host, tried when the per-lane halves translation refuses it.
-pub(crate) fn lower_literal(
-    parts: &Parts,
-    keep: Option<&KeptOutputs>,
-    per_vertex_center: bool,
-) -> Result<Lowered, ShaderError> {
-    let native = parts.native;
-    // Register-relative move bounds and resource paths must use the same
-    // control flow as lowering. The per-lane move bounds do not apply here.
-    let p = crate::ir::build(&native.patched_code(), true, native.vgprs)?;
-    let st = crate::structure::split_literal(&p)?;
-    let res = crate::resource::track(&p, &native.layout, native.stage, Some(&st))?;
-    if !res.waterfall.reads.is_empty() {
-        return Err(ShaderError::Unsupported {
-            offset: 0,
-            what: "a resource waterfall in literal wave64 halves",
-        });
-    }
-    let io = crate::io::raise(&p, native)?;
-    lower_with_structure(
-        &Parts {
-            p: &p,
-            st: &st,
-            res: &res,
-            io: &io,
-            ..parts.clone()
-        },
-        keep,
-        per_vertex_center,
-    )
-}
-
-fn lower_with_structure(
-    parts: &Parts,
-    keep: Option<&KeptOutputs>,
-    per_vertex_center: bool,
-) -> Result<Lowered, ShaderError> {
-    let mut bad = HashMap::new();
-    loop {
-        match Lower::new(parts, &bad, keep, per_vertex_center).run() {
-            Ok(l) => return Ok(l),
-            Err(Stop::Retry(v, why)) => {
-                if bad.insert(v, why).is_some() {
-                    return Err(ShaderError::Unsupported {
-                        offset: 0,
-                        what: "a phi that does not settle",
-                    });
-                }
-            }
-            Err(Stop::Fail(e)) => return Err(e),
-        }
-    }
 }
 
 const TWO_PI: f32 = std::f32::consts::TAU;
@@ -484,6 +407,18 @@ struct Lower<'a> {
     /// In halves: the group-shared dwords values pass between the halves
     /// through, once made ([`Lower::exchange_halves`]).
     half_words: Option<V>,
+    /// In halves, a group of more than one host wave: the divergent
+    /// regions where the halves can meet (`lower::meet`).
+    meet: Option<meet::Meet>,
+    /// The sites earlier passes found, laid out in this one.
+    meet_plan: &'a Set<MeetSite>,
+    /// Sites this pass found that are not laid out yet.
+    meet_found: &'a std::cell::RefCell<Set<MeetSite>>,
+    meet_layout: meet::MeetLayout,
+    /// The rendezvous words, once made ([`Lower::meet_prologue`]).
+    meet_words: Option<V>,
+    /// Each region's epoch, from its branch block's end on.
+    meet_epoch: Map<usize, V>,
     /// The DXIL block the instruction being lowered starts in: every lane
     /// running its IR block runs it (no guard of the instruction's own).
     level: usize,
@@ -542,65 +477,6 @@ struct Lower<'a> {
     /// the one in force at the instruction being lowered (see [`round16`]).
     round16: Vec<Option<u8>>,
     mode16: Option<u8>,
-}
-
-/// The 16/64-bit round mode (MODE bits 3:2: 0 nearest even, 3 toward zero)
-/// after `inst`, from `mode` before it (`None`: not known).
-fn round16_after(inst: &Inst, mode: Option<u8>) -> Option<u8> {
-    match (inst.name(), &inst.fields) {
-        ("s_round_mode", Fields::Sopp { imm }) => Some((imm >> 2 & 3) as u8),
-        (
-            "s_setreg_imm32_b32" | "s_setreg_b32",
-            Fields::Sop {
-                src, imm: Some(h), ..
-            },
-        ) => {
-            let (id, off, size) = (h & 0x3F, h >> 6 & 0x1F, (h >> 11 & 0x1F) + 1);
-            if id != 1 || off >= 4 || off + size <= 2 {
-                return mode;
-            }
-            match src.first() {
-                Some(&Operand::Literal(x)) if off <= 2 && off + size >= 4 => {
-                    Some((x >> (2 - off) & 3) as u8)
-                }
-                _ => None,
-            }
-        }
-        _ => mode,
-    }
-}
-
-/// The 16/64-bit round mode each block starts with: nearest even at the
-/// program's start, then as the MODE writes on the way set it; `None` where
-/// paths that set it differently join (or a write is not a constant).
-fn round16(p: &crate::ir::Program) -> Vec<Option<u8>> {
-    // None: not reached yet; Some(m): the mode (m None: not known).
-    let mut entry: Vec<Option<Option<u8>>> = vec![None; p.blocks.len()];
-    entry[0] = Some(Some(0));
-    let order = crate::ir::reverse_postorder(&p.blocks);
-    loop {
-        let mut changed = false;
-        for &b in &order {
-            let Some(mut m) = entry[b] else { continue };
-            for inst in &p.blocks[b].insts {
-                m = round16_after(inst, m);
-            }
-            for s in p.blocks[b].exit.successors() {
-                let new = match entry[s] {
-                    None => Some(m),
-                    Some(old) if old == m => continue,
-                    Some(_) => Some(None),
-                };
-                if entry[s] != new {
-                    entry[s] = new;
-                    changed = true;
-                }
-            }
-        }
-        if !changed {
-            return entry.into_iter().map(Option::flatten).collect();
-        }
-    }
 }
 
 /// Iterations after which a loop is left (per entry into it), unless
@@ -686,43 +562,6 @@ fn reads_mask_as_data(st: &Structured, i: &Inst) -> bool {
         Operand::Scalar { code, .. } if code != NULL => i.read(Reg::S(code)).is_some_and(is_mask),
         _ => false,
     })
-}
-
-/// Where half `h` (dword h / 2, the high half when odd) of the parameter
-/// whose first element is in row `a` comes from, when the console packs
-/// 16-bit values two per dword: a row and channel of `elements`, none for
-/// padding. The console fills its parameters with the 16-bit elements taken
-/// by first channel, then row: each takes whole dwords of the first
-/// parameter with room for it (four dwords each), its channels in order.
-fn packed_half(elements: &[SigElement], a: u8, h: u8) -> Option<(u8, u8)> {
-    let mut halves: Vec<&SigElement> = elements
-        .iter()
-        .filter(|e| e.half && e.kind == 0 && e.row.is_some())
-        .collect();
-    halves.sort_by_key(|e| (e.col, e.row));
-    // (first element's row, (row, channel) per half)
-    type Param = (Option<u32>, Vec<Option<(u8, u8)>>);
-    let mut params: Vec<Param> = Vec::new();
-    for e in halves {
-        let need = usize::from(e.cols.div_ceil(2) * 2);
-        let i = match params.iter().position(|p| p.1.len() + need <= 8) {
-            Some(i) => i,
-            None => {
-                params.push((e.row, Vec::new()));
-                params.len() - 1
-            }
-        };
-        let row = u8::try_from(e.row?).ok()?;
-        let slots = &mut params[i].1;
-        slots.extend((0..e.cols).map(|c| Some((row, e.col + c))));
-        slots.resize(slots.len().next_multiple_of(2), None);
-    }
-    // Two parameters starting in one row would leave the half ambiguous.
-    let mut found = params.iter().filter(|p| p.0 == Some(u32::from(a)));
-    match (found.next(), found.next()) {
-        (Some(p), None) => p.1.get(usize::from(h)).copied().flatten(),
-        _ => None,
-    }
 }
 
 /// Vertex or mesh outputs of 16-bit values (see [`Lower::half_outputs`]),
@@ -827,6 +666,8 @@ impl<'a> Lower<'a> {
         bad: &'a HashMap<Value, Why>,
         keep: Option<&KeptOutputs>,
         per_vertex_center: bool,
+        meet_plan: &'a Set<MeetSite>,
+        meet_found: &'a std::cell::RefCell<Set<MeetSite>>,
     ) -> Self {
         let p = x.p;
         let mut phi_at = Map::default();
@@ -1008,7 +849,10 @@ impl<'a> Lower<'a> {
             }
         }
         let (step, cap_escaped, group_scalars) = step_and_cap(p, x.st, halves);
-        Lower {
+        let one_host_wave = s.threads.is_some_and(|t| t.iter().product::<u32>() <= 32);
+        let meet = (halves && !one_host_wave && x.halves_rendezvous)
+            .then(|| meet::meet_regions(p, x.st, &step));
+        let mut l = Lower {
             s,
             x,
             bad,
@@ -1077,6 +921,12 @@ impl<'a> Lower<'a> {
             group_scalars,
             cap_escaped,
             half_words: None,
+            meet,
+            meet_plan,
+            meet_found,
+            meet_layout: meet::MeetLayout::default(),
+            meet_words: None,
+            meet_epoch: Map::default(),
             level: 0,
             alike: if halves {
                 halves::lane_uniform(x)
@@ -1120,7 +970,9 @@ impl<'a> Lower<'a> {
             abort: None,
             round16: round16(p),
             mode16: Some(0),
-        }
+        };
+        l.lay_out_meet();
+        l
     }
 
     /// The dword of the program's code at byte `byte` (a constant table
@@ -1716,6 +1568,7 @@ impl<'a> Lower<'a> {
         }
         self.find_sections();
         self.inputs()?;
+        self.meet_prologue();
         if let Some(mesh) = self.s.mesh {
             self.mesh_prologue(mesh).map_err(|w| unsupported(0, w))?;
             self.block[order[0]] = Some(self.cur);
@@ -1760,6 +1613,7 @@ impl<'a> Lower<'a> {
                     self.vals.insert(phi.value, val);
                 }
             }
+            self.meet_enter(b);
             let mut i = 0;
             self.mode16 = self.round16[b];
             while i < p.blocks[b].insts.len() {
@@ -1777,6 +1631,7 @@ impl<'a> Lower<'a> {
                 if self.split_barriers.contains(&(b, i)) {
                     self.group_barrier();
                 }
+                self.meet_masks(b, Some(i));
                 self.level = self.cur;
                 self.inst(b, i)?;
                 self.mode16 = round16_after(&p.blocks[b].insts[i], self.mode16);
@@ -1793,6 +1648,12 @@ impl<'a> Lower<'a> {
             if self.split_barriers.contains(&(b, p.blocks[b].insts.len())) {
                 self.group_barrier();
             }
+            self.meet_masks(b, None);
+            let offset = p.blocks[b]
+                .insts
+                .last()
+                .map_or(p.blocks[b].offset, |i| i.machine.offset);
+            self.meet_exit(b).map_err(|w| unsupported(offset, w))?;
             self.mask_ok = self.mask_data == MaskData::Console;
             self.tail[b] = Some(self.cur);
             self.level = self.cur;
@@ -2400,6 +2261,15 @@ impl<'a> Lower<'a> {
                 if across {
                     match self.across_at(def) {
                         Some(a) => at = a,
+                        // In divergent code the halves meet there (laid
+                        // out by the next pass: a stand-in until then).
+                        None if def
+                            .is_some_and(|d| self.meet_later(MeetSite::Mask(lo), d)) =>
+                        {
+                            let zero = self.s.m.i32(0);
+                            self.ballots.insert(lo, (zero, zero));
+                            return Ok(zero);
+                        }
                         None => {
                             if let Ok(xy) = self.mask_number(lo) {
                                 self.ballots.insert(lo, xy);

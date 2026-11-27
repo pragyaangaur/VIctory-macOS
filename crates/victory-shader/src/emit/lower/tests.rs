@@ -67,6 +67,7 @@ fn lowers(words: &[u32], rsrc2: u32) -> Result<(), crate::ShaderError> {
     let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
     let io = io::raise(&p, &native).unwrap();
     lower(&Parts {
+        halves_rendezvous: false,
         native: &native,
         p: &p,
         st: &st,
@@ -125,6 +126,7 @@ fn lower_wave(
     let res = resource::track(&p, &native.layout, native.stage, Some(&st))?;
     let io = io::raise(&p, &native).unwrap();
     lower(&Parts {
+        halves_rendezvous: false,
         native: &native,
         p: &p,
         st: &st,
@@ -434,6 +436,7 @@ fn perm_features(selector: u32) -> u64 {
     let io = io::raise(&p, &native).unwrap();
 
     let emitted = lower(&Parts {
+        halves_rendezvous: false,
         native: &native,
         p: &p,
         st: &st,
@@ -1412,6 +1415,7 @@ fn lowered_result(
     let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
     let io = io::raise(&p, &native).unwrap();
     lower(&Parts {
+        halves_rendezvous: false,
         native: &native,
         p: &p,
         st: &st,
@@ -1643,6 +1647,7 @@ fn lowered_halves(words: &[u32], lanes: u32) -> Result<Lowered, crate::ShaderErr
     let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
     let io = io::raise(&p, &native).unwrap();
     lower(&Parts {
+        halves_rendezvous: false,
         native: &native,
         p: &p,
         st: &st,
@@ -2323,6 +2328,7 @@ fn ds_bpermute_wave64_preserves_32_lane_half() {
         let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
         let io = io::raise(&p, &native).unwrap();
         let mut lowered = lower(&Parts {
+            halves_rendezvous: false,
             native: &native,
             p: &p,
             st: &st,
@@ -2422,6 +2428,7 @@ fn lower_ps_for_early_z(
     let res = crate::resource::track(&p, &native.layout, native.stage, Some(&st)).expect("track");
     let io = crate::io::raise(&p, &native).expect("io::raise");
     lower(&Parts {
+        halves_rendezvous: false,
         native: &native,
         p: &p,
         st: &st,
@@ -2962,6 +2969,7 @@ fn lower_halves_io(
     // tests look for, so they lower without it.
     let lowered = crate::emit::with_thread_ticket(false, || {
         lower(&Parts {
+            halves_rendezvous: false,
             native: &native,
             p: &p,
             st: &st,

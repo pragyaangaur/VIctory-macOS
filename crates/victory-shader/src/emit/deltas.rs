@@ -280,6 +280,7 @@ mod tests {
                 bias_as_gradients: false,
                 narrow_waves: false,
                 uav_size_level0: false,
+                halves_rendezvous: false,
                 host_wave32: false,
                 view_marks: false,
             },

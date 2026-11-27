@@ -172,6 +172,7 @@ fn lower_halves(
             bias_as_gradients: false,
             narrow_waves,
             uav_size_level0: false,
+            halves_rendezvous: true,
             host_wave32,
     };
     if literal && matches!(&native.io, crate::native::StageIo::Cs(cs) if cs.threads.iter().product::<u32>() == 64) {
@@ -2884,6 +2885,7 @@ fn thread_ticket_relabels_2d_and_partial_tail_groups_bijectively() {
         let io = io::raise(&p, prog).expect("io");
         super::with_thread_ticket(ticket, || {
             lower::lower(&lower::Parts {
+                halves_rendezvous: false,
                 native: prog,
                 p: &p,
                 st: &st,
@@ -2979,4 +2981,352 @@ fn check_ticket_dispatches(with_ticket: lower::Lowered, lowered_40: lower::Lower
 
     let got_40 = run(lowered_40, 40);
     assert_eq!(got_40, vec![1u32; 40], "all 40 threads (32 full + 8 partial) must run once");
+}
+
+// ---- the halves meet in divergent code (`lower::meet`) ----
+
+/// Which lanes take a divergent branch: the even ones
+/// (`v_and_b32 v3, 1, v0; v_cmp_eq_u32 vcc, 0, v3`), or those below a
+/// thread id (`v_cmp_gt_u32 vcc, n, v0`).
+#[derive(Clone, Copy)]
+enum Side {
+    Even,
+    Below(u32),
+}
+
+impl Side {
+    fn words(self) -> Vec<u32> {
+        match self {
+            Side::Even => vec![0x3606_0081, 0x7D84_0680],
+            Side::Below(n) => vec![0x7D88_00FF, n],
+        }
+    }
+
+    fn takes(self, l: u32) -> bool {
+        match self {
+            Side::Even => l.is_multiple_of(2),
+            Side::Below(n) => l < n,
+        }
+    }
+}
+
+/// `v_cmp_gt_u32 vcc, limit, v0`, the console wave's count of those lanes
+/// (`s_bcnt1_i32_b64 s12, vcc`) into `v1` and their high dword (`vcc_hi`)
+/// into `v2`: a lane mask read as data where it is written.
+fn ballot_below(limit: u32) -> [u32; 5] {
+    [
+        0x7D88_00FF,
+        limit,       // v_cmp_gt_u32 vcc, limit, v0
+        0xBE8C_106A, // s_bcnt1_i32_b64 s12, vcc
+        0x7E02_020C, // v_mov_b32 v1, s12
+        0x7E04_026B, // v_mov_b32 v2, vcc_hi
+    ]
+}
+
+const S_AND_SAVEEXEC_S20_VCC: u32 = 0xBE94_246A; // s_and_saveexec_b64 s[20:21], vcc
+const S_MOV_EXEC_S20: u32 = 0xBEFE_0414; // s_mov_b64 exec, s[20:21]
+const S_ANDN2_EXEC_S20_EXEC: u32 = 0x8AFE_7E14; // s_andn2_b64 exec, s[20:21], exec
+const fn s_cbranch_execz(skip: usize) -> u32 {
+    0xBF88_0000 | skip as u32
+}
+
+/// `v1`, `v2` start at -1; in the lanes `side` takes, [`ballot_below`]`
+/// (limit)` behind `s_cbranch_execz`; both stored. Per lane two dwords.
+fn ballot_in_an_if(side: Side, limit: u32) -> Vec<u32> {
+    let body = ballot_below(limit);
+    let mut w = PROLOGUE.to_vec();
+    w.extend([
+        0x3420_0085, // v_lshlrev_b32 v16, 5, v0
+        0x7E02_02C1, // v_mov_b32 v1, -1
+        0x7E04_02C1, // v_mov_b32 v2, -1
+    ]);
+    w.extend(side.words());
+    w.extend([S_AND_SAVEEXEC_S20_VCC, s_cbranch_execz(body.len())]);
+    w.extend(body);
+    w.push(S_MOV_EXEC_S20);
+    w.extend(store(1, 0));
+    w.extend(store(2, 4));
+    w.push(S_ENDPGM);
+    w
+}
+
+/// [`ballot_in_an_if`] with an else: the lanes `side` does not take run
+/// [`ballot_below`]`(other)`, behind a branch of their own.
+fn ballots_in_an_if_and_else(side: Side, limit: u32, other: u32) -> Vec<u32> {
+    let (then, otherwise) = (ballot_below(limit), ballot_below(other));
+    let mut w = PROLOGUE.to_vec();
+    w.extend([
+        0x3420_0085, // v_lshlrev_b32 v16, 5, v0
+        0x7E02_02C1, // v_mov_b32 v1, -1
+        0x7E04_02C1, // v_mov_b32 v2, -1
+    ]);
+    w.extend(side.words());
+    w.extend([S_AND_SAVEEXEC_S20_VCC, s_cbranch_execz(then.len())]);
+    w.extend(then);
+    w.extend([S_ANDN2_EXEC_S20_EXEC, s_cbranch_execz(otherwise.len())]);
+    w.extend(otherwise);
+    w.push(S_MOV_EXEC_S20);
+    w.extend(store(1, 0));
+    w.extend(store(2, 4));
+    w.push(S_ENDPGM);
+    w
+}
+
+/// [`ballot_in_an_if`] in a scalar loop that runs twice (the branch block
+/// runs twice, in step), each pass adding the count to `v1` (from 0):
+/// `v1` is twice the count where the lane takes the branch.
+fn ballot_in_an_if_in_a_loop(side: Side, limit: u32) -> Vec<u32> {
+    let body = [
+        0x7D88_00FF,
+        limit,       // v_cmp_gt_u32 vcc, limit, v0
+        0xBE8C_106A, // s_bcnt1_i32_b64 s12, vcc
+        0x4A02_020C, // v_add_nc_u32 v1, s12, v1
+    ];
+    let mut w = PROLOGUE.to_vec();
+    w.extend([
+        0x3420_0085, // v_lshlrev_b32 v16, 5, v0
+        0x7E02_0280, // v_mov_b32 v1, 0
+        0xBE96_0380, // s_mov_b32 s22, 0
+    ]);
+    let top = w.len();
+    w.extend(side.words());
+    w.extend([S_AND_SAVEEXEC_S20_VCC, s_cbranch_execz(body.len())]);
+    w.extend(body);
+    w.extend([
+        S_MOV_EXEC_S20,
+        0x8016_8116, // s_add_u32 s22, s22, 1
+        0xBF0A_8216, // s_cmp_lt_u32 s22, 2
+    ]);
+    let back = top as i32 - (w.len() as i32 + 1);
+    w.push(0xBF85_0000 | (back as u32 & 0xFFFF)); // s_cbranch_scc1 (back to the top)
+    w.extend(store(1, 0));
+    w.push(S_ENDPGM);
+    w
+}
+
+/// A scalar loop of two passes inside the branch: the region is a cycle,
+/// where the halves cannot meet.
+fn ballot_in_a_loop_in_an_if(side: Side, limit: u32) -> Vec<u32> {
+    let mut body = vec![0xBE96_0380]; // s_mov_b32 s22, 0
+    let top = body.len();
+    body.extend([
+        0x7D88_00FF,
+        limit,       // v_cmp_gt_u32 vcc, limit, v0
+        0xBE8C_106A, // s_bcnt1_i32_b64 s12, vcc
+        0x4A02_020C, // v_add_nc_u32 v1, s12, v1
+        0x8016_8116, // s_add_u32 s22, s22, 1
+        0xBF0A_8216, // s_cmp_lt_u32 s22, 2
+    ]);
+    let back = top as i32 - (body.len() as i32 + 1);
+    body.push(0xBF85_0000 | (back as u32 & 0xFFFF)); // s_cbranch_scc1
+    let mut w = PROLOGUE.to_vec();
+    w.extend([
+        0x3420_0085, // v_lshlrev_b32 v16, 5, v0
+        0x7E02_0280, // v_mov_b32 v1, 0
+    ]);
+    w.extend(side.words());
+    w.extend([S_AND_SAVEEXEC_S20_VCC, s_cbranch_execz(body.len())]);
+    w.extend(body);
+    w.push(S_MOV_EXEC_S20);
+    w.extend(store(1, 0));
+    w.push(S_ENDPGM);
+    w
+}
+
+/// The console's [`ballot_below`]`(limit)` in lane `l` of a group of
+/// `threads` where the lanes `active` runs it: the count of its console
+/// wave's active lanes below `limit`, and their high dword.
+fn console_ballot(threads: u32, l: u32, active: impl Fn(u32) -> bool, limit: u32) -> [u32; 2] {
+    let wave = l & !63;
+    let on = |t: u32| t < threads && active(t) && t < limit;
+    let count = (wave..wave + 64).filter(|&t| on(t)).count() as u32;
+    let high = (0..32)
+        .filter(|&k| on(wave + 32 + k))
+        .fold(0u32, |m, k| m | 1 << k);
+    [count, high]
+}
+
+/// The divergent test programs are what their comments say.
+#[test]
+fn the_divergent_ballot_programs_are_what_their_comments_say() {
+    let programs: Vec<(Vec<u32>, &[&str])> = vec![
+        (
+            ballot_in_an_if(Side::Even, 50),
+            &[
+                "v_and_b32 v3, 1, v0",
+                "v_cmp_eq_u32 vcc, 0, v3",
+                "s_and_saveexec_b64 s[20:21], vcc",
+                "s_cbranch_execz",
+                "s_bcnt1_i32_b64 s12, vcc",
+                "s_mov_b64 exec, s[20:21]",
+            ],
+        ),
+        (
+            ballots_in_an_if_and_else(Side::Even, 50, 40),
+            &["s_andn2_b64 exec, s[20:21], exec", "v_mov_b32 v2, vcc_hi"],
+        ),
+        (
+            ballot_in_an_if_in_a_loop(Side::Even, 50),
+            &[
+                "s_mov_b32 s22, 0",
+                "v_add_nc_u32 v1, s12, v1",
+                "s_add_u32 s22, s22, 1",
+                "s_cmp_lt_u32 s22, 2",
+                "s_cbranch_scc1",
+            ],
+        ),
+    ];
+    for (words, wants) in programs {
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let all = gfx10::decode(&code)
+            .expect("decodes")
+            .iter()
+            .map(|i| i.text(true))
+            .collect::<Vec<_>>()
+            .join("\n");
+        for want in wants {
+            assert!(all.contains(want), "{want:?} not in:\n{all}");
+        }
+    }
+}
+
+/// A lane mask read as data in divergent code: the halves meet there
+/// (`lower::meet`) in groups of more than one host wave, and the program
+/// validates; a loop inside the branch keeps it refused.
+#[test]
+fn lane_masks_in_divergent_code_meet_between_halves() {
+    let programs = [
+        ballot_in_an_if(Side::Even, 50),
+        ballot_in_an_if(Side::Below(20), 64),
+        ballots_in_an_if_and_else(Side::Even, 50, 40),
+        ballot_in_an_if_in_a_loop(Side::Below(40), 64),
+    ];
+    for words in &programs {
+        for threads in [32, 64, 96, 128] {
+            assert_eq!(refusal(words, threads, 0), "translated", "{threads} threads");
+        }
+        let halves = lowered(&native(words, true, 128, 0), true).expect("halves");
+        assert_eq!(halves.wave_size, Some(32));
+        if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref())
+        {
+            v.validate(&mut halves.dxil.clone())
+                .expect("DXIL validation failed");
+        }
+    }
+    let looped = ballot_in_a_loop_in_an_if(Side::Even, 50);
+    // Refused before main's scalar mask numbers (`Lower::mask_number`),
+    // which now give such a mask as the console does: either is right.
+    let why = refusal(&looped, 64, 0);
+    assert!(
+        why == "translated" || why.contains("a lane mask read as data (wave64 on a 32-lane host)"),
+        "{why}"
+    );
+    assert_eq!(refusal(&looped, 32, 0), "translated");
+    // Without the rendezvous, refused as before.
+    let n = native(&programs[0], true, 64, 0);
+    let p = ir::build(&n.code, n.wave64, n.vgprs).expect("ir::build");
+    let st = structure::structure(&p).expect("structure");
+    let res = resource::track(&p, &n.layout, n.stage, Some(&st)).expect("track");
+    let io = io::raise(&p, &n).expect("io::raise");
+    let off = lower::lower(&lower::Parts {
+        uav_size_level0: false,
+        native: &n,
+        p: &p,
+        st: &st,
+        io: &io,
+        res: &res,
+        inputs: Vec::new(),
+        outputs: Vec::new(),
+        prims: Vec::new(),
+        mesh_stride: 0,
+        view_marks: false,
+        atomic_locks: false,
+        atomic_lock_rounds: false,
+        atomic_umax: false,
+        bias_as_gradients: false,
+        narrow_waves: false,
+        halves_rendezvous: false,
+        host_wave32: true,
+    });
+    let why = off.err().map(|e| e.to_string()).unwrap_or_else(|| "translated".into());
+    assert!(
+        why == "translated" || why.contains("a lane mask read as data (wave64 on a 32-lane host)"),
+        "{why}"
+    );
+}
+
+/// The divergent ballots on every hardware adapter give the console's
+/// masks: some lanes of each half in the branch, only the lower half's
+/// (the upper half meets no one and must not wait), both sides of an if
+/// and else, two console waves diverging differently (128 threads), a
+/// console wave with no upper half (96), and the branch in a loop run
+/// twice (the epochs).
+#[test]
+fn lane_masks_in_divergent_code_match_the_console_on_every_gpu() {
+    let mut failed = Vec::new();
+    let cases = [
+        (Side::Even, 50, 64),
+        (Side::Below(20), 64, 64),
+        (Side::Below(20), 64, 128),
+        (Side::Below(80), 100, 128),
+        (Side::Even, 90, 128),
+        (Side::Even, 90, 96),
+        (Side::Below(40), 70, 96),
+    ];
+    for (side, limit, threads) in cases {
+        let want: Vec<u32> = (0..threads)
+            .flat_map(|l| {
+                if side.takes(l) {
+                    console_ballot(threads, l, |t| side.takes(t), limit)
+                } else {
+                    [u32::MAX; 2]
+                }
+            })
+            .collect();
+        failed.extend(differences(&ballot_in_an_if(side, limit), threads, 2, &want));
+    }
+    for (side, limit, other, threads) in [
+        (Side::Even, 50, 40, 64),
+        (Side::Below(20), 64, 40, 64),
+        (Side::Below(80), 100, 110, 128),
+        (Side::Even, 90, 70, 96),
+    ] {
+        let want: Vec<u32> = (0..threads)
+            .flat_map(|l| {
+                if side.takes(l) {
+                    console_ballot(threads, l, |t| side.takes(t), limit)
+                } else {
+                    console_ballot(threads, l, |t| !side.takes(t), other)
+                }
+            })
+            .collect();
+        failed.extend(differences(
+            &ballots_in_an_if_and_else(side, limit, other),
+            threads,
+            2,
+            &want,
+        ));
+    }
+    for (side, limit, threads) in [
+        (Side::Below(40), 64, 64),
+        (Side::Even, 90, 128),
+        (Side::Below(20), 64, 96),
+    ] {
+        let want: Vec<u32> = (0..threads)
+            .map(|l| {
+                if side.takes(l) {
+                    2 * console_ballot(threads, l, |t| side.takes(t), limit)[0]
+                } else {
+                    0
+                }
+            })
+            .collect();
+        failed.extend(differences(
+            &ballot_in_an_if_in_a_loop(side, limit),
+            threads,
+            1,
+            &want,
+        ));
+    }
+    assert!(failed.is_empty(), "{}", failed.join("\n"));
 }

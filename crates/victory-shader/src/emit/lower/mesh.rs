@@ -12,7 +12,10 @@ pub(crate) type KeptOutputs = HashMap<(String, u32), u8>;
 /// channels and ordering arbitrary elements by descending component size
 /// (`4`, `2`, `1`, `3`) so Metal's aligned mesh-output layout leaves no padding
 /// holes between scalar/pair and `float4` attributes. System values (`kind != 0`)
-/// stay untouched ahead of arbitrary elements.
+/// stay untouched ahead of arbitrary elements, except clip and cull distances:
+/// Metal lays them out as values in element order too, so they go by size
+/// among the arbitrary ones (one right after the position leaves a hole of up
+/// to 12 bytes before the first `float4`).
 pub(super) fn prune_signature(elements: &mut Vec<SigElement>, keep: &KeptOutputs) {
     elements.retain_mut(|e| {
         if e.kind != 0 {
@@ -34,7 +37,7 @@ pub(super) fn prune_signature(elements: &mut Vec<SigElement>, keep: &KeptOutputs
         true
     });
     elements.sort_by_key(|e| {
-        if e.kind != 0 {
+        if !matches!(e.kind, 0 | 6 | 7) {
             (0u8, 0u8, String::new(), 0u32, 0u8)
         } else {
             let size_rank = match e.cols {

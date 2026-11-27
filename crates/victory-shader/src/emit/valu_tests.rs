@@ -141,6 +141,7 @@ fn lower_valu_cs(native: &NativeProgram) -> Result<HostShader, crate::ShaderErro
     let res = resource::track(&p, &native.layout, native.stage, Some(&st))?;
     let io = io::raise(&p, native)?;
     let lowered = lower::lower(&lower::Parts {
+        halves_rendezvous: false,
         native,
         p: &p,
         st: &st,
@@ -1740,6 +1741,7 @@ fn lower_cs32_with(
     let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("track");
     let io = io::raise(&p, &native).expect("io::raise");
     let lowered = lower::lower(&lower::Parts {
+        halves_rendezvous: false,
         native: &native,
         p: &p,
         st: &st,
@@ -2928,6 +2930,7 @@ fn halves_go_through_a_table_as_they_are_and_name_their_views() {
         resource::track(&p, &native.layout, native.stage, Some(&st)).expect("resource::track");
     let io = io::raise(&p, &native).expect("io::raise");
     let lowered = lower::lower(&lower::Parts {
+        halves_rendezvous: false,
         native: &native,
         p: &p,
         st: &st,
@@ -3100,6 +3103,7 @@ fn half_places_are_the_descriptors_the_program_loads() {
             resource::track(&p, &native.layout, native.stage, Some(&st)).expect("resource::track");
         let io = io::raise(&p, &native).expect("io::raise");
         lower::lower(&lower::Parts {
+            halves_rendezvous: false,
             native: &native,
             p: &p,
             st: &st,
@@ -3231,6 +3235,7 @@ fn a_format_load_read_as_halves_loads_the_integer() {
             resource::track(&p, &native.layout, native.stage, Some(&st)).expect("resource::track");
         let io = io::raise(&p, &native).expect("io::raise");
         let l = lower::lower(&lower::Parts {
+            halves_rendezvous: false,
             native: &native,
             p: &p,
             st: &st,
