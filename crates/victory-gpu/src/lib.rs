@@ -113,6 +113,9 @@ mod widened;
 // Whether the host opens heaps over process memory (ignored by default).
 #[cfg(all(windows, test))]
 mod inplace_probe;
+// Which `footprint` rows hold D3DMetal's memory (ignored by default).
+#[cfg(all(windows, test))]
+mod footprint_probe;
 
 #[cfg(all(windows, feature = "diagnostics"))]
 pub use copystat::CountingAlloc;
