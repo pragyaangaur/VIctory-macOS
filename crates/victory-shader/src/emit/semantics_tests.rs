@@ -891,8 +891,17 @@ fn mad(a: u32, b: u32, c: u32) -> u32 {
     add(mul(a, b), c)
 }
 
+/// `v_mad_legacy_f32` and `v_mac_legacy_f32` on RDNA 2, where their encodings
+/// decode as `v_fma_legacy_f32` and `v_fmac_legacy_f32`: sources flushed, the
+/// product fused with the addend, and a zero factor (a denormal read as one)
+/// gives +0 for the product, so the result is +0 plus the addend.
 fn mad_legacy(a: u32, b: u32, c: u32) -> u32 {
-    add(mul_legacy(a, b), c)
+    let (a, b, c) = (ftz(a), ftz(b), ftz(c));
+    if a & 0x7FFF_FFFF == 0 || b & 0x7FFF_FFFF == 0 {
+        add(0, c)
+    } else {
+        fma(a, b, c)
+    }
 }
 
 /// Minimum or maximum: one NaN operand gives the other, two give the
