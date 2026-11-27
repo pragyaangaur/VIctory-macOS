@@ -1758,6 +1758,12 @@ pub(crate) mod tests {
         assert_eq!(unsafe { std::slice::from_raw_parts((view + 100) as *const u8, 13) }, b"from the disk");
         assert_eq!(t.take(view, view + 2 * PAGE), [(view, view + PAGE)]);
         drop(t);
+        // As the runtime does before it unmaps: the guards let go of the
+        // view's pages. Dropping the tracker opens a page only when nothing
+        // else holds it; otherwise the pages stayed in the guard set after
+        // the unmap, and memory a test running at the same time was given
+        // there counted as guarded already, so its writes went unseen (#31).
+        title_memory_remapped(view, 2 * PAGE);
         // SAFETY: our view.
         unsafe { UnmapViewOfFile(windows_sys::Win32::System::Memory::MEMORY_MAPPED_VIEW_ADDRESS { Value: view as *mut _ }) };
     }
