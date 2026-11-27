@@ -58,6 +58,9 @@ pub mod fence;
 pub mod frame;
 #[cfg(windows)]
 mod heap_worker;
+// Plain std, so its tests run everywhere.
+#[cfg(any(windows, test))]
+mod hot_pages;
 #[cfg(any(windows, test))]
 mod hdr_probe;
 mod hold;
