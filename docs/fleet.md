@@ -55,7 +55,7 @@ server.
 chip label such as `fleet:m3`. A `<!-- fleet-task -->` block in the body pins
 the commit and the chip family.
 
-- **Automatic rounds.** The `fleet-rounds` workflow opens a round, one task per chip family, when main changes, at most once every `auto_round_hours` (24). It also runs daily. Open, unclaimed tasks for older commits are closed as superseded.
+- **Automatic rounds.** The `fleet-rounds` workflow opens a round, one task per chip family, when main changes, at most once every `auto_round_hours` (24), counted from the last round's own tasks: fix verifications and coverage gaps don't postpone it. It also runs daily. Open, unclaimed tasks for older commits are closed as superseded.
 - Maintainers can also open rounds by hand.
 - The queue and the worker ignore any task that wasn't opened by a maintainer listed in `tools/fleet/fleet.json` or by the repository's own workflows.
 

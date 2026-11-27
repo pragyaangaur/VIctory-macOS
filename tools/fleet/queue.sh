@@ -530,7 +530,7 @@ auto_round() {
     if jq -e --arg h "$head" 'any(.[]; (.body // "") | contains("\ncommit: \($h)\n"))' > /dev/null <<< "$tasks"; then
         echo "main ($head) already has tasks"
     else
-        newest=$(jq -r 'map(.created_at) | max // empty' <<< "$tasks")
+        newest=$(newest_round_at "$tasks")
         age=$((hours * 3600))
         [ -n "$newest" ] && age=$(($(date -u +%s) - $(date -u -d "$newest" +%s)))
         if [ "$age" -lt $((hours * 3600)) ]; then

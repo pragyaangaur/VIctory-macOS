@@ -395,6 +395,14 @@ eq "task with fields passes moderation" "" "$(moderate "$fb")"
 ok "macOS constraint met" validate_result "$good" "$SHA" m3 15
 eq "macOS constraint missed" "this task needs macOS 26" "$(validate_result "$good" "$SHA" m3 26 || true)"
 eq "result seconds" 233 "$(result_seconds "$good")"
+# The 24-hour spacing of rounds counts from the last round's own tasks: a
+# later fix verification or coverage gap must not postpone the next round.
+round_tasks=$(jq -cn --arg r "$body" --arg v "$(task_body "$SHA" m3 "$REPO" "" 9 "" 57)" --arg g "$(task_body "$SHA" m3 "$REPO" 26 5)" '
+    [{created_at: "2026-11-26T15:09:34Z", body: $r}, {created_at: "2026-11-26T21:41:00Z", body: $g},
+     {created_at: "2026-11-27T01:04:10Z", body: $v}]')
+eq "newest round ignores verifications and gaps" 2026-11-26T15:09:34Z "$(newest_round_at "$round_tasks")"
+eq "newest round with only verifications" "" "$(newest_round_at "$(jq -c '.[2:]' <<< "$round_tasks")")"
+eq "newest round with no tasks" "" "$(newest_round_at '[]')"
 eq "time limit default with few samples" 6 "$(printf '3600\n3600\n' | time_limit_hours 6)"
 eq "time limit from the 90th percentile" 6 "$(printf '3600\n3600\n7200\n' | time_limit_hours 6)"
 eq "time limit at least 2 hours" 2 "$(printf '60\n60\n60\n' | time_limit_hours 6)"
