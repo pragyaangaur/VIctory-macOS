@@ -52,7 +52,7 @@ fi
 # Ask Cargo where it built the executable, including any configured target directory.
 metadata=$(cargo metadata --format-version 1 --no-deps)
 target_dir=$(printf '%s\n' "$metadata" | /usr/bin/plutil -extract target_directory raw -o - -)
-# VICTORY_SET=<name> reads the switches in tools/macos/sets/<name>.env (one
+# VICTORY_SET=<name> reads the switches in tools/macos/sets/<name>.txt (one
 # NAME=value a line, # comments), as a named set testers can compare runs by
 # (#555). A variable already set in the environment wins over the set.
 if [ -n "${VICTORY_SET:-}" ]; then
@@ -60,8 +60,8 @@ if [ -n "${VICTORY_SET:-}" ]; then
         *[!A-Za-z0-9_-]*) echo "VICTORY_SET names a file in tools/macos/sets: $VICTORY_SET" >&2; exit 1 ;;
     esac
     applied=
-    set_file="$ROOT/tools/macos/sets/$VICTORY_SET.env"
-    [ -f "$set_file" ] || { echo "no switch set $VICTORY_SET: the sets are $(ls "$ROOT/tools/macos/sets" | sed 's/\.env$//' | tr '\n' ' ')" >&2; exit 1; }
+    set_file="$ROOT/tools/macos/sets/$VICTORY_SET.txt"
+    [ -f "$set_file" ] || { echo "no switch set $VICTORY_SET: the sets are $(ls "$ROOT/tools/macos/sets" | sed 's/\.txt$//' | tr '\n' ' ')" >&2; exit 1; }
     while IFS= read -r line || [ -n "$line" ]; do
         case "$line" in
             ''|'#'*) continue ;;
