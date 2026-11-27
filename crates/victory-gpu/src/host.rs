@@ -927,6 +927,21 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn a_shed_list_makes_its_scratch_again_from_the_first_chunk() {
+        let Some(host) = host() else { return };
+        let Ok(list) = host.new_list() else { return };
+        list.scratch(200 << 10).unwrap();
+        list.close();
+        list.reset();
+        assert!(list.scratch_bytes() > 0, "kept for the next cycle");
+        list.shed_scratch();
+        assert_eq!(list.scratch_bytes(), 0);
+        list.scratch(1).unwrap();
+        assert_eq!(list.scratch_bytes(), FIRST_SCRATCH_CHUNK);
+        list.close();
+    }
+
+    #[test]
     fn warp_adapter_accepts_only_software() {
         // This probes DXGI without creating a D3D12 device or running a title.
         // SAFETY: plain DXGI adapter queries.
@@ -1802,11 +1817,14 @@ impl Host {
                     .collect::<Vec<_>>()
             })
             .collect();
+        // Every submission, not only those with textures to bring up: the
+        // staging pools and the upload list (it holds what the last
+        // submission staged) age on each one (`uploads`), and so do the
+        // idle spare lists. The last submission has run.
+        crate::list::trim_idle();
         #[cfg(feature = "diagnostics")]
         let uploading = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::UploadsUs);
-        let uploads = (!heaps.is_empty() || !textures.is_empty())
-            .then(|| crate::bindless::uploads(&heaps, &textures))
-            .flatten();
+        let uploads = crate::bindless::uploads(&heaps, &textures);
         #[cfg(feature = "diagnostics")]
         drop(uploading);
         let runs: Vec<&HostList> = uploads
@@ -3292,6 +3310,27 @@ impl HostList {
         }
     }
 
+    /// The upload memory the list keeps for its next cycle, in bytes.
+    pub(crate) fn scratch_bytes(&self) -> u64 {
+        let s = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
+        s.chunks.iter().map(|c| c.capacity).sum()
+    }
+
+    /// Gives up all the scratch of a list that is reset and that no title
+    /// list or submission uses (`list::SPARE`): the next cycle makes what it
+    /// needs again. Released as [`Self::trim_scratch`] releases its chunks.
+    pub(crate) fn shed_scratch(&self) {
+        let spent = {
+            let mut s = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
+            (s.current, s.used) = (0, 0);
+            std::mem::take(&mut s.chunks)
+        };
+        // Each release is a kernel call, as in [`release_later`].
+        if !spent.is_empty() {
+            release_later(Box::new(spent));
+        }
+    }
+
     /// The host address of the list's indirect-work budget, zeroed at each
     /// submission of the list from the first use after a reset on.
     pub(crate) fn budget(&self) -> Option<u64> {
@@ -4368,6 +4407,16 @@ impl Meter {
                         n as f64 / report_frames,
                         bytes as f64 / report_frames / 1e3,
                         own as f64 / report_frames
+                    );
+                }
+                #[cfg(feature = "diagnostics")]
+                {
+                    let (lists, bytes) = crate::list::spare_scratch();
+                    let shed = crate::list::SPARE_SHED.swap(0, Ordering::Relaxed);
+                    tracing::info!(
+                        "spare host lists: {lists}, keeping {:.1} MB of scratch; {:.1} MB given up since the last line",
+                        bytes as f64 / 1e6,
+                        shed as f64 / 1e6
                     );
                 }
                 for (why, n) in drops.iter().take(40) {

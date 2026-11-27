@@ -199,9 +199,14 @@ pub(crate) fn uploads(
     heaps: &[Arc<Viewed>],
     textures: &[(Arc<crate::texture::Staging>, Arc<crate::resource::HostTexture>)],
 ) -> Option<Uploads> {
-    static LIST: Mutex<Holder> = Mutex::new(Holder(None));
+    static LIST: Mutex<Holder> = Mutex::new(Holder(None, false));
     let mut guard = LIST.lock().unwrap_or_else(|e| e.into_inner());
     crate::texture::recycle();
+    // Nothing to bring up, and the list holds nothing of the last submission
+    // to let go of: it stays as it is.
+    if heaps.is_empty() && textures.is_empty() && !guard.1 {
+        return None;
+    }
     match &guard.0 {
         // Closed by the last submission, which has run.
         Some(list) => list.reset(),
@@ -280,12 +285,14 @@ pub(crate) fn uploads(
         unsafe { list.list.ResourceBarrier(&readable) };
     }
     list.close();
+    guard.1 = recorded;
     // A list recording nothing is not run (its reset next time is fine).
     recorded.then_some(Uploads(guard))
 }
 
-/// The upload list, used under its lock only.
-pub(crate) struct Holder(Option<HostList>);
+/// The upload list, used under its lock only, and whether it holds what it
+/// recorded (the staging it names) until the next reset.
+pub(crate) struct Holder(Option<HostList>, bool);
 // SAFETY: D3D12 objects are free-threaded; the list is used by one
 // submission at a time, under the lock.
 unsafe impl Send for Holder {}

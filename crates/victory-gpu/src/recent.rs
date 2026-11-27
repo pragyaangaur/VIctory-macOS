@@ -134,6 +134,28 @@ impl Pool {
     }
 }
 
+/// How many of the oldest idle entries give up what they hold at `now`: the
+/// leading ones idle longer than [`WINDOW`], then, while the entries left
+/// hold more than `cap` bytes, the oldest of those. `idle` is (when an entry
+/// went idle, the bytes it holds), oldest first, so the ones past the window
+/// come first.
+pub(crate) fn idle_shed(
+    idle: impl Iterator<Item = (Instant, u64)> + Clone,
+    now: Instant,
+    cap: u64,
+) -> usize {
+    let mut kept: u64 = idle.clone().map(|(_, bytes)| bytes).sum();
+    let mut shed = 0;
+    for (at, bytes) in idle {
+        if kept <= cap && now.saturating_duration_since(at) <= WINDOW {
+            break;
+        }
+        kept -= bytes;
+        shed += 1;
+    }
+    shed
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -502,5 +524,57 @@ mod tests {
         // A texture over the upper bound is made each time.
         run(&mut u, 3, &[512 * MIB]);
         assert_eq!(u.made, made + 3);
+    }
+
+    #[test]
+    fn idle_shed_gives_up_what_is_past_the_window_then_the_oldest_over_the_cap() {
+        let t = Instant::now();
+        let at = |s: u64| t + Duration::from_secs(s);
+        let now = at(20);
+        let shed = |idle: &[(u64, u64)], cap: u64| {
+            idle_shed(idle.iter().map(|&(s, b)| (at(s), b)), now, cap)
+        };
+        assert_eq!(shed(&[], 0), 0);
+        // Exactly one window old is still kept.
+        assert_eq!(shed(&[(10, 5), (15, 5)], 10), 0);
+        // Past the window (11 s old) goes; the rest fits the cap.
+        assert_eq!(shed(&[(9, 5), (15, 5)], 10), 1);
+        assert_eq!(shed(&[(0, 1), (1, 2)], u64::MAX), 2);
+        // Over the cap, the oldest go until what is left fits.
+        assert_eq!(shed(&[(12, 4), (14, 4), (16, 4)], 8), 1);
+        assert_eq!(shed(&[(12, 4), (14, 4), (16, 4)], 3), 3);
+    }
+
+    /// `idle_shed` against its definition: the least number of oldest entries
+    /// after which no entry is past the window and the bytes left fit the cap.
+    #[test]
+    fn idle_shed_is_the_least_prefix_that_leaves_no_old_entry_and_fits_the_cap() {
+        let t = Instant::now();
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = move |n: u64| {
+            seed = seed
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            (seed >> 33) % n
+        };
+        for _ in 0..200_000 {
+            let len = next(12) as usize;
+            let mut when = 0;
+            let idle: Vec<(Instant, u64)> = (0..len)
+                .map(|_| {
+                    when += next(6);
+                    (t + Duration::from_secs(when), next(8))
+                })
+                .collect();
+            let now = t + Duration::from_secs(next(40));
+            let cap = next(30);
+            let aged = |at: Instant| now.saturating_duration_since(at) > WINDOW;
+            let fits = |k: usize| {
+                idle[k..].iter().all(|&(at, _)| !aged(at))
+                    && idle[k..].iter().map(|&(_, b)| b).sum::<u64>() <= cap
+            };
+            let least = (0..=len).find(|&k| fits(k)).unwrap();
+            assert_eq!(idle_shed(idle.iter().copied(), now, cap), least);
+        }
     }
 }

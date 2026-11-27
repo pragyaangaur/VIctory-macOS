@@ -299,7 +299,7 @@ fn restart(this: This) -> Result<Option<std::sync::Arc<crate::host::HostList>>, 
         || {
             let spare = SPARE.lock().unwrap_or_else(|e| e.into_inner()).pop();
             if let Some(fresh) = spare {
-                Ok(std::sync::Arc::new(fresh))
+                Ok(std::sync::Arc::new(fresh.list))
             } else if let Some(host) = crate::host::host() {
                 host.new_list().map(std::sync::Arc::new).map_err(|e| {
                     tracing::warn!(error = %e, "no replacement host command list");
@@ -319,8 +319,36 @@ fn restart(this: This) -> Result<Option<std::sync::Arc<crate::host::HostList>>, 
 /// Host lists [`restart`] left to a queue, back once they ran: the next
 /// ones it hands out (a host list and its allocators are not free to make;
 /// Grand Theft Auto VI resets up to 21 lists a frame while they are held).
+/// Oldest first: the newest is the one [`restart`] takes.
 #[cfg(windows)]
-static SPARE: std::sync::Mutex<Vec<crate::host::HostList>> = std::sync::Mutex::new(Vec::new());
+static SPARE: std::sync::Mutex<Vec<Idle>> = std::sync::Mutex::new(Vec::new());
+
+/// A list in [`SPARE`], with when it went idle and the scratch it keeps.
+#[cfg(windows)]
+struct Idle {
+    list: crate::host::HostList,
+    at: std::time::Instant,
+    bytes: u64,
+}
+
+/// The scratch [`SPARE`] keeps in all, at most: the most the texture staging
+/// buffers keep (`texture::KEPT_BYTES_MAX`). A list keeps what its last
+/// cycle needed and nothing bounded that (64 lists of 12 MB held 764 MB), so
+/// the oldest entries give theirs up past this.
+#[cfg(windows)]
+const SPARE_BYTES: u64 = 256 << 20;
+
+/// Scratch [`shed`] gave up since the last frame-rate line, in bytes
+/// (diagnostics).
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) static SPARE_SHED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The spare lists and the scratch they keep, in bytes (diagnostics).
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn spare_scratch() -> (usize, u64) {
+    let spare = SPARE.lock().unwrap_or_else(|e| e.into_inner());
+    (spare.len(), spare.iter().map(|i| i.bytes).sum())
+}
 
 /// A host list a queue has run: one no title list holds any more is reset
 /// and kept for [`restart`].
@@ -329,9 +357,40 @@ pub(crate) fn recycle(list: std::sync::Arc<crate::host::HostList>) {
     const KEPT: usize = 64;
     if let Ok(list) = std::sync::Arc::try_unwrap(list) {
         list.reset();
+        let bytes = list.scratch_bytes();
+        let now = std::time::Instant::now();
         let mut spare = SPARE.lock().unwrap_or_else(|e| e.into_inner());
         if spare.len() < KEPT {
-            spare.push(list);
+            spare.push(Idle {
+                list,
+                at: now,
+                bytes,
+            });
+        }
+        shed(&mut spare, now);
+    }
+}
+
+/// At each submission: the scratch of spare lists idle past
+/// [`crate::recent::WINDOW`] is given up, and of the oldest while the rest
+/// keep more than [`SPARE_BYTES`]. A spare list is reset and no title list
+/// holds it, so nothing uses its scratch.
+#[cfg(windows)]
+pub(crate) fn trim_idle() {
+    let now = std::time::Instant::now();
+    let mut spare = SPARE.lock().unwrap_or_else(|e| e.into_inner());
+    shed(&mut spare, now);
+}
+
+#[cfg(windows)]
+fn shed(spare: &mut [Idle], now: std::time::Instant) {
+    let n = crate::recent::idle_shed(spare.iter().map(|i| (i.at, i.bytes)), now, SPARE_BYTES);
+    for idle in &mut spare[..n] {
+        if idle.bytes > 0 {
+            idle.list.shed_scratch();
+            #[cfg(feature = "diagnostics")]
+            SPARE_SHED.fetch_add(idle.bytes, std::sync::atomic::Ordering::Relaxed);
+            idle.bytes = 0;
         }
     }
 }
