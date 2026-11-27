@@ -2121,7 +2121,7 @@ impl Host {
             Vec::with_capacity(2 * runs.len() + needed_barriers);
         // Where each run's lists start in `lists`.
         let mut firsts = Vec::with_capacity(runs.len());
-        let mut batch = Batch::default();
+        let mut batch = Batch::take();
         for (idx, list) in runs.iter().enumerate() {
             list.run_deferred(&mut batch);
             firsts.push(lists.len());
@@ -4278,18 +4278,44 @@ impl HostList {
 /// write meanwhile is for later submissions (on the console it would race
 /// the GPU).
 #[derive(Default)]
+struct PtrHasher(u64);
+
+impl std::hash::Hasher for PtrHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+    fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.0 = self.0.wrapping_mul(0x9e37_79b9_7f4a_7c15) ^ u64::from(b);
+        }
+    }
+    fn write_usize(&mut self, i: usize) {
+        let x = (i as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+        self.0 = x ^ (x >> 32);
+    }
+}
+
+type PtrMap<V> = std::collections::HashMap<usize, V, std::hash::BuildHasherDefault<PtrHasher>>;
+
+struct BatchBuffers {
+    refreshes: Vec<(std::sync::Arc<crate::shadow::Shadow>, crate::ranges::Ranges)>,
+    pending: PtrMap<usize>,
+    current: PtrMap<(std::sync::Arc<crate::shadow::Shadow>, crate::ranges::Ranges)>,
+    extents: victory_formats::extents::Extents,
+}
+
+static BATCH_POOL: Mutex<Vec<BatchBuffers>> = Mutex::new(Vec::new());
+
+#[derive(Default)]
 struct Batch {
     /// The ranges still to bring up to date, by copy.
     refreshes: Vec<(std::sync::Arc<crate::shadow::Shadow>, crate::ranges::Ranges)>,
     /// Where each copy's refreshes are in `refreshes`, by copy.
-    pending: std::collections::HashMap<usize, usize>,
+    pending: PtrMap<usize>,
     /// The ranges of each copy brought up to date since the last write that
     /// can have changed them, by copy (held, so that its address names no
     /// other).
-    current: std::collections::HashMap<
-        usize,
-        (std::sync::Arc<crate::shadow::Shadow>, crate::ranges::Ranges),
-    >,
+    current: PtrMap<(std::sync::Arc<crate::shadow::Shadow>, crate::ranges::Ranges)>,
     /// Totals and the largest ranges refreshed by this submission, for a
     /// bounded diagnostics line. No range contents or view attribution.
     #[cfg(feature = "diagnostics")]
@@ -4306,7 +4332,41 @@ struct Batch {
 /// measured).
 const JOIN: usize = crate::watch::PAGE;
 
+impl Drop for Batch {
+    fn drop(&mut self) {
+        self.refreshes.clear();
+        self.pending.clear();
+        self.current.clear();
+        self.extents.clear();
+        if self.current.capacity() == 0 && self.pending.capacity() == 0 {
+            return;
+        }
+        let mut pool = BATCH_POOL.lock().unwrap_or_else(|e| e.into_inner());
+        if pool.len() < 4 {
+            pool.push(BatchBuffers {
+                refreshes: std::mem::take(&mut self.refreshes),
+                pending: std::mem::take(&mut self.pending),
+                current: std::mem::take(&mut self.current),
+                extents: std::mem::take(&mut self.extents),
+            });
+        }
+    }
+}
+
 impl Batch {
+    fn take() -> Self {
+        let Some(buffers) = BATCH_POOL.lock().unwrap_or_else(|e| e.into_inner()).pop() else {
+            return Self::default();
+        };
+        Self {
+            refreshes: buffers.refreshes,
+            pending: buffers.pending,
+            current: buffers.current,
+            #[cfg(feature = "diagnostics")]
+            summary: Default::default(),
+            extents: buffers.extents,
+        }
+    }
     fn add(&mut self, shadow: &std::sync::Arc<crate::shadow::Shadow>, address: usize, len: usize) {
         // Nothing to copy: a world submission asks for every copy its heaps'
         // views and page tables reach (~9,000), a few of them written.
@@ -6623,6 +6683,21 @@ mod batch {
         crate::shadow::unregister(a, a as u64);
         crate::shadow::unregister(b, b as u64);
         done(src, None);
+    }
+
+    #[test]
+    fn batch_pool_recycles_cleanly() {
+        let mut batch = Batch::take();
+        batch.pending.insert(0x1234_5678, 0);
+        batch.extents.flushed(0x1234_5678, 0x1000, 0x2000);
+        let cap = batch.pending.capacity();
+        drop(batch);
+
+        let recycled = Batch::take();
+        assert!(recycled.pending.is_empty());
+        assert!(recycled.current.is_empty());
+        assert!(recycled.refreshes.is_empty());
+        assert!(recycled.pending.capacity() >= cap);
     }
 }
 
