@@ -900,12 +900,20 @@ fn protect_noting(g: &mut Guards, pages: &[usize], unmapped_pages: &mut Vec<usiz
         // SAFETY: title memory; only its protection changes.
         unsafe { VirtualProtect((from * PAGE) as *const _, (to - from) * PAGE, PAGE_READONLY, &mut old) != 0 }
     };
-    let unmapped = |page: usize| {
+    let unmapped_region = |page: usize| -> Option<usize> {
         // SAFETY: plain data filled in by the query.
         let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
         // SAFETY: a valid out pointer of the right size.
         let n = unsafe { VirtualQuery((page * PAGE) as *const _, &mut info, size_of_val(&info)) };
-        n == 0 || info.State != MEM_COMMIT
+        if n == 0 {
+            return Some(page + 1);
+        }
+        if info.State != MEM_COMMIT {
+            let end = ((info.BaseAddress as usize).saturating_add(info.RegionSize) / PAGE)
+                .max(page + 1);
+            return Some(end);
+        }
+        None
     };
     let mut taken = Vec::with_capacity(pages.len());
     let busy = |page: usize| g.busy.iter().any(|&(a, b)| (a..b).contains(&page));
@@ -944,22 +952,50 @@ fn protect_noting(g: &mut Guards, pages: &[usize], unmapped_pages: &mut Vec<usiz
         }
         let run = &pages[first..=i];
         i += 1;
-        if set(run[0], run[run.len() - 1] + 1) {
-            g.protected.extend(run);
-            taken.extend(run);
-            continue;
-        }
-        for &page in run {
-            if set(page, page + 1) {
-                g.protected.insert(page);
-                taken.push(page);
-            } else if unmapped(page) {
-                taken.push(page);
-                unmapped_pages.push(page);
-            }
-        }
+        protect_run_pages(
+            run,
+            &mut g.protected,
+            &mut taken,
+            unmapped_pages,
+            set,
+            unmapped_region,
+        );
     }
     taken
+}
+
+/// Guards a contiguous run of unprotected pages, falling back to per-page
+/// protection on failure and skipping whole uncommitted `VirtualQuery` regions
+/// without probing each unmapped page individually under `Guards`.
+fn protect_run_pages(
+    run: &[usize],
+    protected: &mut BTreeSet<usize>,
+    taken: &mut Vec<usize>,
+    unmapped_pages: &mut Vec<usize>,
+    mut set: impl FnMut(usize, usize) -> bool,
+    mut unmapped_region: impl FnMut(usize) -> Option<usize>,
+) {
+    if set(run[0], run[run.len() - 1] + 1) {
+        protected.extend(run);
+        taken.extend(run);
+        return;
+    }
+    let mut unmapped_until = 0usize;
+    for &page in run {
+        if page < unmapped_until {
+            taken.push(page);
+            unmapped_pages.push(page);
+            continue;
+        }
+        if set(page, page + 1) {
+            protected.insert(page);
+            taken.push(page);
+        } else if let Some(end) = unmapped_region(page) {
+            taken.push(page);
+            unmapped_pages.push(page);
+            unmapped_until = end;
+        }
+    }
 }
 
 /// Asks `VirtualQuery` for the region containing `page` and whether it is
@@ -2367,5 +2403,41 @@ pub(crate) mod tests {
         assert_eq!(kept, expected);
         assert!(ends[..1000].iter().all(|&e| e == 1000));
         assert!(ends[1000..].iter().all(|&e| e == 2000));
+    }
+
+    /// When a bulk `VirtualProtect` fails on a run containing uncommitted pages,
+    /// `protect_run_pages` skips the rest of each uncommitted `VirtualQuery`
+    /// region without calling `VirtualProtect` or `VirtualQuery` on every
+    /// unmapped page individually.
+    #[test]
+    fn protect_run_pages_skips_uncommitted_regions_without_per_page_probes() {
+        let run: Vec<usize> = (100..164).collect(); // 64 pages
+        let mut protected = BTreeSet::new();
+        let mut taken = Vec::new();
+        let mut unmapped_pages = Vec::new();
+        let (mut protect_calls, mut query_calls) = (0usize, 0usize);
+
+        // Pages 100..110 are committed; 110..164 are one uncommitted reservation.
+        protect_run_pages(
+            &run,
+            &mut protected,
+            &mut taken,
+            &mut unmapped_pages,
+            |from, to| {
+                protect_calls += 1;
+                to <= 110 && from >= 100
+            },
+            |page| {
+                query_calls += 1;
+                (page >= 110).then_some(164)
+            },
+        );
+
+        // 1 bulk call + 10 committed per-page calls + 1 failing call at 110 = 12.
+        assert_eq!(protect_calls, 12);
+        assert_eq!(query_calls, 1, "one VirtualQuery for the whole uncommitted tail");
+        assert_eq!(taken, run);
+        assert_eq!(protected, (100..110).collect::<BTreeSet<_>>());
+        assert_eq!(unmapped_pages, (110..164).collect::<Vec<_>>());
     }
 }
