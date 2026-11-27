@@ -1132,6 +1132,7 @@ impl Drop for HostTexture {
             use windows::core::Interface;
             life::note(self.texture.as_raw() as usize, life::LET_GO, 0, life::holders(&self.texture));
         }
+        crate::host::retire(self.texture.clone());
     }
 }
 

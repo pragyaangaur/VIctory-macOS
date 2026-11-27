@@ -155,6 +155,21 @@ no "extra count field" bad '.native.note = 1'
 no "bad setup value" bad '.setup = "maybe"'
 no "array instead of object" validate_result '[1]' "$SHA" m3
 no "not JSON" validate_result 'nope' "$SHA" m3
+no "null chip is rejected" bad '.chip = null'
+no "array chip is rejected" bad '.chip = []'
+no "null macOS version is rejected" bad '.macos = null'
+no "null failures are rejected" bad '.failures = null'
+no "null binaries are rejected" bad '.binaries = null'
+no "multiple JSON documents are rejected" validate_result "$good"$'\n'"$good" "$SHA" m3
+ok "trailing whitespace after one document is accepted" validate_result "$good"$'\n \t' "$SHA" m3
+# jq execution errors must fail validation even when they print no diagnostics.
+validator_error() {
+    (
+        jq() { if [ "${1:-}" = -r ]; then return 5; else command jq "$@"; fi; }
+        validate_result "$good" "$SHA" m3
+    )
+}
+no "validator execution failure is rejected" validator_error
 no "too large" validate_result "$(printf '%9000s' x)" "$SHA" m3
 ok "null suites when setup failed" bad '.setup = "failed" | .native = null | .wine = null | .failures = [] | .binaries = []'
 ok "unknown toolkit version" bad '.gptk = "unknown"'
@@ -335,6 +350,10 @@ english_sig=$(failures_json "$(parse_cargo "$tmp/english-os.log")" wine | jq -r 
 french_sig=$(failures_json "$(parse_cargo "$tmp/french-os.log")" wine | jq -r '.[0].sig')
 eq "localized OS error text gives the same signature" "$english_sig" "$french_sig"
 eq "binaries json" '[{"suite":"wine","name":"victory_gpu","seconds":0.52},{"suite":"wine","name":"load_probe","seconds":12},{"suite":"wine","name":"doc_victory_core","seconds":0}]' "$(binaries_json "$parsed" wine)"
+for checkout in '/Users/worker/Project (copy)' '/Users/worker/Project (nested (copy))'; do
+    sed "s|target/|$checkout/target/|g" "$tmp/native.log" > "$tmp/parenthesized.log"
+    eq "Cargo parsing preserves binary names under $checkout" "$parsed" "$(parse_cargo "$tmp/parenthesized.log")"
+done
 eq "signature lines keep the text locally" "native/victory_gpu::tests::two" "$(signature_lines "$parsed" native | head -n 1 | cut -f 2)"
 eq "topic: timeout wins" timeout "$(failure_topic "victory_gpu::x" "timed out after #s")"
 eq "topic: crate" shader "$(failure_topic "victory_shader::t" "assertion failed")"

@@ -9,15 +9,18 @@
 //! Each list also has a budget (2^27 vertex instances or threads, groups
 //! counted as 64 threads, mesh groups as 128): records past it run empty,
 //! so a list of thousands of garbage records cannot run for seconds
-//! either.
+//! either. By default (`VICTORY_INDIRECT_REST=0`), a record that does not
+//! fit in the remaining budget runs empty without taking the rest, so
+//! smaller draws after it still run.
 //!
 //! With a count buffer ExecuteIndirect runs only the first min(max, count)
 //! records, so the clamp reads the count word and stops there: the maximum
 //! can be far above the count, and the records between never run.
 //!
-//! shortcut: the bounds (2^24 vertices, 2^26 vertex instances, 65,535
-//! groups per dimension except in x where [`widest`] allows more, 2^20
-//! per dispatch, one-dimensional mesh dispatches, the budget) cut
+//! shortcut: the bounds (below 2^23 vertices per instance, 2^26 vertex
+//! instances, 65,535 groups per dimension except in x where [`widest`]
+//! allows more, 2^20 per dispatch, one-dimensional mesh dispatches up to
+//! 65,535 groups, the budget) cut
 //! legitimate work beyond them; raise them if the title needs more.
 
 use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
@@ -107,8 +110,9 @@ pub(crate) fn widest() -> u32 {
 struct Clamp {
     root: ID3D12RootSignature,
     pso: ID3D12PipelineState,
-    /// Built from [`WORDS_SOURCE`], which also reads the budget as words
-    /// through root view 5 (the other views are those of [`SOURCE`]).
+    /// Built from [`WORDS_SOURCE`] or [`WORDS_1_SOURCE`], which also reads
+    /// the budget as words through root view 5 (the other views are those of
+    /// [`SOURCE`]).
     words: bool,
 }
 
@@ -139,10 +143,45 @@ fn make() -> windows::core::Result<Clamp> {
         }
         Err(e) => tracing::warn!(error = %e, "precompiled argument clamp unavailable"),
     }
-    make_fxc().or_else(|e| {
-        tracing::info!(error = %e, "argument clamp: building the one-thread form");
-        make_words()
-    })
+    make_fxc()
+        .or_else(|e| {
+            tracing::info!(error = %e, "argument clamp: building the 64-lane words form");
+            make_words()
+        })
+        .or_else(|e| {
+            tracing::info!(error = %e, "argument clamp: building the one-thread words form");
+            make_words_1()
+        })
+}
+
+/// Whether a record that does not fit in what is left of its list's budget
+/// takes the rest (`VICTORY_INDIRECT_REST=1`), emptying every record after
+/// it. Off (`0`) by default so one oversized record zeroes only itself.
+fn indirect_rest() -> bool {
+    #[cfg(test)]
+    if let Some(rest) = TEST_INDIRECT_REST.with(std::cell::Cell::get) {
+        return rest;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::switch::on("VICTORY_INDIRECT_REST"))
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_INDIRECT_REST: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+fn with_indirect_rest<R>(rest: bool, f: impl FnOnce() -> R) -> R {
+    struct Guard(Option<bool>);
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            TEST_INDIRECT_REST.with(|cell| cell.set(self.0));
+        }
+    }
+    let prev = TEST_INDIRECT_REST.with(|cell| cell.replace(Some(rest)));
+    let _guard = Guard(prev);
+    f()
 }
 
 /// The clamp compiled by DXC at build time. D3DMetal finds a shader by the
@@ -161,46 +200,177 @@ fn precompiled() -> windows::core::Result<Clamp> {
     from_bytes(&bytes)
 }
 
-/// The clamp for Wine's HLSL compiler (vkd3d-shader), which has no `Load`
-/// on `RWByteAddressBuffer`, no stores to indexed group-shared memory and
-/// no `[RootSignature]`: [`SOURCE`]'s clamp, read through structured views
-/// of the same buffers, and one thread charging the records in order
-/// instead of a group of 64. The results are the same.
+/// The 64-lane clamp for Wine's HLSL compiler (vkd3d-shader), which has no
+/// `Load` on `RWByteAddressBuffer`, no stores to indexed group-shared memory
+/// and no `[RootSignature]`: [`SOURCE`]'s 64-lane tile clamp, read through
+/// structured views of the same buffers, with per-lane scratch slots in
+/// `budget` bytes `64..320` (`budgetWords[16..80]`).
 const WORDS_SOURCE: &str = r#"
-cbuffer Record : register(b0) { uint kind; uint stride; uint records; uint counted; uint widest; };
+cbuffer Record : register(b0) { uint kind; uint stride; uint records; uint flags; uint widest; };
 StructuredBuffer<uint> argWords : register(t0);
 RWByteAddressBuffer budget : register(u1);
 RWByteAddressBuffer dest : register(u0);
 StructuredBuffer<uint> countWords : register(t1);
 RWStructuredBuffer<uint> budgetWords : register(u2);
 static const uint BUDGET = 1u << 27;
+static const uint MOST_DRAW = 1u << 23;
 static const uint GROUPS = 1u << 20;
-uint3 load3(uint at) { return uint3(argWords[at / 4], argWords[at / 4 + 1], argWords[at / 4 + 2]); }
+static const uint PAST = 0xffffffffu;
+uint3 load3(uint at) { return uint3(argWords[at / 4u], argWords[at / 4u + 1u], argWords[at / 4u + 2u]); }
 uint clamped(uint at) {
     uint cost;
-    if (kind <= 1) {
-        uint count = min(argWords[at / 4], 1u << 24);
-        uint instances = min(argWords[at / 4 + 1], (1u << 26) / max(count, 1u));
+    uint base_bytes;
+    if (kind <= 1u) {
+        uint raw_count = argWords[at / 4u];
+        uint raw_instances = argWords[at / 4u + 1u];
+        uint count = raw_count;
+        uint instances = 0u;
+        if (raw_count >= MOST_DRAW) {
+            count = 0u;
+        } else {
+            instances = min(raw_instances, (1u << 26) / max(count, 1u));
+        }
         cost = count * instances;
         dest.Store2(at, uint2(count, instances));
-        if (kind == 1) {
-            dest.Store3(at + 8, uint3(argWords[at / 4 + 2], argWords[at / 4 + 3], argWords[at / 4 + 4]));
+        if (kind == 1u) {
+            dest.Store3(at + 8u, uint3(argWords[at / 4u + 2u], argWords[at / 4u + 3u], argWords[at / 4u + 4u]));
+            base_bytes = 20u;
         } else {
-            dest.Store2(at + 8, uint2(argWords[at / 4 + 2], argWords[at / 4 + 3]));
+            dest.Store2(at + 8u, uint2(argWords[at / 4u + 2u], argWords[at / 4u + 3u]));
+            base_bytes = 16u;
         }
-    } else if (kind == 2) {
+    } else if (kind == 2u) {
         uint3 g = load3(at);
         g = uint3(g.x <= widest ? g.x : 65535u, min(g.y, 65535u), min(g.z, 65535u));
-        if ((g.y != 0 && g.x > GROUPS / g.y) || (g.z != 0 && g.x * g.y > GROUPS / g.z)) {
-            g = uint3(0, 0, 0);
+        if ((g.y != 0u && g.x > GROUPS / g.y) || (g.z != 0u && g.x * g.y > GROUPS / g.z)) {
+            g = uint3(0u, 0u, 0u);
         }
-        cost = g.x * g.y * g.z * 64;
+        cost = g.x * g.y * g.z * 64u;
         dest.Store3(at, g);
+        base_bytes = 12u;
     } else {
-        uint3 g = load3(at);
-        g = uint3(min(g.x, 65535u), min(g.y, 1u), min(g.z, 1u));
-        cost = g.x * g.y * g.z * 128;
+        uint3 raw_g = load3(at);
+        uint3 g = uint3(raw_g.x, min(raw_g.y, 1u), min(raw_g.z, 1u));
+        if (raw_g.x > 65535u) {
+            g = uint3(0u, 0u, 0u);
+        }
+        cost = g.x * g.y * g.z * 128u;
         dest.Store3(at, g);
+        base_bytes = 12u;
+    }
+    for (uint extra = base_bytes; extra < stride; extra += 4u) {
+        dest.Store(at + extra, argWords[(at + extra) / 4u]);
+    }
+    return cost;
+}
+[numthreads(64, 1, 1)]
+void main(uint3 id : SV_DispatchThreadID) {
+    uint lane = id.x;
+    uint left = 0u;
+    if (lane == 0u) {
+        left = BUDGET - min(budgetWords[0], BUDGET);
+    }
+    uint walked = records;
+    if ((flags & 1u) != 0u) {
+        walked = min(records, countWords[0]);
+    }
+    uint take_rest = flags & 2u;
+    uint tiles = (records + 63u) / 64u;
+    for (uint tile = 0u; tile < tiles; tile++) {
+        uint record = tile * 64u + lane;
+        uint at = record * stride;
+        uint cost = 0u;
+        if (record < walked) {
+            cost = clamped(at);
+        }
+        budget.Store(64u + lane * 4u, cost);
+        AllMemoryBarrierWithGroupSync();
+        if (lane == 0u && tile * 64u < walked) {
+            for (uint i = 0u; i < 64u; i++) {
+                uint c = budgetWords[16u + i];
+                if (c > left) {
+                    budget.Store(64u + i * 4u, PAST);
+                    if (take_rest != 0u) {
+                        left = 0u;
+                    }
+                } else {
+                    left -= c;
+                }
+            }
+        }
+        AllMemoryBarrierWithGroupSync();
+        if (record < walked && budgetWords[16u + lane] == PAST) {
+            if (kind <= 1u) {
+                dest.Store2(at, uint2(0u, 0u));
+            } else {
+                dest.Store3(at, uint3(0u, 0u, 0u));
+            }
+        }
+        if (tile + 1u < tiles) {
+            AllMemoryBarrierWithGroupSync();
+        }
+    }
+    if (lane == 0u) {
+        budget.Store(0u, BUDGET - left);
+    }
+}
+"#;
+
+/// One-thread fallback for compilers that refuse [`WORDS_SOURCE`].
+const WORDS_1_SOURCE: &str = r#"
+cbuffer Record : register(b0) { uint kind; uint stride; uint records; uint flags; uint widest; };
+StructuredBuffer<uint> argWords : register(t0);
+RWByteAddressBuffer budget : register(u1);
+RWByteAddressBuffer dest : register(u0);
+StructuredBuffer<uint> countWords : register(t1);
+RWStructuredBuffer<uint> budgetWords : register(u2);
+static const uint BUDGET = 1u << 27;
+static const uint MOST_DRAW = 1u << 23;
+static const uint GROUPS = 1u << 20;
+uint3 load3(uint at) { return uint3(argWords[at / 4u], argWords[at / 4u + 1u], argWords[at / 4u + 2u]); }
+uint clamped(uint at) {
+    uint cost;
+    uint base_bytes;
+    if (kind <= 1u) {
+        uint raw_count = argWords[at / 4u];
+        uint raw_instances = argWords[at / 4u + 1u];
+        uint count = raw_count;
+        uint instances = 0u;
+        if (raw_count >= MOST_DRAW) {
+            count = 0u;
+        } else {
+            instances = min(raw_instances, (1u << 26) / max(count, 1u));
+        }
+        cost = count * instances;
+        dest.Store2(at, uint2(count, instances));
+        if (kind == 1u) {
+            dest.Store3(at + 8u, uint3(argWords[at / 4u + 2u], argWords[at / 4u + 3u], argWords[at / 4u + 4u]));
+            base_bytes = 20u;
+        } else {
+            dest.Store2(at + 8u, uint2(argWords[at / 4u + 2u], argWords[at / 4u + 3u]));
+            base_bytes = 16u;
+        }
+    } else if (kind == 2u) {
+        uint3 g = load3(at);
+        g = uint3(g.x <= widest ? g.x : 65535u, min(g.y, 65535u), min(g.z, 65535u));
+        if ((g.y != 0u && g.x > GROUPS / g.y) || (g.z != 0u && g.x * g.y > GROUPS / g.z)) {
+            g = uint3(0u, 0u, 0u);
+        }
+        cost = g.x * g.y * g.z * 64u;
+        dest.Store3(at, g);
+        base_bytes = 12u;
+    } else {
+        uint3 raw_g = load3(at);
+        uint3 g = uint3(raw_g.x, min(raw_g.y, 1u), min(raw_g.z, 1u));
+        if (raw_g.x > 65535u) {
+            g = uint3(0u, 0u, 0u);
+        }
+        cost = g.x * g.y * g.z * 128u;
+        dest.Store3(at, g);
+        base_bytes = 12u;
+    }
+    for (uint extra = base_bytes; extra < stride; extra += 4u) {
+        dest.Store(at + extra, argWords[(at + extra) / 4u]);
     }
     return cost;
 }
@@ -208,26 +378,39 @@ uint clamped(uint at) {
 void main() {
     uint left = BUDGET - min(budgetWords[0], BUDGET);
     uint walked = records;
-    if (counted != 0) {
+    if ((flags & 1u) != 0u) {
         walked = min(records, countWords[0]);
     }
-    for (uint record = 0; record < walked; record++) {
+    uint take_rest = flags & 2u;
+    for (uint record = 0u; record < walked; record++) {
         uint at = record * stride;
         uint cost = clamped(at);
         if (cost > left) {
-            // The first record that does not fit takes what is left, so
-            // those after it run empty too.
-            dest.Store(at, 0);
-            left = 0;
+            if (kind <= 1u) {
+                dest.Store2(at, uint2(0u, 0u));
+            } else {
+                dest.Store3(at, uint3(0u, 0u, 0u));
+            }
+            if (take_rest != 0u) {
+                left = 0u;
+            }
         } else {
             left -= cost;
         }
     }
-    budget.Store(0, BUDGET - left);
+    budget.Store(0u, BUDGET - left);
 }
 "#;
 
 fn make_words() -> windows::core::Result<Clamp> {
+    make_words_from(WORDS_SOURCE)
+}
+
+fn make_words_1() -> windows::core::Result<Clamp> {
+    make_words_from(WORDS_1_SOURCE)
+}
+
+fn make_words_from(source: &str) -> windows::core::Result<Clamp> {
     use crate::compute::Param;
     let params = [
         Param::Constants { register: 0, count: 5 },
@@ -237,7 +420,7 @@ fn make_words() -> windows::core::Result<Clamp> {
         Param::Srv { register: 1, space: 0 },
         Param::Uav { register: 2 },
     ];
-    let (root, pso) = crate::compute::pipeline(WORDS_SOURCE, s!("clamp"), 0, &params)?;
+    let (root, pso) = crate::compute::pipeline(source, s!("clamp"), 0, &params)?;
     Ok(Clamp { root, pso, words: true })
 }
 
@@ -345,7 +528,8 @@ fn bound_with(
     CLAMPS[1].fetch_add(1, Ordering::Relaxed);
     let out = list.arguments(u64::from(stride) * u64::from(records.max(1)))?;
     let l = &list.list;
-    let constants = [kind, stride, records, u32::from(count.is_some()), widest()];
+    let flags = u32::from(count.is_some()) | (u32::from(indirect_rest()) << 1);
+    let constants = [kind, stride, records, flags, widest()];
     // SAFETY: an open list; our root signature, pipeline and buffers, and
     // title buffers' copies the caller's list holds.
     unsafe {
@@ -445,6 +629,7 @@ pub(crate) fn record_batch(
         ));
     }
     let widest = widest();
+    let rest = indirect_rest();
     // SAFETY: `cmd` is the host list's open prelude command list; our clamp
     // pipeline, budget buffer, hoisted argument buffers, and title shadow
     // copies are kept alive by the host list until reset.
@@ -470,7 +655,7 @@ pub(crate) fn record_batch(
                 clamp.kind,
                 clamp.stride,
                 clamp.records,
-                u32::from(clamp.count_gpu.is_some()),
+                u32::from(clamp.count_gpu.is_some()) | (u32::from(rest) << 1),
                 widest,
             ];
             cmd.SetComputeRoot32BitConstants(
@@ -519,27 +704,24 @@ pub(crate) fn done(list: &HostList, arguments: &ID3D12Resource) {
 mod tests {
     use crate::backend::{HostGpu, HostMemory};
 
-    /// The clamp compiles with the system's compiler and the host takes it.
+    /// The clamp compiles with the system's compiler (including both 64-lane
+    /// and 1-lane words forms) and the host takes it.
     #[test]
     fn argument_clamp_builds() {
         if super::host().is_none() {
             return; // no host GPU here
         }
         assert!(super::clamp().is_some());
+        assert!(super::make_words().is_ok());
+        assert!(super::make_words_1().is_ok());
     }
 
     /// Every word the clamp `c` writes for `records` records of `kind` made
     /// from `seed` by a small generator, in one list with no count buffer.
     /// `None` without a host GPU.
-    #[cfg(victory_dxc_clamp)]
-    fn clamp_all(c: &super::Clamp, kind: u32, seed: u32, records: u32) -> Option<Vec<u32>> {
+    fn clamp_all(c: &super::Clamp, kind: u32, stride_words: usize, seed: u32, records: u32) -> Option<Vec<u32>> {
         let host = super::host()?;
-        let per = match kind {
-            0 => 4,
-            1 => 5,
-            _ => 3,
-        };
-        let all = per * records as usize;
+        let all = stride_words * records as usize;
         let (buffer, data) = host.shared_buffer(all as u64 * 4 + 16).unwrap();
         let data = data.cast::<u32>();
         let list = host.new_list().unwrap();
@@ -549,11 +731,15 @@ mod tests {
         unsafe {
             for at in 0..all {
                 state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
-                // Mostly small values, now and then a wild one.
-                let word = if state >> 28 == 0 { state } else { (state >> 8) % 9000 };
+                // Mostly small values, now and then a wild or all-ones one.
+                let word = match state >> 28 {
+                    0 => state,
+                    1 => u32::MAX,
+                    _ => (state >> 8) % 9000,
+                };
                 data.add(at).write_volatile(word);
             }
-            let spec = (kind, per as u32 * 4, records);
+            let spec = (kind, stride_words as u32 * 4, records);
             let out = super::bound_with(c, &list, buffer.GetGPUVirtualAddress(), spec, None).unwrap();
             super::done(&list, &out);
             list.close();
@@ -578,10 +764,38 @@ mod tests {
         assert!(!precompiled.words);
         assert!(!super::clamp().expect("argument clamp").words);
         let reference = super::make_fxc().or_else(|_| super::make_words()).expect("the existing clamp");
-        for (kind, seed, records) in [(0, 1, 200), (1, 2, 200), (2, 3, 130), (10, 4, 70), (0, 5, 3)] {
-            let new = clamp_all(&precompiled, kind, seed, records).unwrap();
-            let old = clamp_all(&reference, kind, seed, records).unwrap();
+        for (kind, per, seed, records) in [(0, 4, 1, 200), (1, 5, 2, 200), (2, 3, 3, 130), (10, 3, 4, 70), (0, 8, 5, 135)] {
+            let new = clamp_all(&precompiled, kind, per, seed, records).unwrap();
+            let old = clamp_all(&reference, kind, per, seed, records).unwrap();
             assert_eq!(new, old, "kind {kind}, {records} records");
+        }
+    }
+
+    /// The 64-lane `WORDS_SOURCE` clamp and the 1-lane `WORDS_1_SOURCE`
+    /// fallback produce identical words across multi-tile batches and padded
+    /// strides, under both `VICTORY_INDIRECT_REST=0` and `=1`.
+    #[test]
+    fn words_64_lane_matches_1_lane_across_tiles_and_strides() {
+        if super::host().is_none() {
+            return; // no host GPU here
+        }
+        let wide = super::make_words().expect("64-lane words clamp");
+        let single = super::make_words_1().expect("1-lane words clamp");
+        for rest in [false, true] {
+            super::with_indirect_rest(rest, || {
+                for (kind, per, seed, records) in [
+                    (0, 4, 11, 150),
+                    (0, 8, 12, 135),
+                    (1, 5, 13, 140),
+                    (2, 3, 14, 130),
+                    (10, 3, 15, 145),
+                    (10, 8, 16, 132),
+                ] {
+                    let a = clamp_all(&wide, kind, per, seed, records).unwrap();
+                    let b = clamp_all(&single, kind, per, seed, records).unwrap();
+                    assert_eq!(a, b, "rest {rest}, kind {kind}, stride_words {per}, records {records}");
+                }
+            });
         }
     }
 
@@ -643,16 +857,119 @@ mod tests {
         }
     }
 
-    /// Rejected records do not wrap the budget: of 128 garbage draws (2^26
+    /// Unfilled draw records (`>= 1 << 23` vertices/indices) and unfilled
+    /// mesh dispatch records (`> 65535` groups, including `0xffffffff`) are
+    /// zeroed with trailing words preserved and spend zero budget.
+    #[test]
+    fn unfilled_draw_and_mesh_records_run_empty_without_spending_budget() {
+        let Some(host) = super::host() else {
+            return; // no host GPU here
+        };
+        // 80 draw records (`stride = 32` bytes = 8 words): 76 unfilled
+        // (`1 << 23` and `u32::MAX`) followed by 4 valid records.
+        const COUNT: usize = 80;
+        let (draw_buf, draw_ptr) = host.shared_buffer((COUNT * 32) as u64).unwrap();
+        let (mesh_buf, mesh_ptr) = host.shared_buffer((COUNT * 32) as u64).unwrap();
+        // SAFETY: our mapped buffers, written before execution and read after.
+        unsafe {
+            let draws = std::slice::from_raw_parts_mut(draw_ptr.cast::<[u32; 8]>(), COUNT);
+            for (i, d) in draws.iter_mut().enumerate() {
+                let k = i as u32;
+                let head = match i {
+                    0..=37 => [u32::MAX, u32::MAX],
+                    38..=75 => [1 << 23, 4],
+                    76 => [(1 << 23) - 1, 1],
+                    _ => [12, 2],
+                };
+                *d = [head[0], head[1], 100 + k, 200 + k, 0xa000 + k, 0xb000 + k, 0xc000 + k, 0xd000 + k];
+            }
+            let meshes = std::slice::from_raw_parts_mut(mesh_ptr.cast::<[u32; 8]>(), COUNT);
+            for (i, m) in meshes.iter_mut().enumerate() {
+                let k = i as u32;
+                let gx = match i {
+                    0..=37 => u32::MAX,
+                    38..=75 => 65_536,
+                    76 => 65_535,
+                    _ => 7,
+                };
+                *m = [gx, 9, 5, 0x1000 + k, 0x2000 + k, 0x3000 + k, 0x4000 + k, 0x5000 + k];
+            }
+
+            let list = host.new_list().unwrap();
+            let out_d = super::bound(&list, draw_buf.GetGPUVirtualAddress(), (0, 32, COUNT as u32), None).unwrap();
+            super::done(&list, &out_d);
+            list.close();
+            host.execute(&[&list]);
+            let mut p = std::ptr::null_mut();
+            out_d.Map(0, None, Some(&mut p)).unwrap();
+            let got_d = std::slice::from_raw_parts(p.cast::<[u32; 8]>(), COUNT);
+            for (i, r) in got_d.iter().enumerate() {
+                let k = i as u32;
+                let expected_head = match i {
+                    0..=75 => [0, 0],
+                    76 => [(1 << 23) - 1, 1],
+                    _ => [12, 2],
+                };
+                assert_eq!(
+                    *r,
+                    [expected_head[0], expected_head[1], 100 + k, 200 + k, 0xa000 + k, 0xb000 + k, 0xc000 + k, 0xd000 + k],
+                    "draw record {i}"
+                );
+            }
+            out_d.Unmap(0, None);
+
+            // On a fresh list, 76 unfilled `0xffffffff` mesh records before 16
+            // max-cost `65535` mesh records spend nothing so all 16 run.
+            let (mesh16_buf, mesh16_ptr) = host.shared_buffer(((76 + 16) * 12) as u64).unwrap();
+            let m16 = std::slice::from_raw_parts_mut(mesh16_ptr.cast::<[u32; 3]>(), 76 + 16);
+            for (i, m) in m16.iter_mut().enumerate() {
+                *m = if i < 76 { [u32::MAX; 3] } else { [65_535, 4, 4] };
+            }
+            list.reset();
+            let out_m16 = super::bound(&list, mesh16_buf.GetGPUVirtualAddress(), (10, 12, (76 + 16) as u32), None).unwrap();
+            super::done(&list, &out_m16);
+            list.close();
+            host.execute(&[&list]);
+            out_m16.Map(0, None, Some(&mut p)).unwrap();
+            let got_m16 = std::slice::from_raw_parts(p.cast::<[u32; 3]>(), 76 + 16);
+            assert!(got_m16[..76].iter().all(|&m| m == [0, 0, 0]));
+            assert!(got_m16[76..].iter().all(|&m| m == [65_535, 1, 1]));
+            out_m16.Unmap(0, None);
+
+            list.reset();
+            let out_m = super::bound(&list, mesh_buf.GetGPUVirtualAddress(), (10, 32, COUNT as u32), None).unwrap();
+            super::done(&list, &out_m);
+            list.close();
+            host.execute(&[&list]);
+            out_m.Map(0, None, Some(&mut p)).unwrap();
+            let got_m = std::slice::from_raw_parts(p.cast::<[u32; 8]>(), COUNT);
+            for (i, r) in got_m.iter().enumerate() {
+                let k = i as u32;
+                let head = match i {
+                    0..=75 => [0, 0, 0],
+                    76 => [65_535, 1, 1],
+                    _ => [7, 1, 1],
+                };
+                assert_eq!(
+                    *r,
+                    [head[0], head[1], head[2], 0x1000 + k, 0x2000 + k, 0x3000 + k, 0x4000 + k, 0x5000 + k],
+                    "mesh record {i}"
+                );
+            }
+            out_m.Unmap(0, None);
+        }
+    }
+
+    /// Rejected records do not wrap the budget: of 128 max-cost draws (2^26
     /// vertex instances each once clamped) two run, where a wrapping add
-    /// let four; of 600 garbage mesh dispatches 16, not 31.
+    /// let four; of 600 max-cost mesh dispatches 16, not 31.
     #[test]
     fn rejected_records_do_not_wrap_the_budget() {
-        let Some(draws) = clamped(0, &[u32::MAX], 128, 1) else {
+        let Some(draws) = clamped(0, &[1 << 22, u32::MAX, 0, 0], 128, 1) else {
             return; // no host GPU here
         };
         assert_eq!(draws.iter().filter(|&&count| count != 0).count(), 2);
-        let meshes = clamped(10, &[u32::MAX], 600, 1).unwrap();
+        let meshes = clamped(10, &[65_535, 1, 1], 600, 1).unwrap();
         assert_eq!(meshes.iter().filter(|&&groups| groups != 0).count(), 16);
     }
 
@@ -670,18 +987,30 @@ mod tests {
         assert!(small.iter().all(|&count| count == 1));
     }
 
-    /// A record that does not fit ends the budget: after two draws of
-    /// 3 * 2^24 vertex instances a third takes what is left, and the small
-    /// ones after it run empty.
+    /// By default (`VICTORY_INDIRECT_REST=0`), a record that does not fit in
+    /// the remaining budget runs empty while smaller records after it still
+    /// run; with `VICTORY_INDIRECT_REST=1`, it takes what is left so later
+    /// records run empty too.
     #[test]
-    fn a_record_that_does_not_fit_ends_the_budget() {
-        let mut words = [1 << 24, 3, 0, 0].repeat(3);
-        words.extend([3, 1, 0, 0].repeat(6));
-        let Some(draws) = clamped(0, &words, 8, 1) else {
+    fn a_record_that_does_not_fit_respects_indirect_rest() {
+        let mut words = [1 << 22, 12, 0, 0].repeat(3);
+        words.extend([3, 1, 0, 0].repeat(5));
+        let Some(draws_default) = clamped(0, &words, 8, 1) else {
             return; // no host GPU here
         };
-        let ran: Vec<bool> = draws.iter().map(|&count| count != 0).collect();
-        assert_eq!(ran, [true, true, false, false, false, false, false, false]);
+        let ran_default: Vec<bool> = draws_default.iter().map(|&count| count != 0).collect();
+        assert_eq!(
+            ran_default,
+            [true, true, false, true, true, true, true, true],
+            "VICTORY_INDIRECT_REST=0 keeps budget for later fitting records"
+        );
+        let draws_rest = super::with_indirect_rest(true, || clamped(0, &words, 8, 1).unwrap());
+        let ran_rest: Vec<bool> = draws_rest.iter().map(|&count| count != 0).collect();
+        assert_eq!(
+            ran_rest,
+            [true, true, false, false, false, false, false, false],
+            "VICTORY_INDIRECT_REST=1 ends the budget on the first overflow"
+        );
     }
 
     /// Two lists clamping into their own argument buffers, run in either
@@ -742,29 +1071,30 @@ mod tests {
     /// finds it spent, and they all run empty.
     #[test]
     fn a_spent_budget_stays_spent() {
-        let Some(twice) = clamped(1, &[u32::MAX], 64, 2) else {
+        let Some(twice) = clamped(1, &[1 << 22, u32::MAX, 0, 0, 0], 64, 2) else {
             return; // no host GPU here
         };
         assert!(twice.iter().all(|&count| count == 0));
     }
 
-    /// The walk stops at the count: of 128 garbage draws under a count of 3
+    /// The walk stops at the count: of 128 max-cost draws under a count of 3
     /// the first two run and the third runs empty, as they do without one,
     /// and the others are never read (the argument buffer's fresh words stay
     /// zero). A count above the records changes nothing; a count of zero
     /// walks none.
     #[test]
     fn the_walk_stops_at_the_count() {
-        let Some(under) = clamped_under(0, &[u32::MAX], 128, 1, Some(3)) else {
+        let words = [1 << 22, u32::MAX, 0, 0];
+        let Some(under) = clamped_under(0, &words, 128, 1, Some(3)) else {
             return; // no host GPU here
         };
-        assert_eq!(under[..3], [1 << 24, 1 << 24, 0]);
+        assert_eq!(under[..3], [1 << 22, 1 << 22, 0]);
         assert!(under[3..].iter().all(|&count| count == 0));
-        let all = clamped(0, &[u32::MAX], 128, 1).unwrap();
+        let all = clamped(0, &words, 128, 1).unwrap();
         assert_eq!(under[..3], all[..3]);
-        let above = clamped_under(0, &[u32::MAX], 128, 1, Some(1 << 20)).unwrap();
+        let above = clamped_under(0, &words, 128, 1, Some(1 << 20)).unwrap();
         assert_eq!(above, all);
-        let none = clamped_under(0, &[u32::MAX], 128, 1, Some(0)).unwrap();
+        let none = clamped_under(0, &words, 128, 1, Some(0)).unwrap();
         assert!(none.iter().all(|&count| count == 0));
     }
 
@@ -773,11 +1103,12 @@ mod tests {
     /// the same draws with no count spent it all on records that never ran.
     #[test]
     fn records_past_the_count_are_not_charged() {
-        let Some(twice) = clamped_under(0, &[u32::MAX], 128, 2, Some(1)) else {
+        let words = [1 << 22, u32::MAX, 0, 0];
+        let Some(twice) = clamped_under(0, &words, 128, 2, Some(1)) else {
             return; // no host GPU here
         };
-        assert_eq!(twice[0], 1 << 24);
-        let spent = clamped(0, &[u32::MAX], 128, 2).unwrap();
+        assert_eq!(twice[0], 1 << 22);
+        let spent = clamped(0, &words, 128, 2).unwrap();
         assert!(spent.iter().all(|&count| count == 0));
     }
 
@@ -1013,8 +1344,8 @@ void main(uint3 g : SV_GroupID) {
                 stride: 16,
                 records: 4,
                 words: vec![
-                    1 << 24, 4, 0, 0,
-                    1 << 24, 4, 0, 0,
+                    1 << 22, 16, 0, 0,
+                    1 << 22, 16, 0, 0,
                     3, 1, 0, 0,
                     3, 1, 0, 0,
                 ],
@@ -1387,7 +1718,7 @@ void main() {
         let Some(host) = super::host() else {
             return; // no host GPU here
         };
-        // Each record asks for 2^24 * 4 = 2^26 vertex instances (half the 2^27
+        // Each record asks for 2^22 * 16 = 2^26 vertex instances (half the 2^27
         // list budget). Two hoisted records exhaust the budget completely, so
         // an inline record after them in the same list must be zeroed.
         let (src, ptr) = host.shared_buffer(32).unwrap();
@@ -1396,8 +1727,8 @@ void main() {
         let (src_gpu, inline_gpu) = unsafe {
             let p = ptr.cast::<u32>();
             for i in 0..2 {
-                p.add(i * 4).write_volatile(1 << 24);
-                p.add(i * 4 + 1).write_volatile(4);
+                p.add(i * 4).write_volatile(1 << 22);
+                p.add(i * 4 + 1).write_volatile(16);
                 p.add(i * 4 + 2).write_volatile(0);
                 p.add(i * 4 + 3).write_volatile(0);
             }
@@ -1421,8 +1752,8 @@ void main() {
         unsafe {
             hoisted_buf.Map(0, None, Some(&mut p)).unwrap();
             let base = p.cast::<u8>().add(hoisted_off as usize).cast::<u32>();
-            assert_eq!(base.add(0).read_volatile(), 1 << 24, "hoisted record 0 fits");
-            assert_eq!(base.add(4).read_volatile(), 1 << 24, "hoisted record 1 fits");
+            assert_eq!(base.add(0).read_volatile(), 1 << 22, "hoisted record 0 fits");
+            assert_eq!(base.add(4).read_volatile(), 1 << 22, "hoisted record 1 fits");
             hoisted_buf.Unmap(0, None);
 
             inline_buf.Map(0, None, Some(&mut p)).unwrap();

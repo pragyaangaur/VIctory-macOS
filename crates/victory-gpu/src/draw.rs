@@ -1217,15 +1217,36 @@ impl State {
                         }
                         continue;
                     }
-                    let Some(Root::View(address)) = self.roots_ref(compute).get(usize::from(slot))
-                    else {
-                        once!(slot, "a shader reads a root view the title did not set");
-                        continue;
+                    let gpu = match self.roots_ref(compute).get(usize::from(slot)) {
+                        Some(Root::View(address)) if *address != 0 => {
+                            let found = root_view(list, *address, kind == 1, kind == 2);
+                            if found.is_none() {
+                                once!(
+                                    slot,
+                                    address = format_args!("{:#x}", *address),
+                                    "a shader uses a direct root view outside title memory"
+                                );
+                            }
+                            found
+                        }
+                        Some(Root::View(_)) => None,
+                        _ => {
+                            once!(slot, "a shader reads a root view the title did not set");
+                            None
+                        }
                     };
-                    let Some(gpu) = root_view(list, *address, kind == 1, kind == 2) else {
-                        continue;
+                    let Some(gpu) = gpu.or_else(|| {
+                        let host = crate::host::host()?;
+                        if kind == 2 {
+                            host.sink_root_uav()
+                        } else {
+                            host.zero_root_read()
+                        }
+                    }) else {
+                        not_run("no fallback buffer for a null or unmapped root view");
+                        return false;
                     };
-                    // SAFETY: an open list; the address is in live memory.
+                    // SAFETY: an open list; `gpu` lies in a live host buffer.
                     unsafe {
                         match (compute, kind) {
                             (false, 0) => l.SetGraphicsRootConstantBufferView(param, gpu),
@@ -6070,6 +6091,191 @@ void main(uint3 id : SV_DispatchThreadID) {
         state.host_state_lost();
         assert!(state.host_targets.is_none());
         list.close();
+    }
+
+    /// Direct root CBV/SRV/UAV bindings (`stage.root_cbvs`, `stage.root_srvs`,
+    /// `stage.root_uavs`) bind zeroed/sink host buffers instead of leaving
+    /// `0x0` or a previous dispatch's stale GPU VA bound when a slot is null,
+    /// unset, or outside committed title memory, and shader writes into a null
+    /// root UAV never corrupt the shared zero-read fallback buffer.
+    #[test]
+    fn null_and_unmapped_direct_root_views_bind_safe_fallbacks() {
+        use victory_shader::emit::{Options, emit_with};
+        use victory_shader::native::{ComputeIo, HwStage, NativeProgram, StageIo};
+        use victory_shader::{Container, io, ir, resource, structure};
+
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU here
+        };
+
+        const DIRECT_ROOT_HLSL: &str = r#"
+cbuffer RootCbv : register(b0) { uint4 cbv_words; };
+StructuredBuffer<uint> root_srv : register(t0);
+RWByteAddressBuffer sink_uav : register(u0);
+RWByteAddressBuffer out_uav : register(u1);
+[numthreads(1, 1, 1)]
+void main() {
+    uint sum = cbv_words.x + root_srv[0];
+    sink_uav.Store(0, 0xdeadbeefu);
+    out_uav.Store(0, sum ^ 0x5a5a0000u);
+}
+"#;
+        let params = [
+            Param::Cbv {
+                register: 0,
+                space: 0,
+            },
+            Param::Srv {
+                register: 0,
+                space: 0,
+            },
+            Param::Uav { register: 0 },
+            Param::Uav { register: 1 },
+        ];
+        let (root, pso) = crate::compute::pipeline(DIRECT_ROOT_HLSL, s!("direct_roots"), 0, &params)
+            .expect("direct root view test pipeline");
+
+        let native = NativeProgram {
+            stage: HwStage::Cs,
+            wave64: false,
+            vgprs: 4,
+            layout: Vec::new(),
+            used: Vec::new(),
+            io: StageIo::Cs(ComputeIo {
+                rsrc2: 0,
+                threads: [1, 1, 1],
+            }),
+            code: 0xBF81_0000u32.to_le_bytes().to_vec(),
+        };
+        let p = ir::build(&native.code, native.wave64, native.vgprs).unwrap();
+        let st = structure::structure(&p).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+        let io = io::raise(&p, &native).unwrap();
+        let host_shader = emit_with(
+            &Container { parts: Vec::new() },
+            &native,
+            &p,
+            &st,
+            &io,
+            &res,
+            Options::default(),
+        )
+        .unwrap();
+        let shader = crate::pipeline::Shader::for_test(
+            "compute",
+            crate::pipeline::Translated {
+                host: host_shader,
+                used: Vec::new(),
+                used_written: Vec::new(),
+                write_unknown: true,
+            },
+        );
+        let hp = HostPipeline {
+            compute: true,
+            mesh: false,
+            pso,
+            root,
+            stages: vec![crate::pipeline::host::Stage {
+                shader,
+                user_data: None,
+                root_cbvs: vec![(0, 0)],
+                root_srvs: vec![(1, 1)],
+                root_uavs: vec![(2, 2), (3, 3)],
+                memory: None,
+                memory_dirty: None,
+                view_addresses: None,
+            }],
+            rectangles: false,
+            slots: 0,
+            inputs: Vec::new(),
+            name: "direct_roots_test".into(),
+            marks: None,
+        };
+
+        let cbv_buf = buffer(256);
+        let srv_buf = buffer(256);
+        let uav_sink_valid = buffer(256);
+        let out1 = buffer(256);
+        let out2 = buffer(256);
+        let out3 = buffer(256);
+        let (cbv_ptr, _) = crate::resource::buffer_bytes(cbv_buf).unwrap();
+        let (srv_ptr, _) = crate::resource::buffer_bytes(srv_buf).unwrap();
+        let (sink_ptr, _) = crate::resource::buffer_bytes(uav_sink_valid).unwrap();
+        let (out1_ptr, _) = crate::resource::buffer_bytes(out1).unwrap();
+        let (out2_ptr, _) = crate::resource::buffer_bytes(out2).unwrap();
+        let (out3_ptr, _) = crate::resource::buffer_bytes(out3).unwrap();
+
+        // SAFETY: inside our 256-byte title buffers.
+        unsafe {
+            cbv_ptr.cast::<u32>().write_volatile(0x0011_0022);
+            srv_ptr.cast::<u32>().write_volatile(0x0033_0044);
+            sink_ptr.cast::<u32>().write_volatile(0);
+            out1_ptr.cast::<u32>().write_volatile(0);
+            out2_ptr.cast::<u32>().write_volatile(0);
+            out3_ptr.cast::<u32>().write_volatile(0);
+        }
+
+        let list = host.new_list().unwrap();
+        let mut state = State::default();
+
+        // Dispatch 1: valid non-zero CBV, SRV, and UAVs bind title shadow VAs.
+        state.set_view(true, 0, cbv_ptr as u64);
+        state.set_view(true, 1, srv_ptr as u64);
+        state.set_view(true, 2, sink_ptr as u64);
+        state.set_view(true, 3, out1_ptr as u64);
+        assert!(state.bind(&list, &hp, true));
+        // SAFETY: bound compute pipeline and root views on open `list`.
+        unsafe { list.list.Dispatch(1, 1, 1) };
+
+        // Dispatch 2 on the same command list: slot 0 = null (`0`), slot 1 =
+        // invalid address (`0x1000`), slot 2 = null UAV (`0`). Without the fix,
+        // `continue;` left Dispatch 1's `cbv_buf` / `srv_buf` / `uav_sink_valid`
+        // VAs bound (or faulted on `0x0`).
+        state.set_view(true, 0, 0);
+        state.set_view(true, 1, 0x1000);
+        state.set_view(true, 2, 0);
+        state.set_view(true, 3, out2_ptr as u64);
+        assert!(state.bind(&list, &hp, true));
+        // SAFETY: fallback buffers bound on open `list`.
+        unsafe { list.list.Dispatch(1, 1, 1) };
+
+        // Dispatch 3: unset slot 0 (`State::default()`), out-of-user-space
+        // slot 1 (`1 << 47`), unset slot 2 -> `zero_root_read` must still read
+        // 0 despite Dispatch 2 writing `0xdeadbeef` to `sink_root_uav`.
+        let mut fresh_state = State::default();
+        fresh_state.set_view(true, 1, 1u64 << 47);
+        fresh_state.set_view(true, 3, out3_ptr as u64);
+        assert!(fresh_state.bind(&list, &hp, true));
+        // SAFETY: fallback buffers bound on open `list`.
+        unsafe { list.list.Dispatch(1, 1, 1) };
+
+        list.close();
+        host.execute(&[&list]);
+
+        // SAFETY: `execute` waited for the GPU fence and completed copy-back.
+        unsafe {
+            assert_eq!(
+                out1_ptr.cast::<u32>().read_volatile(),
+                (0x0011_0022 + 0x0033_0044) ^ 0x5a5a_0000,
+                "valid direct root views ran"
+            );
+            assert_eq!(
+                sink_ptr.cast::<u32>().read_volatile(),
+                0xdead_beef,
+                "Dispatch 2 did not overwrite Dispatch 1's UAV after slot 2 became null, and Dispatch 1 wrote 0xdeadbeef"
+            );
+            assert_eq!(
+                out2_ptr.cast::<u32>().read_volatile(),
+                0x5a5a_0000,
+                "null CBV + unmapped SRV read zeros instead of stale Dispatch 1 VAs"
+            );
+            assert_eq!(
+                out3_ptr.cast::<u32>().read_volatile(),
+                0x5a5a_0000,
+                "null UAV writes into sink_root_uav never corrupt zero_root_read"
+            );
+        }
+        assert_eq!(host.log_messages(), None, "no D3D12 debug errors");
     }
 
     fn local_memo_counts() -> [u64; MEMO_COUNTERS] {

@@ -578,11 +578,8 @@ fn translate(
                 if let (Some(r), Some(i), Some(s)) = (res, raised, structured) {
                     let label = || format!("{} {:?}", example(), p.stage);
                     *counter(t, p.stage, 0) += 1;
-                    let marks = emit::Options {
-                        view_marks: true,
-                        host_wave32: checks.wave32,
-                        ..Default::default()
-                    };
+                    let marks =
+                        emit_options(checks.wave32, victory_gpu::shader_cache::narrow_waves());
                     match emit::emit_with(&container, &p, &program, &s, &i, &r, marks) {
                         Ok(shader) => {
                             *counter(t, p.stage, 1) += 1;
@@ -604,6 +601,21 @@ fn translate(
                 t.fail(reason, || format!("{} {:?}", example(), p.stage));
             }
         }
+    }
+}
+
+/// The emit options for one program. For 32-lane waves (`wave32`), as
+/// `run` translates where its host narrows the waves (`narrow`: under Wine,
+/// D3DMetal runs wave64 programs in 32-lane waves whatever `WaveSize` says;
+/// `VICTORY_NARROW_WAVES` overrides): a group that is one console wave64
+/// with LDS then gets barriers between its halves instead of being refused.
+/// Without them the offline check refuses programs `run` translates.
+fn emit_options(wave32: bool, narrow: bool) -> emit::Options {
+    emit::Options {
+        view_marks: true,
+        host_wave32: wave32,
+        narrow_waves: wave32 && narrow,
+        ..Default::default()
     }
 }
 
@@ -873,6 +885,23 @@ pub(crate) fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 
 #[cfg(test)]
 mod tests {
+    /// `--wave32` translates as `run` does on a host that narrows the waves
+    /// (D3DMetal under Wine), and only then; without `--wave32` the waves are
+    /// never narrowed, as on a host whose waves hold a whole wave64.
+    #[test]
+    fn narrow_waves_follow_wave32_and_the_host() {
+        let o = super::emit_options(true, true);
+        assert!(o.host_wave32 && o.narrow_waves);
+        let o = super::emit_options(true, false);
+        assert!(
+            o.host_wave32 && !o.narrow_waves,
+            "NVIDIA, Intel: halves only"
+        );
+        let o = super::emit_options(false, true);
+        assert!(!o.host_wave32 && !o.narrow_waves);
+        assert!(super::emit_options(false, false).view_marks);
+    }
+
     /// Shader dumps are game-derived, so a dump directory in the repo is refused.
     #[test]
     fn emit_dump_inside_repo_is_refused() {

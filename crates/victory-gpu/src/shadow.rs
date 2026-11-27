@@ -1402,6 +1402,8 @@ impl Drop for Shadow {
     fn drop(&mut self) {
         if let Some(slice) = self.slice {
             arena().give_back(slice);
+        } else {
+            crate::host::retire(self.buffer.clone());
         }
         if let Some(base) = self.marks {
             let mut m = marks();
@@ -2145,10 +2147,20 @@ pub(crate) fn log_held() {
     );
 }
 
+/// User virtual space ends at 2^47 on x86_64 Windows; pages below
+/// [`LOWEST_MAPPED`] are the unmapped null guard region.
+const USER_SPACE_END: u64 = 1 << 47;
+
 /// The copy of the innermost title buffer holding `[address, address +
 /// len)`, made on first use.
 pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
+    if address < LOWEST_MAPPED {
+        return None;
+    }
     let end = address.checked_add(len.max(1))?;
+    if end > USER_SPACE_END {
+        return None;
+    }
     if !lookup_cache_enabled() {
         let shadow = find_uncached(address, end)?;
         shadow.touch();
@@ -2274,7 +2286,11 @@ fn loose(address: u64, end: u64) -> Option<Arc<Shadow>> {
     }
     let window = loose_window_bytes();
     let start = address & !(window - 1);
-    let len = end.checked_next_multiple_of(window)? - start;
+    let rounded_end = end.checked_next_multiple_of(window)?;
+    if rounded_end > USER_SPACE_END {
+        return None;
+    }
+    let len = rounded_end - start;
     let mut map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(shadow) = enclosing_window(&map, LOOSE_SPAN.load(Ordering::Relaxed), address, end) {
         return Some(shadow.clone());
@@ -4183,6 +4199,24 @@ pub(crate) mod tests {
         assert!(ranges_disjoint(&[(0x1000, 0x1000), (0x2000, 0x1000)]));
         assert!(ranges_disjoint(&[(0x2000, 0x1000), (0x1000, 0x1000)]));
         assert!(!ranges_disjoint(&[(0x1000, 0x1500), (0x2000, 0x1000)]));
+    }
+
+    #[test]
+    fn null_and_out_of_range_addresses_never_create_loose_copies() {
+        for bad in [
+            0,
+            0x80,
+            0xfffc,
+            USER_SPACE_END - 8,
+            USER_SPACE_END,
+            0u64.wrapping_sub(0x80),
+            u64::MAX,
+        ] {
+            assert!(
+                find(bad, 16).is_none(),
+                "address {bad:#x} must be rejected"
+            );
+        }
     }
 
     #[test]

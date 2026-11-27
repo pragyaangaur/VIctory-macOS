@@ -356,25 +356,52 @@ pub(crate) fn spare_scratch() -> (usize, u64) {
     (spare.len(), spare.iter().map(|i| i.bytes).sum())
 }
 
+/// Host lists waiting out [`crate::host::bury_lag`] submissions before their
+/// command allocators and kept resources are reset.
+#[cfg(windows)]
+static AGING: std::sync::Mutex<std::collections::VecDeque<(u64, crate::host::HostList)>> =
+    std::sync::Mutex::new(std::collections::VecDeque::new());
+
 /// A host list a queue has run: one no title list holds any more is reset
-/// and kept for [`restart`].
+/// and kept for [`restart`] (after [`crate::host::bury_lag`] submissions).
 #[cfg(windows)]
 pub(crate) fn recycle(list: std::sync::Arc<crate::host::HostList>) {
     const KEPT: usize = 64;
-    if let Ok(list) = std::sync::Arc::try_unwrap(list) {
-        list.reset();
-        let bytes = list.scratch_bytes();
-        let now = std::time::Instant::now();
-        let mut spare = SPARE.lock().unwrap_or_else(|e| e.into_inner());
+    let Ok(list) = std::sync::Arc::try_unwrap(list) else {
+        return;
+    };
+    let lag = crate::host::bury_lag();
+    let done = crate::host::submissions_done();
+    let ready: Vec<crate::host::HostList> = if lag == 0 {
+        vec![list]
+    } else {
+        let mut aging = AGING.lock().unwrap_or_else(|e| e.into_inner());
+        aging.push_back((done, list));
+        let n = aging
+            .iter()
+            .take_while(|(at, _)| at.saturating_add(lag) <= done)
+            .count();
+        aging.drain(..n).map(|(_, l)| l).collect()
+    };
+    if ready.is_empty() {
+        return;
+    }
+    for l in &ready {
+        l.reset();
+    }
+    let now = std::time::Instant::now();
+    let mut spare = SPARE.lock().unwrap_or_else(|e| e.into_inner());
+    for l in ready {
         if spare.len() < KEPT {
+            let bytes = l.scratch_bytes();
             spare.push(Idle {
-                list,
+                list: l,
                 at: now,
                 bytes,
             });
         }
-        shed(&mut spare, now);
     }
+    shed(&mut spare, now);
 }
 
 /// At each submission: the scratch of spare lists idle past
@@ -2303,6 +2330,13 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn allocate_upload_survives_early_reset_and_release_while_held_on_gpu() {
+        // The uploads are freed as the host lists are reset: with the bury lag
+        // they wait that many submissions, so this checks the lag-free case.
+        crate::host::with_bury_lag(0, allocate_upload_survives_early_reset_body);
+    }
+
+    #[cfg(windows)]
+    fn allocate_upload_survives_early_reset_body() {
         let Some(host) = crate::host::host() else {
             return; // no host GPU here
         };

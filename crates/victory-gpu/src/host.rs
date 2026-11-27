@@ -93,6 +93,10 @@ pub(crate) struct Host {
     messages: Option<ID3D12InfoQueue>,
     next_rtv: AtomicU32,
     presenter: Mutex<Presentation>,
+    /// Zero-filled 64 KiB read fallback for null or unmapped direct root CBVs/SRVs.
+    zero_root_read: OnceLock<Option<(ID3D12Resource, u64)>>,
+    /// Isolated 64 KiB write sink for null or unmapped direct root UAVs.
+    sink_root_uav: OnceLock<Option<(ID3D12Resource, u64)>>,
 }
 
 // SAFETY: D3D12 devices, queues, fences and descriptor heaps are
@@ -427,6 +431,8 @@ fn create() -> windows::core::Result<Host> {
             messages,
             next_rtv: AtomicU32::new(0),
             presenter: Mutex::new(Presentation::default()),
+            zero_root_read: OnceLock::new(),
+            sink_root_uav: OnceLock::new(),
         })
     }
 }
@@ -2311,6 +2317,7 @@ impl Host {
             }
             let _ = (i, started);
         }
+        SUBMISSIONS_DONE.store(*submitted, Ordering::Release);
         // The GPU fence has completed: return worker-owned staging chunks now.
         if let Some(u) = &uploads {
             u.release_worker();
@@ -2508,9 +2515,12 @@ impl Host {
             }
         }
         // The submission has run and the next waits for our lock. Host
-        // copies the title gave up meanwhile may have their last holder here.
-        release_retired();
-        release_later(Box::new((batch, back, withheld, heaps)));
+        // copies and retired GPU objects stay alive across `bury_lag`
+        // submissions (~2 frames by default) so D3DMetal/AGX never faults on
+        // recently retired buffer or texture virtual addresses.
+        let done = *submitted;
+        retire_any((batch, back, withheld, heaps));
+        advance_retired(done);
         self.log_messages();
         // A listed frame: what this submission's lists drew, as it is now
         // (the dumps submit lists of their own).
@@ -4036,9 +4046,9 @@ impl HostList {
             (s.current, s.used) = (0, 0);
             spent
         };
-        // Each release is a kernel call, as in [`release_later`].
+        // Each release is a kernel call, deferred across `bury_lag` submissions.
         if !spent.is_empty() {
-            release_later(Box::new(spent));
+            retire_any(spent);
         }
     }
 
@@ -4063,13 +4073,14 @@ impl HostList {
         }
     }
 
-    /// The host address of the list's indirect-work budget, zeroed at each
+    /// The host address of the list's indirect-work budget (plus 64 scratch
+    /// dwords at bytes 64..320 for the 64-lane clamp), zeroed at each
     /// submission of the list from the first use after a reset on.
     pub(crate) fn budget(&self) -> Option<u64> {
         let (buffer, data) = self
             .budget
             .get_or_init(|| {
-                let (b, d) = host()?.shared_buffer(256)?;
+                let (b, d) = host()?.shared_buffer(512)?;
                 Some((b, d as usize))
             })
             .as_ref()?;
@@ -5757,34 +5768,149 @@ impl Host {
             ok
         })
     }
-}
 
-/// Host resources that view heap slots stopped viewing while a submission
-/// may have been running ([`retire`]).
-static RETIRED: Mutex<Vec<ID3D12Resource>> = Mutex::new(Vec::new());
-
-/// Keeps `resource` alive until the GPU work running now (or the next
-/// submission's) has run: title threads rewrite view heap slots while the
-/// GPU runs, and a shader that took the old descriptor still reads what it
-/// views.
-pub(crate) fn retire(resource: ID3D12Resource) {
-    RETIRED.lock().unwrap_or_else(|e| e.into_inner()).push(resource);
-}
-
-/// Batched [`retire`] under one hold of the retired-resources lock.
-pub(crate) fn retire_all(mut resources: Vec<ID3D12Resource>) {
-    if resources.is_empty() {
-        return;
+    /// 256-byte-aligned GPU VA of a shared zero-filled 64 KiB buffer bound
+    /// in place of null, unset, or unmapped direct root CBVs and SRVs.
+    pub(crate) fn zero_root_read(&self) -> Option<u64> {
+        self.zero_root_read
+            .get_or_init(|| {
+                let bytes = (crate::watch::PAGE + 256) as u64;
+                let (buffer, data) = self.shared_buffer(bytes)?;
+                name(&buffer, || "null root read".into());
+                // SAFETY: `data` points to `bytes` mapped bytes; `buffer` is live.
+                let gpu = unsafe {
+                    std::ptr::write_bytes(data, 0, bytes as usize);
+                    buffer.GetGPUVirtualAddress().next_multiple_of(256)
+                };
+                Some((buffer, gpu))
+            })
+            .as_ref()
+            .map(|&(_, gpu)| gpu)
     }
+
+    /// 256-byte-aligned GPU VA of an isolated 64 KiB throwaway buffer bound
+    /// in place of null, unset, or unmapped direct root UAVs so shader writes
+    /// never fault or corrupt [`Host::zero_root_read`].
+    pub(crate) fn sink_root_uav(&self) -> Option<u64> {
+        self.sink_root_uav
+            .get_or_init(|| {
+                let bytes = (crate::watch::PAGE + 256) as u64;
+                let (buffer, data) = self.shared_buffer(bytes)?;
+                name(&buffer, || "null root uav sink".into());
+                // SAFETY: `data` points to `bytes` mapped bytes; `buffer` is live.
+                let gpu = unsafe {
+                    std::ptr::write_bytes(data, 0, bytes as usize);
+                    buffer.GetGPUVirtualAddress().next_multiple_of(256)
+                };
+                Some((buffer, gpu))
+            })
+            .as_ref()
+            .map(|&(_, gpu)| gpu)
+    }
+}
+
+/// Completed host submission count (`Host::execute`).
+static SUBMISSIONS_DONE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Number of completed host submissions so far.
+pub(crate) fn submissions_done() -> u64 {
+    SUBMISSIONS_DONE.load(Ordering::Acquire)
+}
+
+/// How many host submissions a retired GPU object or recycled command list
+/// stays alive after the submission current when it was retired (`16` ~= 2
+/// frames; `VICTORY_BURY_LAG=0` drops right after the current submission).
+pub(crate) fn bury_lag() -> u64 {
+    #[cfg(test)]
+    if let Some(lag) = TEST_BURY_LAG.with(std::cell::Cell::get) {
+        return lag;
+    }
+    static LAG: OnceLock<u64> = OnceLock::new();
+    *LAG.get_or_init(|| {
+        std::env::var("VICTORY_BURY_LAG")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(16)
+    })
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_BURY_LAG: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn with_bury_lag<R>(lag: u64, f: impl FnOnce() -> R) -> R {
+    struct Guard(Option<u64>);
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            TEST_BURY_LAG.with(|cell| cell.set(self.0));
+        }
+    }
+    let prev = TEST_BURY_LAG.with(|cell| cell.replace(Some(lag)));
+    let _guard = Guard(prev);
+    f()
+}
+
+struct Retired(#[allow(dead_code)] Box<dyn std::any::Any + Send>);
+
+/// Host GPU objects (`ID3D12Resource`, `ID3D12Heap`, submission batches) kept
+/// alive across [`bury_lag`] submissions so D3DMetal/AGX never faults on
+/// recently retired virtual addresses.
+static RETIRED: Mutex<std::collections::VecDeque<(u64, Retired)>> =
+    Mutex::new(std::collections::VecDeque::new());
+
+/// Keeps `resource` alive until [`bury_lag`] host submissions after now.
+pub(crate) fn retire(resource: ID3D12Resource) {
+    retire_any(resource);
+}
+
+/// Keeps `object` alive until [`bury_lag`] host submissions after now, then
+/// drops it on the background release thread.
+pub(crate) fn retire_any<T: Send + 'static>(object: T) {
+    let at = submissions_done();
     RETIRED
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .append(&mut resources);
+        .push_back((at, Retired(Box::new(object))));
 }
 
-/// After a submission has run, with none running: the retired resources go.
+/// Releases retired objects whose [`bury_lag`] window has elapsed at
+/// `done_submission`.
+fn advance_retired(done_submission: u64) {
+    let lag = bury_lag();
+    let ready: Vec<(u64, Retired)> = {
+        let mut retired = RETIRED.lock().unwrap_or_else(|e| e.into_inner());
+        let n = retired
+            .iter()
+            .take_while(|(at, _)| at.saturating_add(lag) <= done_submission)
+            .count();
+        if n == 0 {
+            return;
+        }
+        retired.drain(..n).collect()
+    };
+    release_later(Box::new(ready));
+}
+
+/// Batched [`retire`] under one hold of the retired-resources lock.
+pub(crate) fn retire_all(resources: Vec<ID3D12Resource>) {
+    if resources.is_empty() {
+        return;
+    }
+    let at = submissions_done();
+    let mut retired = RETIRED.lock().unwrap_or_else(|e| e.into_inner());
+    retired.extend(resources.into_iter().map(|r| (at, Retired(Box::new(r)))));
+}
+
+/// Immediately releases all retired objects (tests).
+#[cfg(test)]
 pub(crate) fn release_retired() {
-    let retired = std::mem::take(&mut *RETIRED.lock().unwrap_or_else(|e| e.into_inner()));
+    let retired: Vec<(u64, Retired)> = RETIRED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .drain(..)
+        .collect();
     if !retired.is_empty() {
         release_later(Box::new(retired));
     }
@@ -6551,7 +6677,7 @@ mod heap_events {
 #[cfg(test)]
 mod marks {
     use super::LOST;
-    use crate::backend::HostGpu;
+    use crate::backend::{HostGpu, HostMemory};
     use std::sync::atomic::Ordering;
     use windows::Win32::Graphics::Direct3D::*;
     use windows::Win32::Graphics::Direct3D12::*;
@@ -6885,6 +7011,72 @@ float4 ps(float4 pos : SV_Position) : SV_Target {
             pixels,
             "a draw on the new queue runs whole"
         );
+    }
+
+    #[test]
+    fn bury_lag_retains_retired_resources_across_submissions() {
+        use windows::core::Interface;
+        let Some(host) = super::host() else {
+            return; // no host GPU here
+        };
+        let references = |b: &ID3D12Resource| {
+            // SAFETY: a live COM object; one reference taken and given back.
+            unsafe {
+                let raw = b.as_raw();
+                let unknown = &*(raw as *const *const windows::core::IUnknown_Vtbl);
+                ((**unknown).AddRef)(raw);
+                ((**unknown).Release)(raw)
+            }
+        };
+        let wait_released = |b: &ID3D12Resource| {
+            let since = std::time::Instant::now();
+            while references(b) > 1 && since.elapsed() < std::time::Duration::from_secs(5) {
+                std::thread::yield_now();
+            }
+            references(b)
+        };
+
+        let (buf_lag, _) = host.shared_buffer(256).unwrap();
+        let list = host.new_list().unwrap();
+        list.close();
+        super::with_bury_lag(3, || {
+            let _quiet = host.quiet();
+            // The submission count is global: tests that run at the same
+            // time add to it, so retention is checked against the count the
+            // retirement could not have been recorded after.
+            let before = super::submissions_done();
+            super::retire(buf_lag.clone());
+            assert!(references(&buf_lag) >= 2, "held by retirement ring");
+            drop(_quiet);
+
+            for step in 1..3 {
+                list.reset();
+                list.close();
+                host.execute(&[&list]);
+                let passed = super::submissions_done().saturating_sub(before);
+                assert!(
+                    passed >= 3 || references(&buf_lag) >= 2,
+                    "still retained after {step} of 3 lag submissions ({passed} passed)"
+                );
+            }
+            list.reset();
+            list.close();
+            host.execute(&[&list]);
+            assert_eq!(wait_released(&buf_lag), 1, "released once 3 submissions passed");
+        });
+
+        let (buf_immediate, _) = host.shared_buffer(256).unwrap();
+        super::with_bury_lag(0, || {
+            super::retire(buf_immediate.clone());
+            list.reset();
+            list.close();
+            host.execute(&[&list]);
+            assert_eq!(
+                wait_released(&buf_immediate),
+                1,
+                "VICTORY_BURY_LAG=0 releases right after the submission"
+            );
+        });
     }
 
     /// Background heap-worker staging runs concurrently with `Host::quiet()` /

@@ -19,6 +19,9 @@ pub(crate) enum Param<'a> {
     Table(&'a [Range]),
     /// `count` 32-bit constants in `b{register}`.
     Constants { register: u32, count: u32 },
+    /// A root constant buffer view in `b{register}, space{space}`.
+    #[cfg(test)]
+    Cbv { register: u32, space: u32 },
     /// A root shader resource view in `t{register}, space{space}`.
     Srv { register: u32, space: u32 },
     /// A root unordered access view in `u{register}`.
@@ -161,6 +164,10 @@ pub(crate) fn root_signature(device: &ID3D12Device, params: &[Param]) -> Result<
                 },
                 ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
             },
+            #[cfg(test)]
+            Param::Cbv { register, space } => {
+                descriptor(D3D12_ROOT_PARAMETER_TYPE_CBV, register, space)
+            }
             Param::Srv { register, space } => {
                 descriptor(D3D12_ROOT_PARAMETER_TYPE_SRV, register, space)
             }

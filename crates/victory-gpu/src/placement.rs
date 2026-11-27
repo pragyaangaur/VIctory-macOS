@@ -114,13 +114,20 @@ impl Heaps {
         }
         let empty = |h: &Heap| h.free.get(&0) == Some(&HEAP);
         let mut spare = 0;
-        self.heaps.retain(|h| {
-            if !empty(h) {
-                return true;
+        let mut i = 0;
+        while i < self.heaps.len() {
+            if !empty(&self.heaps[i]) {
+                i += 1;
+                continue;
             }
             spare += 1;
-            spare <= SPARE
-        });
+            if spare <= SPARE {
+                i += 1;
+            } else {
+                let removed = self.heaps.remove(i);
+                crate::host::retire_any(removed.heap);
+            }
+        }
     }
 
     /// A range of `size` bytes: in a heap with room, else in a new heap.

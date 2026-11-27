@@ -2774,6 +2774,10 @@ fn v_mul_legacy_f32_treats_denormals_as_zero() {
 #[test]
 fn legacy_mad_fuses_its_product_and_flushes_its_sources() {
     let mad = build_valu_cs(&vop3(0x140, 0, vgpr(1), vgpr(2), vgpr(3)));
+    let mac = build_valu_cs(&[
+        vop1(0x001, 0, vgpr(3)),                  // v_mov_b32 v0, v3
+        0x06 << 25 | 2 << 9 | u32::from(vgpr(1)), // v_mac_legacy_f32 v0, v1, v2
+    ]);
     let cases = [
         // (1 + 2^-23) * (1 - 2^-23) - 1 is -2^-46 exactly: kept by one
         // rounding, lost when the product is rounded before the add.
@@ -2786,15 +2790,17 @@ fn legacy_mad_fuses_its_product_and_flushes_its_sources() {
         [0, 0x7f80_0000, 0x3f80_0000, 0],
     ];
     let want = [0xa880_0000u32, 0x0000_0000, 0x3f80_0000, 0x3f80_0000];
-    run_cases(&mad, &cases, |backend, i, _, got| {
-        if backend == "warp" && i == 0 {
-            // WARP rounds the product before the add; hardware's single
-            // rounding is the reference for the fused form.
-            eprintln!("{backend}: fused rounding differs on WARP; skipped");
-            return;
-        }
-        assert_eq!(got, want[i], "{backend}: case {i}");
-    });
+    for shader in [&mad, &mac] {
+        run_cases(shader, &cases, |backend, i, _, got| {
+            if backend == "warp" && i == 0 {
+                // WARP rounds the product before the add; hardware's single
+                // rounding is the reference for the fused form.
+                eprintln!("{backend}: fused rounding differs on WARP; skipped");
+                return;
+            }
+            assert_eq!(got, want[i], "{backend}: case {i}");
+        });
+    }
 }
 
 /// SDWA `dst_unused:UNUSED_SEXT` (1) with `dst_sel:WORD_0` (4) sign-extends bit 15
