@@ -725,6 +725,7 @@ impl<'a> Lower<'a> {
         s.inputs = x.inputs.clone();
         s.outputs = x.outputs.clone();
         if let Some(keep) = keep {
+            s.repack_signatures = true;
             if x.native.stage == HwStage::Ps {
                 prune_signature(&mut s.inputs, keep);
             } else if x.native.stage == HwStage::Ms {

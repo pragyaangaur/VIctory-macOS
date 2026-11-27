@@ -40,14 +40,13 @@ const GREATER_EQUAL: u32 = 7;
 const ALWAYS: u32 = 8;
 
 impl ValueWait {
-    /// Whether it holds with `read` giving the memory's value: `None` for a
-    /// comparison we do not know (counted by the caller, taken as holding)
-    /// and for memory that cannot be read (taken as not holding).
-    pub(crate) fn holds(&self, read: &dyn Fn(u64, u8) -> Option<u64>) -> Option<bool> {
+    /// Whether `raw` (masked) compares true against `reference`. Returns `None`
+    /// for a comparison function we do not know.
+    pub(crate) fn holds_for(&self, raw: u64) -> Option<bool> {
         if !(NEVER..=ALWAYS).contains(&self.comparison) {
             return None;
         }
-        let value = read(self.address, self.bytes)? & self.mask;
+        let value = raw & self.mask;
         let reference = self.reference;
         Some(match self.comparison {
             NEVER => false,
@@ -60,6 +59,72 @@ impl ValueWait {
             _ => true,
         })
     }
+
+    /// Whether it holds with `read` giving the memory's value: `None` for a
+    /// comparison we do not know (counted by the caller, taken as holding)
+    /// and for memory that cannot be read (taken as not holding).
+    pub(crate) fn holds(&self, read: &dyn Fn(u64, u8) -> Option<u64>) -> Option<bool> {
+        if !(NEVER..=ALWAYS).contains(&self.comparison) {
+            return None;
+        }
+        let raw = read(self.address, self.bytes)?;
+        self.holds_for(raw)
+    }
+}
+
+/// Summary of a segment's deferred CPU/GPU side effects used to avoid merging
+/// across submission-phase ordering hazards.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct BatchFlags {
+    /// Writes into title CPU memory during deferred prep (`Step::Copy`, `Step::Move`).
+    pub(crate) has_title_copy: bool,
+    /// Reads CPU title memory during deferred prep (`Step::Copy`, `Step::Move`, `Step::Fill`).
+    pub(crate) has_cpu_read: bool,
+    /// Records GPU shader writes to a shadow buffer (`Step::GpuWrite`).
+    pub(crate) has_gpu_write: bool,
+    /// Runs post-execution callbacks (`defer_after`, e.g., readbacks).
+    pub(crate) has_after: bool,
+    /// Explicitly uploads title-written textures before deferred prep (`Step::Texture`).
+    pub(crate) has_textures: bool,
+}
+
+impl BatchFlags {
+    pub(crate) fn merge(self, other: Self) -> Self {
+        Self {
+            has_title_copy: self.has_title_copy || other.has_title_copy,
+            has_cpu_read: self.has_cpu_read || other.has_cpu_read,
+            has_gpu_write: self.has_gpu_write || other.has_gpu_write,
+            has_after: self.has_after || other.has_after,
+            has_textures: self.has_textures || other.has_textures,
+        }
+    }
+}
+
+/// Whether a segment with `next` flags can join a non-empty batch with
+/// accumulated `existing` flags and `existing_len` segments without exceeding
+/// `max_lists` or violating host submission phase ordering:
+/// - Explicit texture uploads run before deferred title copies, so a prior
+///   title copy or post-execution callback must complete before a later
+///   segment uploads textures from title memory.
+/// - Deferred CPU reads (`Copy`/`Move`/`Fill`) run before GPU execution and
+///   copy-back, so a prior GPU write or post-execution callback must complete
+///   before a later segment reads CPU title memory.
+pub(crate) fn can_join_batch(
+    existing: BatchFlags,
+    next: BatchFlags,
+    existing_len: usize,
+    max_lists: usize,
+) -> bool {
+    if existing_len >= max_lists {
+        return false;
+    }
+    if (existing.has_title_copy || existing.has_after) && next.has_textures {
+        return false;
+    }
+    if (existing.has_gpu_write || existing.has_after) && next.has_cpu_read {
+        return false;
+    }
+    true
 }
 
 /// What a queue holds, in its order.
@@ -83,6 +148,12 @@ pub(crate) struct Pumped {
     pub(crate) waited: Vec<(usize, Duration)>,
     /// Waits with a comparison we do not know (taken as holding).
     pub(crate) unknown: u32,
+    /// Waits satisfied by an earlier segment's deferred bottom-of-pipe write
+    /// in the same coalesced piece.
+    pub(crate) coalesced_bop_waits: u32,
+    /// Coalesced pieces flushed early because the next ready segment hit a
+    /// submission-phase ordering hazard or the batch list cap.
+    pub(crate) hazard_splits: u32,
 }
 
 /// Every queue's held work.
@@ -106,15 +177,25 @@ impl<S> Held<S> {
     }
 }
 
+/// Predicate checking whether a ready segment can join the in-progress coalesced piece.
+pub(crate) type CanJoin<'a, S> = &'a dyn Fn(&[(S, bool)], &S) -> bool;
+
 /// What the pump needs from the outside world.
 pub(crate) struct World<'a, S> {
     /// A memory value (address, bytes).
     pub(crate) read: &'a dyn Fn(u64, u8) -> Option<u64>,
     /// A fence's value.
     pub(crate) fence: &'a dyn Fn(usize) -> u64,
-    /// Runs a piece (a queue, its segments in order) to completion, the
-    /// bottom-of-pipe writes included.
-    pub(crate) run: &'a mut dyn FnMut(usize, Vec<S>),
+    /// Whether a segment's deferred bottom-of-pipe writes satisfy `wait`.
+    pub(crate) will_write: &'a dyn Fn(&S, &ValueWait) -> bool,
+    /// Whether `next` can join a non-empty coalesced `piece` without violating
+    /// ordering hazards or batch limits.
+    pub(crate) can_join: CanJoin<'a, S>,
+    /// Whether cross-queue and bottom-of-pipe coalescing is active.
+    pub(crate) coalesce: bool,
+    /// Runs a piece of `(segment, barrier_before)` pairs in order to
+    /// completion, the bottom-of-pipe writes included.
+    pub(crate) run: &'a mut dyn FnMut(Vec<(S, bool)>),
     /// Signals a fence.
     pub(crate) signal: &'a mut dyn FnMut(usize, u64),
 }
@@ -132,6 +213,16 @@ impl<S> Held<S> {
 
     /// Runs every queue's heads that may run, until none can.
     pub(crate) fn pump(&mut self, w: &mut World<S>) -> Pumped {
+        if w.coalesce {
+            self.pump_coalesced(w)
+        } else {
+            self.pump_per_queue(w)
+        }
+    }
+
+    /// Legacy per-queue pump: flushes each queue's consecutive ready segments
+    /// separately and flushes before every `Item::Signal`.
+    fn pump_per_queue(&mut self, w: &mut World<S>) -> Pumped {
         let mut done = Pumped::default();
         loop {
             let mut moved = false;
@@ -145,7 +236,7 @@ impl<S> Held<S> {
                             // waits are tested: their bottom-of-pipe writes
                             // can change what the waits read.
                             if !waits.is_empty() && !piece.is_empty() {
-                                (w.run)(*queue, std::mem::take(&mut piece));
+                                (w.run)(std::mem::take(&mut piece));
                                 done.pieces += 1;
                             }
                             let mut ok = true;
@@ -167,7 +258,7 @@ impl<S> Held<S> {
                         // it runs first.
                         Some((Item::Signal(..), ..)) => {
                             if !piece.is_empty() {
-                                (w.run)(*queue, std::mem::take(&mut piece));
+                                (w.run)(std::mem::take(&mut piece));
                                 done.pieces += 1;
                             }
                             true
@@ -186,7 +277,7 @@ impl<S> Held<S> {
                     moved = true;
                     match items.pop_front().map(|(item, ..)| item) {
                         Some(Item::Segment(s, _)) => {
-                            piece.push(s);
+                            piece.push((s, false));
                             done.segments += 1;
                         }
                         Some(Item::Signal(fence, value)) => (w.signal)(fence, value),
@@ -194,12 +285,156 @@ impl<S> Held<S> {
                     }
                 }
                 if !piece.is_empty() {
-                    (w.run)(*queue, piece);
+                    (w.run)(piece);
                     done.pieces += 1;
                 }
             }
             if !moved {
                 break;
+            }
+        }
+        self.queues.retain(|(_, items)| !items.is_empty());
+        done
+    }
+
+    /// Coalesced pump: accumulates ready segments across queues into one host
+    /// submission, allowing a segment whose memory waits are satisfied by an
+    /// earlier segment's deferred bottom-of-pipe write in the same piece to
+    /// join behind a global UAV barrier (subject to `can_join`), and deferring
+    /// mid-piece `Item::Signal`s until immediately after the piece completes.
+    fn pump_coalesced(&mut self, w: &mut World<S>) -> Pumped {
+        enum Decision {
+            Blocked,
+            FlushFirst,
+            TakeSegment(bool),
+            TakeSignal,
+            TakeFenceWait(bool),
+        }
+
+        let flush = |piece: &mut Vec<(S, bool)>,
+                     pending_signals: &mut Vec<(usize, u64)>,
+                     last_queue: &mut Option<usize>,
+                     w: &mut World<S>,
+                     done: &mut Pumped| {
+            if !piece.is_empty() {
+                (w.run)(std::mem::take(piece));
+                done.pieces += 1;
+            }
+            *last_queue = None;
+            for (fence, value) in pending_signals.drain(..) {
+                (w.signal)(fence, value);
+            }
+        };
+
+        let mut done = Pumped::default();
+        let mut piece: Vec<(S, bool)> = Vec::new();
+        let mut pending_signals: Vec<(usize, u64)> = Vec::new();
+        let mut last_queue: Option<usize> = None;
+        loop {
+            let mut moved = false;
+            for (queue, items) in &mut self.queues {
+                let mut pending_fence_barrier = false;
+                loop {
+                    let decision = match items.front_mut() {
+                        None => Decision::Blocked,
+                        Some((Item::Segment(seg, waits), since, fresh)) => {
+                            let mut ok = true;
+                            let mut via_bop = 0u32;
+                            let mut unknown = 0u32;
+                            for wait in waits.iter() {
+                                match wait.holds(w.read) {
+                                    Some(true) => {}
+                                    Some(false) => {
+                                        if piece.iter().rev().any(|(prev, _)| (w.will_write)(prev, wait)) {
+                                            via_bop += 1;
+                                        } else {
+                                            ok = false;
+                                        }
+                                    }
+                                    None => unknown += 1,
+                                }
+                            }
+                            // Only check `can_join` when crossing a join boundary (another queue,
+                            // a BoP-satisfied wait, or a deferred-signal fence wait). Consecutive
+                            // ready segments on the same queue already ran together in one host
+                            // submission in legacy mode and must never be shredded by `can_join`.
+                            let is_join_boundary = !piece.is_empty()
+                                && (last_queue != Some(*queue)
+                                    || via_bop > 0
+                                    || pending_fence_barrier);
+                            if !ok {
+                                *fresh = false;
+                                done.unknown += unknown;
+                                Decision::Blocked
+                            } else if is_join_boundary && !(w.can_join)(&piece, seg) {
+                                Decision::FlushFirst
+                            } else {
+                                if !*fresh {
+                                    done.waited.push((*queue, since.elapsed()));
+                                }
+                                done.unknown += unknown;
+                                done.coalesced_bop_waits += via_bop;
+                                let barrier = via_bop > 0 || std::mem::take(&mut pending_fence_barrier);
+                                Decision::TakeSegment(barrier)
+                            }
+                        }
+                        Some((Item::Signal(..), ..)) => Decision::TakeSignal,
+                        Some((Item::FenceWait(fence, value), _, fresh)) => {
+                            let mem_ok = (w.fence)(*fence) >= *value;
+                            let pending_ok = !mem_ok
+                                && pending_signals
+                                    .iter()
+                                    .any(|&(f, v)| f == *fence && v >= *value);
+                            if !mem_ok && !pending_ok {
+                                *fresh = false;
+                                Decision::Blocked
+                            } else {
+                                Decision::TakeFenceWait(pending_ok)
+                            }
+                        }
+                    };
+                    match decision {
+                        Decision::Blocked => break,
+                        Decision::FlushFirst => {
+                            done.hazard_splits += 1;
+                            flush(&mut piece, &mut pending_signals, &mut last_queue, w, &mut done);
+                            pending_fence_barrier = false;
+                            moved = true;
+                            continue;
+                        }
+                        Decision::TakeSegment(barrier_before) => {
+                            moved = true;
+                            if let Some((Item::Segment(s, _), ..)) = items.pop_front() {
+                                piece.push((s, barrier_before));
+                                last_queue = Some(*queue);
+                                done.segments += 1;
+                            }
+                        }
+                        Decision::TakeSignal => {
+                            moved = true;
+                            if let Some((Item::Signal(fence, value), ..)) = items.pop_front() {
+                                if piece.is_empty() {
+                                    (w.signal)(fence, value);
+                                } else {
+                                    pending_signals.push((fence, value));
+                                }
+                            }
+                        }
+                        Decision::TakeFenceWait(via_pending) => {
+                            moved = true;
+                            if via_pending {
+                                pending_fence_barrier = true;
+                            }
+                            items.pop_front();
+                        }
+                    }
+                }
+            }
+            if !moved {
+                if piece.is_empty() && pending_signals.is_empty() {
+                    break;
+                }
+                flush(&mut piece, &mut pending_signals, &mut last_queue, w, &mut done);
             }
         }
         self.queues.retain(|(_, items)| !items.is_empty());
@@ -264,30 +499,80 @@ mod tests {
         log: Vec<String>,
         /// Bottom-of-pipe writes of each segment: (address, value).
         writes: HashMap<&'static str, Vec<(u64, u64)>>,
+        /// Per-segment hazard flags for `can_join_batch`.
+        flags: HashMap<&'static str, BatchFlags>,
     }
 
     fn ge(address: u64, reference: u64) -> ValueWait {
         ValueWait { address, bytes: 8, comparison: GREATER_EQUAL, reference, mask: u64::MAX }
     }
 
-    fn pump(held: &mut Held<&'static str>, fake: &RefCell<Fake>) -> Pumped {
+    fn pump_with(
+        held: &mut Held<&'static str>,
+        fake: &RefCell<Fake>,
+        coalesce: bool,
+        max_lists: usize,
+    ) -> Pumped {
         let read = |a: u64, _| Some(*fake.borrow().memory.get(&a).unwrap_or(&0));
         let fence = |f: usize| *fake.borrow().fences.get(&f).unwrap_or(&0);
-        let mut run = |q: usize, segments: Vec<&'static str>| {
+        let will_write = |seg: &&'static str, wait: &ValueWait| {
+            fake.borrow()
+                .writes
+                .get(seg)
+                .and_then(|writes| {
+                    writes
+                        .iter()
+                        .rev()
+                        .find(|&&(addr, _)| addr == wait.address)
+                        .map(|&(_, v)| wait.holds_for(v) == Some(true))
+                })
+                .unwrap_or(false)
+        };
+        let can_join = |piece: &[(&'static str, bool)], next: &&'static str| {
+            let f = fake.borrow();
+            let existing = piece.iter().fold(BatchFlags::default(), |acc, (s, _)| {
+                acc.merge(f.flags.get(s).copied().unwrap_or_default())
+            });
+            let next_flags = f.flags.get(next).copied().unwrap_or_default();
+            can_join_batch(existing, next_flags, piece.len(), max_lists)
+        };
+        let mut run = |segments: Vec<(&'static str, bool)>| {
             let mut f = fake.borrow_mut();
-            for s in &segments {
+            let mut names = Vec::with_capacity(segments.len());
+            for (s, barrier) in &segments {
                 for (a, v) in f.writes.get(s).cloned().unwrap_or_default() {
                     f.memory.insert(a, v);
                 }
+                if *barrier {
+                    names.push(format!("|{s}"));
+                } else {
+                    names.push((*s).to_owned());
+                }
             }
-            f.log.push(format!("q{q}: {}", segments.join(" ")));
+            f.log.push(format!("run: {}", names.join(" ")));
         };
         let mut signal = |fence: usize, value: u64| {
             let mut f = fake.borrow_mut();
             f.fences.insert(fence, value);
             f.log.push(format!("signal {fence} {value}"));
         };
-        held.pump(&mut World { read: &read, fence: &fence, run: &mut run, signal: &mut signal })
+        held.pump(&mut World {
+            read: &read,
+            fence: &fence,
+            will_write: &will_write,
+            can_join: &can_join,
+            coalesce,
+            run: &mut run,
+            signal: &mut signal,
+        })
+    }
+
+    fn pump(held: &mut Held<&'static str>, fake: &RefCell<Fake>) -> Pumped {
+        pump_with(held, fake, false, 64)
+    }
+
+    fn pump_coalesced(held: &mut Held<&'static str>, fake: &RefCell<Fake>) -> Pumped {
+        pump_with(held, fake, true, 64)
     }
 
     #[test]
@@ -297,11 +582,13 @@ mod tests {
         let expect = [(NEVER, false), (LESS, false), (EQUAL, true), (LESS_EQUAL, true), (GREATER, false), (NOT_EQUAL, false), (GREATER_EQUAL, true), (ALWAYS, true)];
         for (cmp, holds) in expect {
             assert_eq!(w(cmp, 5).holds(&read), Some(holds), "comparison {cmp}");
+            assert_eq!(w(cmp, 5).holds_for(0x1_0000_0005), Some(holds), "holds_for {cmp}");
         }
         assert_eq!(w(LESS, 6).holds(&read), Some(true));
         assert_eq!(w(GREATER, 4).holds(&read), Some(true));
         assert_eq!(w(0, 5).holds(&read), None, "unknown comparison");
         assert_eq!(w(9, 5).holds(&read), None);
+        assert_eq!(w(0, 5).holds_for(5), None);
         assert_eq!(w(EQUAL, 5).holds(&|_, _| None), None, "unreadable memory");
     }
 
@@ -317,11 +604,11 @@ mod tests {
         held.push(1, Item::Segment("reset", vec![]));
         held.push(1, Item::Segment("after", vec![eq(1)]));
         pump(&mut held, &fake);
-        assert_eq!(fake.borrow().log, ["q1: reset"], "the wait reads the 0 the reset wrote");
+        assert_eq!(fake.borrow().log, ["run: reset"], "the wait reads the 0 the reset wrote");
         assert!(held.holds_work(1));
         fake.borrow_mut().memory.insert(0x100, 1);
         pump(&mut held, &fake);
-        assert_eq!(fake.borrow().log, ["q1: reset", "q1: after"]);
+        assert_eq!(fake.borrow().log, ["run: reset", "run: after"]);
     }
 
     /// The compute queue's list waits for a value the graphics queue's list
@@ -337,7 +624,7 @@ mod tests {
         assert!(held.holds_work(2));
         held.push(1, Item::Segment("draw", vec![]));
         let p = pump(&mut held, &fake);
-        assert_eq!(fake.borrow().log, ["q1: draw", "q2: depth"]);
+        assert_eq!(fake.borrow().log, ["run: draw", "run: depth"]);
         assert_eq!((p.pieces, p.segments, p.waited.len()), (2, 2, 1));
         assert_eq!(p.waited[0].0, 2);
         assert!(!held.holds_work(2));
@@ -351,7 +638,7 @@ mod tests {
         held.push(2, Item::Segment("a", vec![ge(0x100, 7)]));
         held.push(2, Item::Segment("b", vec![]));
         let p = pump(&mut held, &fake);
-        assert_eq!(fake.borrow().log, ["q2: a b"], "one piece");
+        assert_eq!(fake.borrow().log, ["run: a b"], "one piece");
         assert_eq!((p.pieces, p.waited.len()), (1, 0));
     }
 
@@ -376,9 +663,177 @@ mod tests {
         fake.borrow_mut().writes.insert("g0", vec![(0x08, 1)]);
         held.push(1, Item::Segment("g1", vec![ge(0x10, 1)]));
         held.push(1, Item::Segment("g2", vec![ge(0x30, 1)]));
-        pump(&mut held, &fake);
-        assert_eq!(fake.borrow().log, ["q1: g0", "q2: c1", "q1: g1", "q2: c2", "q1: g2"]);
+        let p = pump(&mut held, &fake);
+        assert_eq!(fake.borrow().log, ["run: g0", "run: c1", "run: g1", "run: c2", "run: g2"]);
+        assert_eq!(p.pieces, 5, "legacy per-queue mode keeps 5 pieces");
         assert!(held.blocked(&|_, _| Some(0)).is_empty());
+    }
+
+    /// Coalesced mode joins the entire cross-queue BoP chain into a single
+    /// host submission with a UAV barrier before every BoP-unblocked segment.
+    #[test]
+    fn coalesced_chained_bop_waits_join_into_one_piece_with_barriers() {
+        let fake = RefCell::new(Fake::default());
+        {
+            let mut f = fake.borrow_mut();
+            f.writes.insert("g0", vec![(0x08, 1)]);
+            f.writes.insert("c1", vec![(0x10, 1)]);
+            f.writes.insert("g1", vec![(0x20, 1)]);
+            f.writes.insert("c2", vec![(0x30, 1)]);
+        }
+        let mut held = Held::default();
+        held.push(2, Item::Segment("c1", vec![ge(0x08, 1)]));
+        held.push(2, Item::Segment("c2", vec![ge(0x20, 1)]));
+        // First pump marks c1 as waiting (not fresh).
+        assert_eq!(pump_coalesced(&mut held, &fake).pieces, 0);
+        held.push(1, Item::Segment("g0", vec![]));
+        held.push(1, Item::Segment("g1", vec![ge(0x10, 1)]));
+        held.push(1, Item::Segment("g2", vec![ge(0x30, 1)]));
+        let p = pump_coalesced(&mut held, &fake);
+        assert_eq!(fake.borrow().log, ["run: g0 |c1 |g1 |c2 |g2"]);
+        assert_eq!(p.pieces, 1);
+        assert_eq!(p.segments, 5);
+        assert_eq!(p.coalesced_bop_waits, 4);
+        assert_eq!(p.hazard_splits, 0);
+        assert_eq!(p.waited.len(), 4, "c1, g1, c2, g2 each waited once before BoP unblocked them");
+        assert!(held.is_empty());
+    }
+
+    /// A submission-phase hazard (e.g., GPU write before CPU read, or title
+    /// copy before explicit texture upload) flushes the piece and its deferred
+    /// signals before running the conflicting segment.
+    #[test]
+    fn coalesced_hazard_split_flushes_piece_and_signals_first() {
+        let fake = RefCell::new(Fake::default());
+        {
+            let mut f = fake.borrow_mut();
+            f.writes.insert("gpu_prod", vec![(0x100, 1)]);
+            f.flags.insert("gpu_prod", BatchFlags { has_gpu_write: true, ..Default::default() });
+            f.flags.insert("cpu_reader", BatchFlags { has_cpu_read: true, ..Default::default() });
+            f.flags.insert("title_copier", BatchFlags { has_title_copy: true, ..Default::default() });
+            f.flags.insert("tex_user", BatchFlags { has_textures: true, ..Default::default() });
+        }
+        let mut held = Held::default();
+        held.push(2, Item::Segment("cpu_reader", vec![ge(0x100, 1)]));
+        held.push(1, Item::Segment("gpu_prod", vec![]));
+        held.push(1, Item::Signal(7, 42));
+        let p = pump_coalesced(&mut held, &fake);
+        assert_eq!(
+            fake.borrow().log,
+            ["run: gpu_prod", "signal 7 42", "run: cpu_reader"],
+            "hazard split flushed gpu_prod and its deferred signal before cpu_reader"
+        );
+        assert_eq!(p.pieces, 2);
+        assert_eq!(p.hazard_splits, 1);
+        assert_eq!(p.coalesced_bop_waits, 0);
+
+        // Title copy followed by explicit texture upload also splits.
+        fake.borrow_mut().log.clear();
+        held.push(1, Item::Segment("title_copier", vec![]));
+        held.push(2, Item::Segment("tex_user", vec![]));
+        let p2 = pump_coalesced(&mut held, &fake);
+        assert_eq!(fake.borrow().log, ["run: title_copier", "run: tex_user"]);
+        assert_eq!(p2.pieces, 2);
+        assert_eq!(p2.hazard_splits, 1);
+    }
+
+    /// Batch list cap (`max_lists`) splits oversized coalesced pieces across
+    /// queue boundaries without breaking a single queue's own submission.
+    #[test]
+    fn coalesced_max_lists_cap_splits_piece() {
+        let fake = RefCell::new(Fake::default());
+        let mut held = Held::default();
+        held.push(1, Item::Segment("a", vec![]));
+        held.push(1, Item::Segment("b", vec![]));
+        held.push(2, Item::Segment("c", vec![]));
+        held.push(2, Item::Segment("d", vec![]));
+        held.push(3, Item::Segment("e", vec![]));
+        let p = pump_with(&mut held, &fake, true, 2);
+        assert_eq!(fake.borrow().log, ["run: a b", "run: c d", "run: e"]);
+        assert_eq!(p.pieces, 3);
+        assert_eq!(p.segments, 5);
+        assert_eq!(p.hazard_splits, 2);
+    }
+
+    /// Consecutive ready segments on the same queue (e.g., one multi-list
+    /// submission containing mixed GPU writes, CPU copies/fills, and texture
+    /// uploads) are never split by `can_join`, while a cross-queue BoP-dependent
+    /// compute segment still coalesces onto that piece.
+    #[test]
+    fn coalesced_never_splits_same_queue_consecutive_segments() {
+        let fake = RefCell::new(Fake::default());
+        {
+            let mut f = fake.borrow_mut();
+            f.flags.insert("g0", BatchFlags { has_gpu_write: true, ..Default::default() });
+            f.flags.insert("g1", BatchFlags { has_title_copy: true, has_cpu_read: true, ..Default::default() });
+            f.flags.insert("g2", BatchFlags { has_textures: true, has_gpu_write: true, ..Default::default() });
+            f.writes.insert("g2", vec![(0x200, 1)]);
+            f.flags.insert("c0", BatchFlags { has_gpu_write: true, ..Default::default() });
+        }
+        let mut held = Held::default();
+        held.push(2, Item::Segment("c0", vec![ge(0x200, 1)]));
+        assert_eq!(pump_coalesced(&mut held, &fake).pieces, 0);
+        held.push(1, Item::Segment("g0", vec![]));
+        held.push(1, Item::Segment("g1", vec![]));
+        held.push(1, Item::Segment("g2", vec![]));
+        // Even with max_lists=2, same-queue g0..g2 are never shredded, and with max_lists=64 c0 joins too.
+        let p = pump_coalesced(&mut held, &fake);
+        assert_eq!(fake.borrow().log, ["run: g0 g1 g2 |c0"]);
+        assert_eq!(p.pieces, 1);
+        assert_eq!(p.segments, 4);
+        assert_eq!(p.coalesced_bop_waits, 1);
+        assert_eq!(p.hazard_splits, 0);
+
+        // Even when a single queue has more segments than `max_lists`, it stays one piece.
+        fake.borrow_mut().log.clear();
+        held.push(1, Item::Segment("g0", vec![]));
+        held.push(1, Item::Segment("g1", vec![]));
+        held.push(1, Item::Segment("g2", vec![]));
+        let p2 = pump_with(&mut held, &fake, true, 2);
+        assert_eq!(fake.borrow().log, ["run: g0 g1 g2"]);
+        assert_eq!(p2.pieces, 1);
+        assert_eq!(p2.hazard_splits, 0);
+    }
+
+    /// Deferred `Item::Signal` stays after its piece completes, while another
+    /// queue's `Item::FenceWait` for that pending signal joins behind a barrier.
+    #[test]
+    fn coalesced_deferred_signal_unblocks_fence_wait_with_barrier() {
+        let fake = RefCell::new(Fake::default());
+        let mut held = Held::default();
+        held.push(1, Item::Segment("work", vec![]));
+        held.push(1, Item::Signal(5, 3));
+        held.push(1, Item::Segment("more", vec![]));
+        held.push(2, Item::FenceWait(5, 3));
+        held.push(2, Item::Segment("consumer", vec![]));
+        let p = pump_coalesced(&mut held, &fake);
+        assert_eq!(
+            fake.borrow().log,
+            ["run: work more |consumer", "signal 5 3"]
+        );
+        assert_eq!(p.pieces, 1);
+        assert_eq!(p.segments, 3);
+        assert_eq!(fake.borrow().fences.get(&5), Some(&3));
+    }
+
+    /// Order within a queue never changes in coalesced mode: a later segment
+    /// whose waits hold does not pass a held one on the same queue.
+    #[test]
+    fn coalesced_preserves_per_queue_fifo_order() {
+        let fake = RefCell::new(Fake::default());
+        let mut held = Held::default();
+        held.push(2, Item::Segment("first", vec![ge(0x100, 1)]));
+        held.push(2, Item::Segment("second", vec![]));
+        held.push(1, Item::Segment("independent", vec![]));
+        let p1 = pump_coalesced(&mut held, &fake);
+        assert_eq!(fake.borrow().log, ["run: independent"]);
+        assert_eq!(p1.pieces, 1);
+        assert!(held.holds_work(2));
+        fake.borrow_mut().memory.insert(0x100, 1);
+        let p2 = pump_coalesced(&mut held, &fake);
+        assert_eq!(fake.borrow().log, ["run: independent", "run: first second"]);
+        assert_eq!(p2.pieces, 1);
+        assert!(held.is_empty());
     }
 
     /// Order within a queue never changes: a later segment whose waits hold
@@ -393,7 +848,7 @@ mod tests {
         assert!(fake.borrow().log.is_empty());
         fake.borrow_mut().memory.insert(0x100, 1);
         pump(&mut held, &fake);
-        assert_eq!(fake.borrow().log, ["q2: first second"]);
+        assert_eq!(fake.borrow().log, ["run: first second"]);
     }
 
     /// A Signal behind held work is delivered after it: the title's fence
@@ -409,7 +864,7 @@ mod tests {
         assert_eq!(fake.borrow().fences.get(&5), None, "not signalled yet");
         fake.borrow_mut().memory.insert(0x100, 1);
         pump(&mut held, &fake);
-        assert_eq!(fake.borrow().log, ["q2: work", "signal 5 3", "q2: after"]);
+        assert_eq!(fake.borrow().log, ["run: work", "signal 5 3", "run: after"]);
     }
 
     #[test]
@@ -422,7 +877,7 @@ mod tests {
         assert!(fake.borrow().log.is_empty());
         held.push(1, Item::Signal(5, 2));
         pump(&mut held, &fake);
-        assert_eq!(fake.borrow().log, ["signal 5 2", "q2: after"]);
+        assert_eq!(fake.borrow().log, ["signal 5 2", "run: after"]);
     }
 
     /// The frame ends with work held: it stays held (and is reported), and
@@ -443,7 +898,7 @@ mod tests {
         let p = pump(&mut held, &fake);
         assert_eq!(p.waited.len(), 1);
         assert!(held.is_empty());
-        assert_eq!(fake.borrow().log, ["q2: late", "signal 5 1"]);
+        assert_eq!(fake.borrow().log, ["run: late", "signal 5 1"]);
     }
 
     #[test]
@@ -465,6 +920,25 @@ mod tests {
         let forced = held.force_older_than(Duration::ZERO);
         assert_eq!(forced, [(2, vec![ge(0x100, 1)])]);
         pump(&mut held, &fake);
-        assert_eq!(fake.borrow().log, ["q2: stuck"]);
+        assert_eq!(fake.borrow().log, ["run: stuck"]);
+    }
+
+    #[test]
+    fn batch_flags_and_can_join_enforce_phase_hazards_and_caps() {
+        let clean = BatchFlags::default();
+        let gpu_write = BatchFlags { has_gpu_write: true, ..Default::default() };
+        let title_copy = BatchFlags { has_title_copy: true, has_cpu_read: true, ..Default::default() };
+        let cpu_read = BatchFlags { has_cpu_read: true, ..Default::default() };
+        let after = BatchFlags { has_after: true, ..Default::default() };
+        let tex = BatchFlags { has_textures: true, ..Default::default() };
+
+        assert!(can_join_batch(clean, clean, 1, 64));
+        assert!(can_join_batch(gpu_write, tex, 1, 64), "GPU write -> texture upload is safe");
+        assert!(can_join_batch(gpu_write, gpu_write, 1, 64), "GPU write -> GPU write is safe");
+        assert!(!can_join_batch(gpu_write, cpu_read, 1, 64), "GPU write -> CPU read splits");
+        assert!(!can_join_batch(after, cpu_read, 1, 64), "defer_after -> CPU read splits");
+        assert!(!can_join_batch(title_copy, tex, 1, 64), "title copy -> texture upload splits");
+        assert!(!can_join_batch(after, tex, 1, 64), "defer_after -> texture upload splits");
+        assert!(!can_join_batch(clean, clean, 64, 64), "cap reached splits");
     }
 }

@@ -23,7 +23,7 @@ use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use super::Shader;
-use super::host::{GraphicsState, HostPipeline};
+use super::host::{GraphicsState, HostPipeline, TargetFormats};
 use super::schedule::{
     COMPUTE_BUDGET, Lane, PriorityQueue, WaitBudgets, lane_for, sync_compute_enabled,
 };
@@ -53,6 +53,13 @@ pub(crate) struct Pending {
     /// whether a draw has used it yet.
     pub(crate) key: String,
     used: AtomicBool,
+    /// The formats its state declares for what a draw draws into (zeros
+    /// without a graphics state).
+    pub(crate) formats: TargetFormats,
+    /// The same shaders and state for other formats, bound at a draw
+    /// ([`for_formats`]): a chain from the title's pipeline, one link per
+    /// set of formats met, never shortened.
+    variant: OnceLock<Arc<Pending>>,
 }
 
 // SAFETY: D3D12 objects are free-threaded; the graphics state (whose input
@@ -85,6 +92,8 @@ impl Pending {
             && shaders.first().is_some_and(|s| s.stage == "compute")
             && sync_compute_enabled();
         Pending {
+            formats: graphics.as_ref().map_or([0; 9], |g| g.formats()),
+            variant: OnceLock::new(),
             key,
             shaders,
             graphics,
@@ -238,6 +247,60 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
         wait(p, crate::frame::current());
     }
     p.made.get()?.as_ref()
+}
+
+/// Pipelines made again for the formats bound at a draw, since the start.
+static VARIANTS: AtomicU64 = AtomicU64::new(0);
+
+/// Whether a draw into views of other formats than its pipeline declares
+/// gets a host pipeline for those formats ([`for_formats`]). On by
+/// default; `VICTORY_TARGET_VARIANTS=0` sends such a draw to the host with
+/// the title's pipeline, as before.
+fn variants_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TARGET_VARIANTS").is_none_or(|v| v != "0"))
+}
+
+/// The host pipeline for a draw with `p` into views of the formats
+/// `bound`, which `p` does not declare (`host::formats_differ`).
+#[cold]
+pub(crate) fn for_formats<'a>(
+    p: &'a Arc<Pending>,
+    bound: &TargetFormats,
+) -> Option<&'a HostPipeline> {
+    match p.graphics.as_deref() {
+        Some(g) if variants_on() => {
+            ready(variant(p, g, &super::host::formats_for(&p.formats, bound)))
+        }
+        _ => ready(p),
+    }
+}
+
+fn variant<'a>(p: &'a Arc<Pending>, g: &GraphicsState, bound: &TargetFormats) -> &'a Arc<Pending> {
+    let mut at = p;
+    for _ in 0..64 {
+        let next = at.variant.get_or_init(|| {
+            let so_far = VARIANTS.fetch_add(1, Ordering::Relaxed) + 1;
+            tracing::info!(
+                pipeline = ?p.shaders,
+                declared = ?p.formats,
+                bound = ?bound,
+                so_far,
+                "a pipeline is made again for the render target formats bound at its draw (VICTORY_TARGET_VARIANTS=0 disables)"
+            );
+            Arc::new(Pending::new(
+                p.shaders.clone(),
+                Some(Box::new(g.with_formats(bound))),
+                #[cfg(feature = "diagnostics")]
+                &[],
+            ))
+        });
+        if next.formats == *bound {
+            return next;
+        }
+        at = next;
+    }
+    p
 }
 
 /// Starts making `p` now, without waiting for it.
@@ -531,6 +594,31 @@ mod tests {
             missing(&skipped).as_deref(),
             Some("skipped shader abcdef0123456789")
         );
+    }
+
+    #[test]
+    fn a_pipeline_for_bound_formats_is_made_once() {
+        let p = Arc::new(Pending::new(
+            Vec::new(),
+            Some(Box::new(GraphicsState::declaring(24))),
+            #[cfg(feature = "diagnostics")]
+            &[],
+        ));
+        assert_eq!(p.formats, [24, 0, 0, 0, 0, 0, 0, 0, 0]);
+        let g = p.graphics.as_deref().unwrap();
+        let (a, b) = ([26, 0, 0, 0, 0, 0, 0, 0, 0], [28, 0, 0, 0, 0, 0, 0, 0, 0]);
+        let first = variant(&p, g, &a);
+        assert_eq!(first.formats, a);
+        assert_ne!(first.key, p.key);
+        assert!(Arc::ptr_eq(first, variant(&p, g, &a)));
+        let second = variant(&p, g, &b);
+        assert_eq!(second.formats, b);
+        assert!(!Arc::ptr_eq(first, second));
+        assert_ne!(second.key, first.key);
+        assert!(Arc::ptr_eq(first, variant(&p, g, &a)));
+        assert!(Arc::ptr_eq(second, variant(&p, g, &b)));
+        assert!(!first.queued.load(Ordering::Relaxed));
+        assert!(!p.queued.load(Ordering::Relaxed));
     }
 
     #[cfg(feature = "diagnostics")]

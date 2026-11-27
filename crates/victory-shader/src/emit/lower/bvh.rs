@@ -136,23 +136,35 @@ impl Lower<'_> {
                 // shortcut: the root address is taken to be 256-byte aligned
                 // (the descriptor drops its low byte, not known here).
                 let (k, dynamic) = self.built_offset(src)?;
-                let three = self.s.m.i32(3);
-                let mut at = self.s.m.bin(c, Bin::Shl, lo, three);
-                let k = self.s.m.i32(k);
-                at = self.s.m.bin(c, Bin::Add, at, k);
-                if let Some(d) = dynamic {
-                    at = self.s.m.bin(c, Bin::Add, at, d);
-                }
                 // A root view is title memory there (bounds-checked).
                 match self.root_address(src) {
                     Some((root_lo, root_hi)) => {
                         self.s.flags |= super::flags::INT64;
-                        let base = wide64(self, root_lo, root_hi);
                         let zero = self.s.m.i32(0);
-                        let at = wide64(self, at, zero);
-                        Nodes::Raw(self.s.m.bin(c, Bin::Add, base, at))
+                        let mut base = wide64(self, root_lo, root_hi);
+                        if k != 0 {
+                            let k = self.s.m.int_const(i64t, i64::from(k));
+                            base = self.s.m.bin(c, Bin::Add, base, k);
+                        }
+                        if let Some(d) = dynamic {
+                            let d = wide64(self, d, zero);
+                            base = self.s.m.bin(c, Bin::Add, base, d);
+                        }
+                        let ptr = wide64(self, lo, node_hi.unwrap_or(zero));
+                        let k3 = self.s.m.int_const(i64t, 3);
+                        let off = self.s.m.bin(c, Bin::Shl, ptr, k3);
+                        Nodes::Raw(self.s.m.bin(c, Bin::Add, base, off))
                     }
-                    None => Nodes::Buffer(self.handle((b, i), src, false, (11, 0))?, at),
+                    None => {
+                        let three = self.s.m.i32(3);
+                        let mut at = self.s.m.bin(c, Bin::Shl, lo, three);
+                        let k = self.s.m.i32(k);
+                        at = self.s.m.bin(c, Bin::Add, at, k);
+                        if let Some(d) = dynamic {
+                            at = self.s.m.bin(c, Bin::Add, at, d);
+                        }
+                        Nodes::Buffer(self.handle((b, i), src, false, (11, 0))?, at)
+                    }
                 }
             }
             Some(_) => return Err("a BVH descriptor"),
@@ -199,10 +211,23 @@ impl Lower<'_> {
 
     /// The four result dwords of `ray` against the node `node` points to.
     fn bvh_lanes(&mut self, nodes: &Nodes, node: V, ray: &Ray) -> Result<[V; 4], Why> {
-        let (w, head) = self.node_dwords(nodes, 0, 16, None)?;
         let c = self.cur;
         let seven = self.s.m.i32(7);
         let ty = self.s.m.bin(c, Bin::And, node, seven);
+        let six = self.s.m.i32(6);
+        // Types 6 (instance) and 7 (procedural, including `INVALID = 0xFFFF_FFFF`)
+        // always return `[INVALID; 4]`; skip loading their node memory so sentinel
+        // or unhandled pointers never read unmapped title memory or mark misses.
+        let known = self.s.m.cmp(c, pred::IULT, ty, six);
+        let outer = self.begin_guarded(Some(known));
+        let (w, head) = match self.node_dwords(nodes, 0, 16, None) {
+            Ok(loaded) => loaded,
+            Err(why) => {
+                self.end_guarded(outer, &[]);
+                return Err(why);
+            }
+        };
+        let c = self.cur;
         // The rest of a box32 node, read only for one.
         let five = self.s.m.i32(5);
         let is32 = self.s.m.cmp(c, pred::EQ, ty, five);
@@ -211,6 +236,7 @@ impl Lower<'_> {
             Ok((t, _)) => t,
             Err(why) => {
                 self.end_guarded(at, &[]);
+                self.end_guarded(outer, &[]);
                 return Err(why);
             }
         };
@@ -222,15 +248,11 @@ impl Lower<'_> {
         let tri = self.bvh_triangle(&w, ty, ray);
         let c = self.cur;
         let four = self.s.m.i32(4);
-        let six = self.s.m.i32(6);
         let is_tri = self.s.m.cmp(c, pred::IULT, ty, four);
-        let t6 = self.s.m.bin(c, Bin::And, ty, six);
-        let is_box = self.s.m.cmp(c, pred::EQ, t6, four);
+        let r: [V; 4] = std::array::from_fn(|k| self.s.m.select(c, is_tri, tri[k], boxes[k]));
         let none = self.s.m.i32(INVALID);
-        Ok(std::array::from_fn(|k| {
-            let x = self.s.m.select(c, is_box, boxes[k], none);
-            self.s.m.select(c, is_tri, tri[k], x)
-        }))
+        let r = self.end_guarded(outer, &r.map(|x| (x, none)));
+        Ok([r[0], r[1], r[2], r[3]])
     }
 
     /// `n` dwords of the node from dword `from`, and in title memory the

@@ -9,7 +9,10 @@ pub(crate) type KeptOutputs = HashMap<(String, u32), u8>;
 
 /// Keeps only arbitrary (`kind == 0`) signature elements whose semantic has at
 /// least one channel read in `keep`, trimming unread leading and trailing
-/// channels. System values (`kind != 0`) stay untouched.
+/// channels and ordering arbitrary elements by descending component size
+/// (`4`, `2`, `1`, `3`) so Metal's aligned mesh-output layout leaves no padding
+/// holes between scalar/pair and `float4` attributes. System values (`kind != 0`)
+/// stay untouched ahead of arbitrary elements.
 pub(super) fn prune_signature(elements: &mut Vec<SigElement>, keep: &KeptOutputs) {
     elements.retain_mut(|e| {
         if e.kind != 0 {
@@ -29,6 +32,19 @@ pub(super) fn prune_signature(elements: &mut Vec<SigElement>, keep: &KeptOutputs
         e.col += first;
         e.cols = last - first + 1;
         true
+    });
+    elements.sort_by_key(|e| {
+        if e.kind != 0 {
+            (0u8, 0u8, String::new(), 0u32, 0u8)
+        } else {
+            let size_rank = match e.cols {
+                4 => 0,
+                2 => 1,
+                1 => 2,
+                _ => 3,
+            };
+            (1u8, size_rank, e.name.to_ascii_uppercase(), e.index, e.col)
+        }
     });
 }
 

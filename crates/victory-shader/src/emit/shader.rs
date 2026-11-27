@@ -143,6 +143,8 @@ pub(crate) struct Shader {
     pub m: Module,
     pub t: Types,
     pub pixel: bool,
+    /// Repack pruned signature rows in element order at `finish` time.
+    pub repack_signatures: bool,
     pub inputs: Vec<SigElement>,
     pub outputs: Vec<SigElement>,
     /// A mesh shader's per-primitive outputs.
@@ -234,6 +236,7 @@ impl Shader {
                 res_ret_i32,
             },
             pixel,
+            repack_signatures: false,
             inputs: Vec::new(),
             outputs: Vec::new(),
             prims: Vec::new(),
@@ -836,6 +839,19 @@ impl Shader {
             self.m.named_md("dx.resources", vec![r]);
         }
 
+        if self.pixel {
+            container::same_mode_per_row(&mut self.inputs, true);
+            if self.repack_signatures {
+                container::repack_rows(&mut self.inputs);
+            }
+        } else {
+            container::same_mode_per_row(&mut self.outputs, false);
+            if self.repack_signatures {
+                container::repack_rows(&mut self.outputs);
+                container::repack_rows(&mut self.prims);
+            }
+        }
+
         let graphics = self.threads.is_none() || self.mesh.is_some();
         if graphics {
             // shortcut: every output is declared to depend on every input; the
@@ -875,11 +891,6 @@ impl Shader {
             self.m.named_md("dx.viewIdState", vec![view_node]);
         }
 
-        if self.pixel {
-            container::same_mode_per_row(&mut self.inputs, true);
-        } else {
-            container::same_mode_per_row(&mut self.outputs, false);
-        }
         let sigs = if graphics {
             let ins = self.signature_md(self.inputs.clone());
             let outs = self.signature_md(self.outputs.clone());

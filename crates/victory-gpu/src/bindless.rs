@@ -162,6 +162,47 @@ impl Viewed {
         }
     }
 
+    /// Batched [`Viewed::set`]: computes each unique view's entry outside the
+    /// lock (deduplicating repeated view pointers) and applies all slot
+    /// updates under one hold of `self.inner`.
+    #[cfg(windows)]
+    pub(crate) fn set_batch(&self, updates: &[(u32, Option<&View>, bool)]) {
+        if updates.is_empty() {
+            return;
+        }
+        let mut cache: HashMap<(usize, bool), Option<Seen>> = HashMap::new();
+        let mut entries: Vec<(u32, Option<Seen>)> = Vec::with_capacity(updates.len());
+        for &(index, view, made) in updates {
+            let entry = match view {
+                None => None,
+                Some(v) => {
+                    let key = (std::ptr::from_ref(v) as usize, made);
+                    cache
+                        .entry(key)
+                        .or_insert_with(|| {
+                            if made {
+                                seen(v)
+                            } else {
+                                Some(Seen::Left(left_kind(v)))
+                            }
+                        })
+                        .clone()
+                }
+            };
+            entries.push((index, entry));
+        }
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        for (index, entry) in entries {
+            if let Some(old) = inner.slots.remove(&index) {
+                inner.count(index, &old, false);
+            }
+            if let Some(entry) = entry {
+                inner.count(index, &entry, true);
+                inner.slots.insert(index, entry);
+            }
+        }
+    }
+
     /// The buffer ranges views reach, merged per host copy and kind
     /// (shader resource, unordered access): copy, start, bytes.
     #[cfg(any(test, feature = "diagnostics"))]

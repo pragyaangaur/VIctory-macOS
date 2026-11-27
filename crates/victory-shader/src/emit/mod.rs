@@ -532,6 +532,66 @@ impl MeshOutputs {
     }
 }
 
+/// Output bytes as Apple's Metal counts them for a translated mesh shader
+/// container (`OSG1`, `PSG1`, `PSV0`): per vertex, clip/cull distances,
+/// `SV_Position`, then remaining allocated outputs in signature order aligned
+/// to their own byte size, plus allocated primitive outputs aligned likewise,
+/// multiplied by declared max counts.
+pub fn mesh_aligned_bytes(dxil: &[u8]) -> Option<u32> {
+    use crate::dxbc::u32_at;
+    let c = Container::parse(dxil).ok()?;
+    let psv = c.part(FourCC::PSV0)?.data;
+    let size = u32_at(psv, 0).ok()? as usize;
+    let info = psv.get(4..4 + size).filter(|i| i.len() >= 33)?;
+    if info[24] != 13 {
+        return None;
+    }
+    let half = |at: usize| u32::from(u16::from_le_bytes([info[at], info[at + 1]]));
+    let elements = |fourcc| -> Option<Vec<(u32, u32)>> {
+        let Some(part) = c.part(fourcc) else {
+            return Some(Vec::new());
+        };
+        let (count, base) = (u32_at(part.data, 0).ok()?, u32_at(part.data, 4).ok()?);
+        let mut out = Vec::new();
+        for i in 0..count as usize {
+            let at = base as usize + 32 * i;
+            let register = u32_at(part.data, at + 20).ok()?;
+            if register == u32::MAX {
+                continue;
+            }
+            let sys = u32_at(part.data, at + 12).ok()?;
+            let mask = *part.data.get(at + 24)?;
+            out.push((sys, mask.count_ones()));
+        }
+        Some(out)
+    };
+    const POSITION: u32 = 1;
+    const DISTANCES: [u32; 2] = [2, 3];
+    let layout = |sizes: &mut dyn Iterator<Item = u32>| {
+        sizes
+            .filter(|&size| size > 0)
+            .fold(0u32, |end, size| end.next_multiple_of(size) + size)
+    };
+    let vertex = elements(FourCC::OSG1)?;
+    let distances: u32 = vertex
+        .iter()
+        .filter(|(sys, _)| DISTANCES.contains(sys))
+        .map(|&(_, n)| n)
+        .sum();
+    let vertex_bytes = layout(
+        &mut std::iter::repeat_n(4, distances as usize)
+            .chain([16])
+            .chain(
+                vertex
+                    .iter()
+                    .filter(|(sys, _)| *sys != POSITION && !DISTANCES.contains(sys))
+                    .map(|&(_, n)| 4 * n),
+            ),
+    );
+    let primitive_bytes = layout(&mut elements(FourCC::PSG1)?.iter().map(|&(_, n)| 4 * n));
+    Some(half(12) * vertex_bytes + half(14) * primitive_bytes)
+}
+
 /// The declared outputs of a translated mesh shader: the counts from its
 /// `PSV0` part, the components from its `OSG1` and `PSG1`. None for other
 /// stages or a container without them.
@@ -760,23 +820,8 @@ pub fn translate_linked(
         io: &mp.io,
         res: &mp.res,
     };
-    let emit_mesh = |reads: &lower::KeptOutputs| {
-        let linked = emit_pruned(&ms_in, options, Some(reads))?;
-        let bytes = mesh_outputs(&linked.dxil)
-            .ok_or(ShaderError::Malformed(
-                "linked shader has no mesh output declaration",
-            ))?
-            .bytes();
-        if bytes > METAL_MESH_OUTPUT_BYTES {
-            return Err(ShaderError::Unsupported {
-                offset: 0,
-                what: "mesh outputs required by the next stage exceed 32 KiB",
-            });
-        }
-        Ok(linked)
-    };
     let Some(ps_bytes) = pixel else {
-        return Ok((emit_mesh(&lower::KeptOutputs::new())?, None));
+        return link_prepared(&ms_in, None, options);
     };
     let pp = prepare(ps_bytes)?;
     if pp.native.stage != HwStage::Ps {
@@ -792,10 +837,37 @@ pub fn translate_linked(
         io: &pp.io,
         res: &pp.res,
     };
-    let full_ps = emit_pruned(&ps_in, options, None)?;
+    link_prepared(&ms_in, Some(&ps_in), options)
+}
+
+fn link_prepared(
+    ms_in: &EmitInput<'_>,
+    ps_in: Option<&EmitInput<'_>>,
+    options: Options,
+) -> Result<(HostShader, Option<HostShader>), ShaderError> {
+    let emit_mesh = |reads: &lower::KeptOutputs| {
+        let linked = emit_pruned(ms_in, options, Some(reads))?;
+        let packed = mesh_outputs(&linked.dxil)
+            .ok_or(ShaderError::Malformed(
+                "linked shader has no mesh output declaration",
+            ))?
+            .bytes();
+        let bytes = mesh_aligned_bytes(&linked.dxil).map_or(packed, |a| packed.max(a));
+        if bytes > METAL_MESH_OUTPUT_BYTES {
+            return Err(ShaderError::Unsupported {
+                offset: 0,
+                what: "mesh outputs required by the next stage exceed 32 KiB",
+            });
+        }
+        Ok(linked)
+    };
+    let Some(ps_in) = ps_in else {
+        return Ok((emit_mesh(&lower::KeptOutputs::new())?, None));
+    };
+    let full_ps = emit_pruned(ps_in, options, None)?;
     let reads = pixel_input_reads(&full_ps.dxil)?;
     let linked_ms = emit_mesh(&reads)?;
-    let linked_ps = emit_pruned(&ps_in, options, Some(&reads))?;
+    let linked_ps = emit_pruned(ps_in, options, Some(&reads))?;
     Ok((linked_ms, Some(linked_ps)))
 }
 
@@ -2985,16 +3057,20 @@ mod tests {
         assert_eq!(metal_mesh_output_bytes(&standalone.dxil), Some(aligned));
         assert!(aligned > METAL_MESH_OUTPUT_BYTES);
 
-        // If the next stage needs every component, pruning cannot make it safe.
+        // If the next stage needs every component nothing is pruned, but the
+        // repacking still orders the outputs by size, which removes the
+        // alignment holes: the layout then takes its packed size, over the
+        // limit only when the packed size is.
         let all_reads = widths
             .into_iter()
             .enumerate()
             .map(|(row, width)| (("TEXCOORD".into(), row as u32), (1 << width) - 1))
             .collect();
         let still_over = emit_pruned(&ms_in, Options::default(), Some(&all_reads)).unwrap();
+        assert_eq!(metal_mesh_output_bytes(&still_over.dxil), Some(packed));
         assert_eq!(
             over_limit_mesh_output_bytes(&still_over.dxil),
-            Some(aligned)
+            (packed > METAL_MESH_OUTPUT_BYTES).then_some(packed)
         );
 
         // Depth-only linking (no pixel shader) drops all arbitrary outputs.
@@ -3177,6 +3253,376 @@ mod tests {
                     texels.first()
                 );
                 eprintln!("{label}: linked mesh exact readback matched");
+            }
+        }
+    }
+
+    /// Reproduces #172/#282's aligned mesh-output inflation: a 128-lane mesh
+    /// shader declares 16 per-vertex `TEXCOORD`s (`OSG1`) and 3 per-primitive
+    /// `PRIM`s (`PSG1`) where five `1`-component scalar reads precede ten
+    /// `4`-component vector reads in `OSG1` and a `1`-component `PRIM0.x`
+    /// precedes `4`-component `PRIM1.xyzw` in `PSG1`. Without repacking,
+    /// alignment holes inflate the kept outputs from 27,648 B packed to
+    /// 36,864 B aligned (> 32 KiB); `translate_linked` prunes both `OSG1` and
+    /// `PSG1` (`PRIM2` and `TEXCOORD15` dropped) and repacks vectors ahead of
+    /// scalars so `mesh_aligned_bytes` drops to 27,648 B, validates, and draws
+    /// accurately on hardware (D3DMetal) and WARP.
+    #[test]
+    fn linked_mesh_repacks_interleaved_scalar_and_vector_outputs_and_prunes_primitives() {
+        let mut words = vec![
+            0xD765_0001u32, // v_mbcnt_lo_u32_b32 v1, -1, 0
+            0x0001_00C1,
+            0x3604_0281, // v_and_b32 v2, 1, v1
+            0x3606_0282, // v_and_b32 v3, 2, v1
+            0x7E04_0D02, // v_cvt_f32_u32 v2, v2
+            0x7E06_0D03, // v_cvt_f32_u32 v3, v3
+            0x1008_04F6, // v_mul_f32 v4, 4.0, v2
+            0x0608_08F3, // v_add_f32 v4, -1.0, v4
+            0x100A_06F4, // v_mul_f32 v5, 2.0, v3
+            0x060A_0AF3, // v_add_f32 v5, -1.0, v5
+            0x7E0C_02F0, // v_mov_b32 v6, 0.5
+            0x7E0E_02F2, // v_mov_b32 v7, 1.0
+            0x7E10_02FF, // v_mov_b32 v8, 0.25
+            0.25f32.to_bits(),
+            0x7E12_02FF, // v_mov_b32 v9, TRIANGLE
+            TRIANGLE,
+            0x7E14_0280, // v_mov_b32 v10, 0.0
+            0x7E16_02FF, // v_mov_b32 v11, 0.125
+            0.125f32.to_bits(),
+            0x7E18_02FF, // v_mov_b32 v12, 0.75
+            0.75f32.to_bits(),
+        ];
+        // Per-vertex param0..15:
+        // - param0 = (1.0, 0, 0, 0)
+        // - param1 = (0, 0.5, 0, 0)
+        // - param9 = (0, 0, 0.25, 0)
+        // - all others = (0, 0, 0, 0)
+        words.extend([0xF800_000F | (32 << 4), 0x0A0A_0A07]);
+        words.extend([0xF800_000F | (33 << 4), 0x0A0A_060A]);
+        for k in 2..16u32 {
+            let src = if k == 9 { 0x0A08_0A0A } else { 0x0A0A_0A0A };
+            words.extend([0xF800_000F | ((32 + k) << 4), src]);
+        }
+        // Per-primitive param16..18:
+        // - param16 (PRIM0) = (0.125, 0, 0, 0)
+        // - param17 (PRIM1) = (0, 0, 0, 0.75)
+        // - param18 (PRIM2, unread) = (0, 0, 0, 0)
+        words.extend([0xF800_000F | ((32 + 16) << 4), 0x0A0A_0A0B]);
+        words.extend([0xF800_000F | ((32 + 17) << 4), 0x0C0A_0A0A]);
+        words.extend([0xF800_000F | ((32 + 18) << 4), 0x0A0A_0A0A]);
+        words.extend([
+            0xF800_0941, // exp prim v9, off, off, off done
+            0x0000_0009,
+            0xF800_08CF, // exp pos0 v4, v5, v6, v7 done
+            0x0706_0504,
+            0xBF81_0000, // s_endpgm
+        ]);
+
+        let mut ms_outputs: Vec<crate::native::VsOutput> = (0..16u8)
+            .map(|k| crate::native::VsOutput {
+                usage: crate::native::Usage::Generic,
+                row: k + 1,
+                param: k,
+                fp16: false,
+                pack2: false,
+            })
+            .collect();
+        for p in 0..3u8 {
+            ms_outputs.push(crate::native::VsOutput {
+                usage: crate::native::Usage::Generic,
+                row: p,
+                param: 0x80 | (16 + p),
+                fp16: false,
+                pack2: false,
+            });
+        }
+        let ms_native = NativeProgram {
+            stage: HwStage::Ms,
+            wave64: false,
+            vgprs: 16,
+            layout: vec![],
+            used: vec![],
+            io: StageIo::Ms(crate::native::MeshIo {
+                outputs: ms_outputs,
+                clip_cntl: 0,
+                threads: 128,
+                max_vertices: 128,
+                max_primitives: 128,
+                topology: 2,
+                lds_bytes: 0,
+            }),
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let mut ms_sig = vec![SigElement {
+            name: "SV_Position".into(),
+            index: 0,
+            kind: 3,
+            comp: 9,
+            interp: 0,
+            row: Some(0),
+            col: 0,
+            cols: 4,
+            usage: 0xF,
+            half: false,
+        }];
+        for k in 0..16u32 {
+            ms_sig.push(SigElement {
+                name: "TEXCOORD".into(),
+                index: k,
+                kind: 0,
+                comp: 9,
+                interp: 0,
+                row: Some(k + 1),
+                col: 0,
+                cols: 4,
+                usage: 0xF,
+                half: false,
+            });
+        }
+        let prim_sig: Vec<SigElement> = (0..3u32)
+            .map(|p| SigElement {
+                name: "PRIM".into(),
+                index: p,
+                kind: 0,
+                comp: 9,
+                interp: 1,
+                row: Some(p),
+                col: 0,
+                cols: 4,
+                usage: 0xF,
+                half: false,
+            })
+            .collect();
+        let ms_osg1 = container::signature(&ms_sig, false);
+        let ms_psg1 = container::signature(&prim_sig, false);
+        let ms_bytes = crate::dxbc::build(&[(FourCC::OSG1, &ms_osg1), (FourCC::PSG1, &ms_psg1)]);
+        let mc = Container::parse(&ms_bytes).unwrap();
+        let mp = ir::build(&ms_native.patched_code(), ms_native.wave64, ms_native.vgprs).unwrap();
+        let mst = structure::structure(&mp).unwrap();
+        let mres = resource::track(&mp, &ms_native.layout, ms_native.stage, Some(&mst)).unwrap();
+        let mio = io::raise(&mp, &ms_native).unwrap();
+        let ms_in = EmitInput {
+            c: &mc,
+            native: &ms_native,
+            p: &mp,
+            st: &mst,
+            io: &mio,
+            res: &mres,
+        };
+
+        // Pixel shader:
+        // - Reads ONLY `.x` of TEXCOORD 0, 2, 4, 6, 8 (five 1-col scalars)
+        // - Reads ALL `.xyzw` of TEXCOORD 1, 3, 5, 7, 9, 10, 11, 12, 13, 14 (ten 4-col vectors)
+        // - Leaves TEXCOORD 15 unread
+        // - Reads PRIM0.x (1-col) and PRIM1.xyzw (4-col) via P0 flat interp, leaving PRIM2 unread.
+        let p1 = |vdst: u32, attr: u32, ch: u32| {
+            0xC800_0000u32 | (vdst << 18) | (attr << 10) | (ch << 8)
+        };
+        let p2 = |vdst: u32, attr: u32, ch: u32| {
+            0xC801_0001u32 | (vdst << 18) | (attr << 10) | (ch << 8)
+        };
+        let pmov = |vdst: u32, attr: u32, ch: u32| {
+            0xC802_0002u32 | (vdst << 18) | (attr << 10) | (ch << 8)
+        };
+        let mut ps_words = vec![
+            0x7E04_0280u32, // v2 = 0.0 (R accumulator)
+            0x7E06_0280,    // v3 = 0.0 (G accumulator)
+            0x7E08_0280,    // v4 = 0.0 (B accumulator)
+            0x7E0A_0280,    // v5 = 0.0 (A accumulator)
+        ];
+        // Five 1-col scalar reads (0, 2, 4, 6, 8 -> .x; TEXCOORD0.x == 1.0, others 0.0) into v2:
+        for attr in [0u32, 2, 4, 6, 8] {
+            ps_words.extend([
+                p1(6, attr, 0),
+                p2(6, attr, 0),
+                0x0604_0D02, // v_add_f32 v2, v2, v6
+            ]);
+        }
+        // Ten 4-col vector reads (1, 3, 5, 7, 9, 10, 11, 12, 13, 14 -> .xyzw):
+        // TEXCOORD1.y == 0.5 goes into v3; TEXCOORD9.z == 0.25 goes into v4; all others 0.0!
+        for attr in [1u32, 3, 5, 7, 9, 10, 11, 12, 13, 14] {
+            for ch in 0..4u32 {
+                let acc = match ch {
+                    1 => 0x0606_0D03, // v3 += v6
+                    2 => 0x0608_0D04, // v4 += v6
+                    _ => 0x060A_0D05, // v5 += v6
+                };
+                ps_words.extend([p1(6, attr, ch), p2(6, attr, ch), acc]);
+            }
+        }
+        // PRIM0 (attr 16).x == 0.125 -> add to v4 (so B = 0.25 + 0.125 = 0.375)
+        ps_words.extend([pmov(6, 16, 0), 0x0608_0D04]);
+        // PRIM1 (attr 17).xyzw -> (0, 0, 0, 0.75) -> add to v5 (so A = 0.75)
+        for ch in 0..4u32 {
+            ps_words.extend([pmov(6, 17, ch), 0x060A_0D05]);
+        }
+        ps_words.extend([
+            0xF800_180F,
+            0x0504_0302, // exp mrt0, v2, v3, v4, v5 done vm
+            0xBF81_0000, // s_endpgm
+        ]);
+
+        let mut ps_inputs: Vec<crate::native::PsInput> = (0..16u8)
+            .map(|k| crate::native::PsInput {
+                usage: crate::native::Usage::Generic,
+                row: k + 1,
+                mask: 0xF,
+                attr: k,
+                flat: false,
+                fp16: false,
+                pack2: false,
+                row2: 0,
+            })
+            .collect();
+        for p in 0..3u8 {
+            ps_inputs.push(crate::native::PsInput {
+                usage: crate::native::Usage::Generic,
+                row: 17 + p,
+                mask: 0xF,
+                attr: 16 + p,
+                flat: true,
+                fp16: false,
+                pack2: false,
+                row2: 0,
+            });
+        }
+        let ps_native = NativeProgram {
+            stage: HwStage::Ps,
+            wave64: false,
+            vgprs: 8,
+            layout: vec![],
+            used: vec![],
+            io: StageIo::Ps {
+                inputs: ps_inputs,
+                input_addr: 1 << 1,
+                db_shader_control: 0,
+                patches: vec![],
+            },
+            code: ps_words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let mut ps_sig = ms_sig.clone();
+        for p in 0..3u32 {
+            ps_sig.push(SigElement {
+                name: "PRIM".into(),
+                index: p,
+                kind: 0,
+                comp: 9,
+                interp: 1,
+                row: Some(17 + p),
+                col: 0,
+                cols: 4,
+                usage: 0,
+                half: false,
+            });
+        }
+        let ps_isg1 = container::signature(&ps_sig, true);
+        let ps_osg1 = rows(&[("SV_Target", 16, false)], false);
+        let ps_bytes = crate::dxbc::build(&[(FourCC::ISG1, &ps_isg1), (FourCC::OSG1, &ps_osg1)]);
+        let pc = Container::parse(&ps_bytes).unwrap();
+        let pp = ir::build(&ps_native.patched_code(), ps_native.wave64, ps_native.vgprs).unwrap();
+        let pst = structure::structure(&pp).unwrap();
+        let pres = resource::track(&pp, &ps_native.layout, ps_native.stage, Some(&pst)).unwrap();
+        let pio = io::raise(&pp, &ps_native).unwrap();
+        let ps_in = EmitInput {
+            c: &pc,
+            native: &ps_native,
+            p: &pp,
+            st: &pst,
+            io: &pio,
+            res: &pres,
+        };
+
+        // Standalone mesh shader is 40,960 B (> 32 KiB).
+        let standalone_ms = emit_pruned(&ms_in, Options::default(), None).unwrap();
+        assert_eq!(mesh_bytes(&standalone_ms.dxil), Some(40_960));
+        assert_eq!(mesh_aligned_bytes(&standalone_ms.dxil), Some(40_960));
+
+        // Linked mesh + pixel prunes TEXCOORD15 and PRIM2, trims five vertex +
+        // one primitive outputs to 1-col, and repacks 4-col vectors ahead of
+        // 1-col scalars so BOTH packed and aligned footprints equal 27,648 B
+        // (whereas unrepacked aligned bytes would have been 36,864 B > 32 KiB!).
+        let (linked_ms, linked_ps) =
+            link_prepared(&ms_in, Some(&ps_in), Options::default()).unwrap();
+        let linked_ps = linked_ps.unwrap();
+        let mo = mesh_outputs(&linked_ms.dxil).unwrap();
+        assert_eq!(mo.vertex_components, 4 + 10 * 4 + 5);
+        assert_eq!(mo.primitive_components, 4 + 1);
+        assert_eq!(mo.bytes(), 27_648);
+        assert_eq!(
+            mesh_aligned_bytes(&linked_ms.dxil),
+            Some(27_648),
+            "repacking eliminates the 9,216 B of scalar-before-float4 alignment holes"
+        );
+
+        #[cfg(windows)]
+        {
+            if let Ok(mut v) = super::validator::Validator::load(
+                super::validator::Validator::default_path().as_deref(),
+            ) {
+                v.validate(&mut linked_ms.dxil.clone()).unwrap();
+                v.validate(&mut linked_ps.dxil.clone()).unwrap();
+            }
+            use super::host::{Draw, Host, Root};
+            use windows::Win32::Graphics::Direct3D12::{
+                D3D12_FEATURE_D3D12_OPTIONS7, D3D12_FEATURE_DATA_D3D12_OPTIONS7,
+                D3D12_MESH_SHADER_TIER_NOT_SUPPORTED, D3D12_SHADER_VISIBILITY_MESH,
+                D3D12_SHADER_VISIBILITY_PIXEL,
+            };
+            let _one = super::valu_tests::ONE_AT_A_TIME
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            for (label, warp) in [("hardware", false), ("warp", true)] {
+                let Ok(host) = Host::new(warp) else {
+                    eprintln!("no SM 6.6 {label} device; skipped");
+                    continue;
+                };
+                let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS7::default();
+                // SAFETY: the query writes the structure of the given size.
+                let queried = unsafe {
+                    host.device.CheckFeatureSupport(
+                        D3D12_FEATURE_D3D12_OPTIONS7,
+                        (&raw mut options).cast(),
+                        size_of_val(&options) as u32,
+                    )
+                };
+                if queried.is_err()
+                    || options.MeshShaderTier == D3D12_MESH_SHADER_TIER_NOT_SUPPORTED
+                {
+                    eprintln!("no mesh shaders on the {label} device; skipped");
+                    continue;
+                }
+                let root = host
+                    .root_signature_for(&[
+                        (&linked_ms, D3D12_SHADER_VISIBILITY_MESH),
+                        (&linked_ps, D3D12_SHADER_VISIBILITY_PIXEL),
+                    ])
+                    .unwrap();
+                let pso = host
+                    .mesh_pipeline_with(&root, &linked_ms.dxil, &linked_ps.dxil)
+                    .unwrap_or_else(|e| panic!("{label}: repacked mesh pipeline: {e}"));
+                let texels = host
+                    .draw(
+                        &root,
+                        &pso,
+                        &Draw {
+                            roots: vec![
+                                (0, Root::Constants(vec![0])),
+                                (1, Root::Constants(vec![0])),
+                            ],
+                            textures: &[],
+                            samplers: &[],
+                            vertices: &[],
+                            stride: 0,
+                            size: (16, 16),
+                            mesh_groups: 1,
+                        },
+                    )
+                    .unwrap_or_else(|e| panic!("{label}: repacked mesh draw: {e}"));
+                assert!(
+                    texels.iter().all(|t| *t == [1.0, 0.5, 0.375, 0.75]),
+                    "{label}: unexpected repacked pixel {:?}",
+                    texels.first()
+                );
             }
         }
     }

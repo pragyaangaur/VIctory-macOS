@@ -112,9 +112,17 @@ pub fn rosetta() -> bool {
 pub(crate) const PAGE: usize = 64 << 10;
 
 /// The pages a tracker has not taken since they changed, what it saves of
-/// pages it armed, its bit in [`DIRTY`] (none: always taken as dirty), and
-/// whether it is a host buffer copy's (the only trackers [`retake`] marks).
-struct Changed(Mutex<BTreeSet<usize>>, Mutex<Saved>, Option<u32>, bool);
+/// pages it armed, its bit in [`DIRTY`] (none: always taken as dirty),
+/// whether it is a host buffer copy's (the only trackers [`retake`] marks),
+/// and any pages retaken/remapped whose baseline hashes must be discarded.
+struct Changed(
+    Mutex<BTreeSet<usize>>,
+    Mutex<Saved>,
+    Option<u32>,
+    bool,
+    std::sync::atomic::AtomicBool,
+    Mutex<BTreeSet<usize>>,
+);
 
 /// A bit per tracker, set while it holds changed pages: set and cleared
 /// under the tracker's lock, read without one ([`Tracked::clean`]). Dense,
@@ -472,7 +480,14 @@ fn track_as(start: usize, len: usize, views: bool, copy: bool) -> Option<Tracked
     // A tracker with untracked parts is never clean: no bit.
     let bit = if untracked.is_empty() { dirty_bit() } else { None };
     set_dirty(bit, true);
-    let changed = Arc::new(Changed(Mutex::new(pages.iter().copied().collect()), Mutex::default(), bit, copy));
+    let changed = Arc::new(Changed(
+        Mutex::new(pages.iter().copied().collect()),
+        Mutex::default(),
+        bit,
+        copy,
+        std::sync::atomic::AtomicBool::new(false),
+        Mutex::default(),
+    ));
     let mut g = guards();
     for &page in &pages {
         g.holders.entry(page).or_default().push(changed.clone());
@@ -622,6 +637,36 @@ impl Tracked {
             }
         }
         merged
+    }
+
+    /// Drains any retaken or remapped pages overlapping `[from, to)` so a host
+    /// buffer copy discards cached baseline piece hashes before refreshing.
+    pub(crate) fn take_retaken(&self, from: usize, to: usize) -> Runs {
+        if !self.changed.4.load(Ordering::Acquire) {
+            return Vec::new();
+        }
+        let (from, to) = (from.max(self.start), to.min(self.end));
+        if from >= to {
+            return Vec::new();
+        }
+        let mut retaken = self.changed.5.lock().unwrap_or_else(|e| e.into_inner());
+        let pages: Vec<usize> = retaken.range(from / PAGE..to.div_ceil(PAGE)).copied().collect();
+        for &p in &pages {
+            retaken.remove(&p);
+        }
+        if retaken.is_empty() {
+            self.changed.4.store(false, Ordering::Release);
+        }
+        drop(retaken);
+        let mut runs: Runs = Vec::new();
+        for p in pages {
+            let (a, b) = ((p * PAGE).max(from), ((p + 1) * PAGE).min(to));
+            match runs.last_mut() {
+                Some((_, end)) if *end == a => *end = b,
+                _ => runs.push((a, b)),
+            }
+        }
+        runs
     }
 
     /// [`Tracked::take`], the runs on pages with nothing mapped apart: they
@@ -1065,8 +1110,10 @@ pub fn writing(at: usize, len: usize) -> Writing {
 /// The runtime mapped or unmapped title memory `[at, at + len)`: what it
 /// shows is new, and read-write.
 pub fn title_memory_remapped(at: usize, len: usize) {
+    crate::texback::remapped(at, len);
     let (first, last) = (at / PAGE, at.saturating_add(len).div_ceil(PAGE));
     remapped(&mut guards(), first, last);
+    crate::shadow::forget_range(at, len);
 }
 
 /// Before title memory `[at, at + len)` is unmapped or freed (`len` 0: the
@@ -1090,6 +1137,8 @@ pub fn title_memory_unmapping(at: usize, len: usize) -> Writing {
     let mut g = guards();
     g.busy.push((first, last));
     remapped(&mut g, first, last);
+    drop(g);
+    crate::shadow::forget_range(at, len);
     Writing { first, last }
 }
 
@@ -1115,6 +1164,7 @@ fn allocation_len(at: usize) -> usize {
 fn remapped(g: &mut Guards, first: usize, last: usize) {
     // What it showed is gone already: nothing to keep.
     changed(g, first, last, false);
+    mark_retaken(g, first, last);
     // What it showed is not what it shows now: its links go, both ways.
     let stale: Vec<usize> = g.alias_of.range(first..last).map(|(&p, _)| p).collect();
     for page in stale {
@@ -1160,8 +1210,25 @@ pub(crate) fn retake(at: usize, len: usize) {
     let g = guards();
     let others: Vec<usize> = g.alias_of.range(first..last).flat_map(|(_, o)| o.iter().copied()).collect();
     mark_copies(&g, first, last);
-    for page in others {
+    for &page in &others {
         mark_copies(&g, page, page + 1);
+    }
+    drop(g);
+    crate::shadow::forget_range(at, len);
+    for page in others {
+        crate::shadow::forget_range(page * PAGE, PAGE);
+    }
+}
+
+/// Marks pages `[first, last)` as retaken in every host buffer copy's tracker
+/// holding them so cached baseline piece hashes are discarded before refresh.
+fn mark_retaken(g: &Guards, first: usize, last: usize) {
+    for (&page, holders) in g.holders.range(first..last) {
+        for c in holders.iter().filter(|c| c.3) {
+            let mut set = c.5.lock().unwrap_or_else(|e| e.into_inner());
+            set.insert(page);
+            c.4.store(true, Ordering::Release);
+        }
     }
 }
 
@@ -1173,6 +1240,10 @@ fn mark_copies(g: &Guards, first: usize, last: usize) {
             let mut set = c.0.lock().unwrap_or_else(|e| e.into_inner());
             set_dirty(c.2, true);
             set.insert(page);
+            drop(set);
+            let mut retaken = c.5.lock().unwrap_or_else(|e| e.into_inner());
+            retaken.insert(page);
+            c.4.store(true, Ordering::Release);
         }
     }
 }
@@ -1210,6 +1281,19 @@ pub fn title_memory_aliased(at: usize, others: &[usize]) {
 pub(crate) fn aliased(at: usize, len: usize) -> bool {
     let (first, last) = (at / PAGE, at.saturating_add(len).div_ceil(PAGE));
     guards().alias_of.range(first..last).next().is_some()
+}
+
+/// Alias pages (page numbers) mapping the same physical memory as `[at, at + len)`.
+pub(crate) fn alias_pages(at: usize, len: usize) -> Vec<usize> {
+    if len == 0 {
+        return Vec::new();
+    }
+    let (first, last) = (at / PAGE, at.saturating_add(len).div_ceil(PAGE));
+    guards()
+        .alias_of
+        .range(first..last)
+        .flat_map(|(_, o)| o.iter().copied())
+        .collect()
 }
 
 /// Registers the handler that takes writes to guarded blocks, once, ahead

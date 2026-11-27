@@ -8,7 +8,10 @@ use victory_shader::{
     ir, resource, structure,
 };
 use windows::Win32::Graphics::Direct3D12::*;
-use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R32G32B32A32_FLOAT;
+use windows::Win32::Graphics::Dxgi::Common::{
+    DXGI_FORMAT_B4G4R4A4_UNORM, DXGI_FORMAT_B5G5R5A1_UNORM, DXGI_FORMAT_R8G8B8A8_UNORM,
+    DXGI_FORMAT_R32G32B32A32_FLOAT,
+};
 use windows::core::Interface;
 
 /// Synthetic compute shader storing four root constants at texel (0, 0).
@@ -101,9 +104,47 @@ impl Drop for Guest {
 // The cached placement must stay live for the process. Align within the array.
 const TEXTURE_ALIGNMENT: usize = 64 << 10;
 static BACKING: [u8; 2 * TEXTURE_ALIGNMENT] = [0; 2 * TEXTURE_ALIGNMENT];
+static PACKED_BACKING: [[u8; 2 * TEXTURE_ALIGNMENT]; 2] = [[0; 2 * TEXTURE_ALIGNMENT]; 2];
 
 #[test]
 fn placed_uav_dispatch_writes_its_texture() {
+    let value = [1.0f32, 0.5, -0.25, 2.0];
+    let expected = value.map(f32::to_le_bytes).concat();
+    check_placed_store(
+        &BACKING,
+        DXGI_FORMAT_R32G32B32A32_FLOAT.0 as u32,
+        16,
+        value,
+        &expected,
+    );
+}
+
+#[test]
+fn widened_packed_uavs_store_through_the_guest_format() {
+    let formats = [DXGI_FORMAT_B5G5R5A1_UNORM, DXGI_FORMAT_B4G4R4A4_UNORM];
+    for (format, backing) in formats.into_iter().zip(PACKED_BACKING.iter()) {
+        let format = format.0 as u32;
+        if crate::resource::target_format(format) != DXGI_FORMAT_R8G8B8A8_UNORM.0 as u32 {
+            continue;
+        }
+        eprintln!("testing a widened UAV for format {format}");
+        check_placed_store(
+            backing,
+            format,
+            128,
+            [1.0, 0.0, 1.0, 1.0],
+            &[255, 0, 255, 255],
+        );
+    }
+}
+
+fn check_placed_store(
+    backing: &'static [u8],
+    format: u32,
+    width: u32,
+    value: [f32; 4],
+    expected: &[u8],
+) {
     let Some(host) = crate::host::host() else {
         return;
     };
@@ -160,11 +201,10 @@ fn placed_uav_dispatch_writes_its_texture() {
     let views = Guest(views);
     let handle = crate::descriptor::heap(views.0).start + 32;
 
-    let address = (BACKING.as_ptr() as usize).next_multiple_of(TEXTURE_ALIGNMENT) as u64;
-    let format = DXGI_FORMAT_R32G32B32A32_FLOAT.0 as u32;
+    let address = (backing.as_ptr() as usize).next_multiple_of(TEXTURE_ALIGNMENT) as u64;
     let mut resource = [0; 14];
     resource[0] = D3D12_RESOURCE_DIMENSION_TEXTURE2D.0 as u32;
-    resource[4] = 16; // width, one 256-byte RGBA32_FLOAT row
+    resource[4] = width; // width of one guest 256-byte row
     resource[6] = 1; // height
     resource[7] = 1 | (1 << 16); // one slice and one mip
     resource[8] = format;
@@ -180,13 +220,12 @@ fn placed_uav_dispatch_writes_its_texture() {
     let texture = crate::resource::host_resource(placed).expect("host texture");
     crate::descriptor::create_placed_uav(std::ptr::null(), &resource, &view, handle);
 
-    let expected = [1.0f32, 0.5, -0.25, 2.0];
     let list = host.new_list().unwrap();
     crate::texture::upload(&list, placed, &texture);
     let mut state = crate::draw::State::default();
     state.set_pipeline(pipeline.0);
     state.set_heaps(&[views.0]);
-    state.set_constants(true, 0, &expected.map(f32::to_bits), 0);
+    state.set_constants(true, 0, &value.map(f32::to_bits), 0);
     state.set_table(true, 1, handle);
     let dispatched = crate::draw::dispatched();
     state.dispatch(&list, 1, 1, 1);
@@ -200,18 +239,20 @@ fn placed_uav_dispatch_writes_its_texture() {
     list.close();
     host.execute(&[&list]);
 
-    // SAFETY: read the two RGBA32_FLOAT texels after the synchronous submission.
+    // SAFETY: read two host texels after the synchronous submission.
     let texels = unsafe {
         let mut data = std::ptr::null_mut();
         readback.Map(0, None, Some(&mut data)).unwrap();
-        let texels = data
-            .cast::<u8>()
-            .add(footprint.Offset as usize)
-            .cast::<[[f32; 4]; 2]>()
-            .read_unaligned();
+        let start = data.cast::<u8>().add(footprint.Offset as usize);
+        let texels = std::slice::from_raw_parts(start, 2 * expected.len()).to_vec();
         readback.Unmap(0, None);
         assert!(host.device.GetDeviceRemovedReason().is_ok());
         texels
     };
-    assert_eq!(texels, [expected, [0.0; 4]], "placed UAV dispatch readback");
+    let (first, next) = texels.split_at(expected.len());
+    assert_eq!(first, expected, "placed UAV dispatch readback");
+    assert!(
+        next.iter().all(|&byte| byte == 0),
+        "neighboring texel changed"
+    );
 }

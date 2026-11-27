@@ -2585,10 +2585,11 @@ fn the_null_pair_is_read_once_in_the_entry_block() {
 
 /// A box32 node's last 48 bytes are read through its first 64 bytes'
 /// page-table lookup, and looked up again only in lanes whose node starts
-/// in the last 64 bytes of a page (`raw_load_past`): the head's lookup and
-/// the null pair's view in the entry block, then the head's 16 dwords and
-/// the tail's 12 through that lookup, and the second lookup in a block of
-/// its own.
+/// in the last 64 bytes of a page (`raw_load_past`): the null pair's view
+/// in the entry block, the head's lookup in the `ty < 6` block (so sentinel
+/// `INVALID` and unhandled types 6/7 read nothing), then the head's 16
+/// dwords and the tail's 12 through that lookup, and the second lookup in a
+/// block of its own.
 #[test]
 fn a_box32_nodes_tail_reuses_its_heads_lookup() {
     // The descriptor in s[12:15], based at the pointer.
@@ -2611,11 +2612,15 @@ fn a_box32_nodes_tail_reuses_its_heads_lookup() {
     let at = |b: usize| loads.iter().filter(|&&x| x == b).count();
     assert_eq!(table.len(), 1 + 2 + 2, "{table:?}");
     assert_eq!(loads.len(), 1 + (2 + 4) + 3 + (2 + 3), "{loads:?}");
-    assert_eq!(table[..3], [0; 3], "{table:?}");
+    assert_eq!(table[0], 0, "{table:?}");
+    let head = table[1];
+    assert!(head > 0 && table[2] == head, "{table:?}");
     let again = table[3];
-    assert!(table[4] == again && at(again) == 2, "{loads:?} {table:?}");
-    let through_head = loads.iter().filter(|&&b| b != 0 && b < again);
-    assert_eq!(through_head.count(), 4 + 3, "{loads:?} {table:?}");
+    assert!(again > head && table[4] == again && at(again) == 2, "{loads:?} {table:?}");
+    // Excluding the 2 page-table loads in `head`, the 4 head node loads and
+    // 3 non-crossing tail node loads all reuse `head`'s lookup.
+    let through_head = loads.iter().filter(|&&b| b >= head && b < again).count() - 2;
+    assert_eq!(through_head, 4 + 3, "{loads:?} {table:?}");
 }
 
 /// SMEM `op` (`s_load_dword*` 0-4, `s_buffer_load_dword*` 8-12) of

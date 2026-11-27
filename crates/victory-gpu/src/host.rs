@@ -74,6 +74,8 @@ pub(crate) struct Host {
     mark: OnceLock<Option<Mark>>,
     /// Extra marks for native calls before the final call of a split submission.
     split_marks: Mutex<Option<Vec<Mark>>>,
+    /// Reusable global UAV barrier lists inserted between coalesced queue pieces.
+    barrier_lists: Mutex<Option<Vec<BarrierList>>>,
     event: HANDLE,
     rtvs: ID3D12DescriptorHeap,
     rtv_size: u32,
@@ -166,6 +168,39 @@ impl Mark {
     fn saw(&self, value: u64) -> bool {
         // SAFETY: our mapped read-back buffer.
         unsafe { self.seen.read_volatile() == value }
+    }
+
+    fn list(&self) -> Option<ID3D12CommandList> {
+        self.list.cast().ok()
+    }
+}
+
+/// A closed command list holding a single global UAV barrier, inserted between
+/// coalesced queue pieces that crossed a bottom-of-pipe wait or fence boundary
+/// so GPU writes in the producer are visible to the consumer.
+struct BarrierList {
+    list: ID3D12GraphicsCommandList,
+    _allocator: ID3D12CommandAllocator,
+}
+
+impl BarrierList {
+    fn new(host: &Host) -> windows::core::Result<Self> {
+        // SAFETY: plain D3D12 object creation with a single global UAV barrier.
+        unsafe {
+            let allocator: ID3D12CommandAllocator = host
+                .device
+                .CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)?;
+            let list: ID3D12GraphicsCommandList = host.device.CreateCommandList(
+                0,
+                D3D12_COMMAND_LIST_TYPE_DIRECT,
+                &allocator,
+                None,
+            )?;
+            list.ResourceBarrier(&[uav_barrier()]);
+            list.Close()?;
+            name(&list, || "coalesced piece UAV barrier".into());
+            Ok(Self { list, _allocator: allocator })
+        }
     }
 
     fn list(&self) -> Option<ID3D12CommandList> {
@@ -379,6 +414,7 @@ fn create() -> windows::core::Result<Host> {
             submitted: Mutex::new(0),
             mark: OnceLock::new(),
             split_marks: Mutex::new(Some(Vec::new())),
+            barrier_lists: Mutex::new(Some(Vec::new())),
             event,
             rtvs,
             rtv_size,
@@ -412,6 +448,25 @@ pub(crate) fn process_memory() -> (u64, u64) {
 pub(crate) fn device_removed() -> bool {
     // SAFETY: plain device query.
     host().is_some_and(|h| unsafe { h.device.GetDeviceRemovedReason() }.is_err())
+}
+
+/// The PCI vendor id of the host device's adapter (NVIDIA 0x10DE), 0 if it
+/// cannot be told.
+pub(crate) fn host_vendor() -> u32 {
+    static VENDOR: OnceLock<u32> = OnceLock::new();
+    *VENDOR.get_or_init(|| {
+        let Some(host) = host() else { return 0 };
+        // SAFETY: plain DXGI queries for the device's own adapter.
+        let vendor = unsafe {
+            let luid = host.device.GetAdapterLuid();
+            CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0))
+                .and_then(|f| f.EnumAdapterByLuid::<IDXGIAdapter1>(luid))
+                .and_then(|a| a.GetDesc1())
+                .map_or(0, |d| d.VendorId)
+        };
+        tracing::info!(vendor = format_args!("{vendor:#x}"), "host adapter vendor");
+        vendor
+    })
 }
 
 /// DXGI may return hardware for `EnumWarpAdapter` (notably under Proton).
@@ -1182,6 +1237,60 @@ pub(crate) mod tests {
         assert_eq!(d, a, "scratch restarts from chunk 0 after reset");
         list.close();
     }
+
+    #[test]
+    fn host_list_will_write_and_batch_flags_reflect_deferred_steps() {
+        let Some(host) = host() else { return };
+        let Ok(producer) = host.new_list() else { return };
+        let Ok(consumer) = host.new_list() else { return };
+
+        let mut word = 0u64;
+        let addr = (&raw mut word) as u64;
+        let wait_ge_5 = crate::hold::ValueWait {
+            address: addr,
+            bytes: 8,
+            comparison: 7, // GREATER_EQUAL
+            reference: 5,
+            mask: u64::MAX,
+        };
+        let wait_ge_9 = crate::hold::ValueWait {
+            address: addr,
+            bytes: 8,
+            comparison: 7,
+            reference: 9,
+            mask: u64::MAX,
+        };
+
+        assert!(!producer.will_write(&wait_ge_5));
+        producer.defer_write(addr as *mut u8, crate::queue::Written::Value(7), 8);
+        assert!(producer.will_write(&wait_ge_5));
+        assert!(!producer.will_write(&wait_ge_9));
+        // A later timestamp write to the same address is unknown at submission time.
+        producer.defer_write(addr as *mut u8, crate::queue::Written::GpuTimestamp, 8);
+        assert!(!producer.will_write(&wait_ge_5));
+        // A later value write restores a known satisfying value.
+        producer.defer_write(addr as *mut u8, crate::queue::Written::Value(9), 8);
+        assert!(producer.will_write(&wait_ge_9));
+
+        assert_eq!(producer.batch_flags(), crate::hold::BatchFlags::default());
+        let src = [0x22u8; 16];
+        let mut dst = [0u8; 16];
+        producer.defer_copy(dst.as_mut_ptr(), src.as_ptr(), 16);
+        let p_flags = producer.batch_flags();
+        assert!(p_flags.has_title_copy && p_flags.has_cpu_read);
+        assert!(!p_flags.has_gpu_write && !p_flags.has_after && !p_flags.has_textures);
+
+        consumer.defer_after(|| {});
+        let c_flags = consumer.batch_flags();
+        assert!(c_flags.has_after);
+        assert!(crate::hold::can_join_batch(p_flags, c_flags, 1, 64));
+        assert!(!crate::hold::can_join_batch(c_flags, p_flags, 1, 64));
+
+        producer.close();
+        consumer.close();
+        host.execute_with_barriers(&[&producer, &consumer], &[false, true]);
+        assert_eq!(word, 9);
+    }
 }
 
 type WidenedWrite = (std::sync::Arc<crate::shadow::Shadow>, usize, usize);
@@ -1590,6 +1699,14 @@ struct Deferred {
     slots: std::collections::HashSet<(usize, u32)>,
     /// Textures whose contents the list brings up to date.
     textures: std::collections::HashSet<usize>,
+    /// Title textures written by GPU shaders that match `VICTORY_TEXTURE_BACK`,
+    /// copied into readback buffers when the list closes.
+    back_wanted: Vec<crate::texback::Target>,
+    /// Recorded GPU-to-CPU texture readbacks to retile into title memory once
+    /// the submission completes.
+    texture_backs: Vec<crate::texback::Back>,
+    /// Last GPU source copied into each aliased host texture in this list.
+    texture_aliases: std::collections::HashMap<usize, usize>,
     /// Bottom-of-pipe writes, done once the list has run: address, what,
     /// bytes.
     writes: Vec<(usize, crate::queue::Written, usize)>,
@@ -1795,6 +1912,14 @@ impl HostGpu for Host {
 
     /// Runs closed lists and waits for them.
     fn execute(&self, runs: &[&HostList]) {
+        self.execute_with_barriers(runs, &[]);
+    }
+}
+
+impl Host {
+    /// Runs closed lists and waits for them, inserting a global UAV barrier
+    /// command list before each `runs[i]` where `barrier_before.get(i) == Some(&true)`.
+    pub(crate) fn execute_with_barriers(&self, runs: &[&HostList], barrier_before: &[bool]) {
         // One submission at a time from preparation to copy-back: snapshots
         // and the ranges shaders write are per host copy, not per submission.
         let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
@@ -1860,6 +1985,7 @@ impl HostGpu for Host {
         let uploads = crate::bindless::uploads(&heaps, &textures);
         #[cfg(feature = "diagnostics")]
         drop(uploading);
+        let uploads_offset = usize::from(uploads.is_some());
         let runs: Vec<&HostList> = uploads
             .as_ref()
             .map(|u| u.list())
@@ -1891,14 +2017,47 @@ impl HostGpu for Host {
         #[cfg(not(feature = "diagnostics"))]
         let gpu_timing = false;
         let split_preludes = !gpu_timing && split_uav_srv_prelude();
+        let needed_barriers = barrier_before.iter().copied().filter(|&b| b).count();
+        let mut barrier_pool = (needed_barriers > 0)
+            .then(|| self.barrier_lists.lock().unwrap_or_else(|e| e.into_inner()));
+        if let Some(pool) = barrier_pool.as_deref_mut()
+            && let Some(barriers) = pool.as_mut()
+            && let Err(error) = (barriers.len()..needed_barriers).try_for_each(|_| {
+                barriers.push(BarrierList::new(self)?);
+                Ok::<_, windows::core::Error>(())
+            })
+        {
+            tracing::warn!(
+                %error,
+                "could not make coalesced UAV barrier lists, submitting without extra barriers"
+            );
+            *pool = None;
+        }
+        let barrier_lists = barrier_pool
+            .as_deref()
+            .and_then(Option::as_deref)
+            .unwrap_or(&[]);
+        let mut barrier_cursor = 0usize;
         let mut native_boundaries = Vec::new();
-        let mut lists: Vec<Option<ID3D12CommandList>> = Vec::with_capacity(2 * runs.len());
+        let mut lists: Vec<Option<ID3D12CommandList>> =
+            Vec::with_capacity(2 * runs.len() + needed_barriers);
         // Where each run's lists start in `lists`.
         let mut firsts = Vec::with_capacity(runs.len());
         let mut batch = Batch::default();
-        for list in runs {
+        for (idx, list) in runs.iter().enumerate() {
             list.run_deferred(&mut batch);
             firsts.push(lists.len());
+            let needs_barrier = idx
+                .checked_sub(uploads_offset)
+                .and_then(|i| barrier_before.get(i).copied())
+                .unwrap_or(false);
+            if needs_barrier
+                && !lists.is_empty()
+                && let Some(barrier) = barrier_lists.get(barrier_cursor)
+            {
+                lists.push(barrier.list());
+                barrier_cursor += 1;
+            }
             #[cfg(feature = "diagnostics")]
             let _timed = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::PreludeUs);
             if let Some((prelude, uav_to_srv)) = list.prelude(split_preludes) {
@@ -1909,6 +2068,7 @@ impl HostGpu for Host {
             }
             lists.push(list.list.cast().ok());
         }
+        drop(barrier_pool);
         batch.flush();
         #[cfg(feature = "diagnostics")]
         batch.log_refreshes(*submitted + 1, runs.len());
@@ -2254,6 +2414,11 @@ impl HostGpu for Host {
             }
         }
         for list in runs {
+            for back in &list.deferred().texture_backs {
+                crate::texback::land(back);
+            }
+        }
+        for list in runs {
             for work in &list.deferred().after {
                 work();
             }
@@ -2288,9 +2453,7 @@ impl HostGpu for Host {
             crate::capture::dump_submission(sub, &targets);
         }
     }
-}
 
-impl Host {
     /// Waits until the host fence reaches `value`. The event is only a
     /// wake-up: the fence's completed value decides. Under D3DMetal a
     /// submission's work can finish without its event ever being set
@@ -2776,6 +2939,7 @@ impl HostList {
                     .ResolveQueryData(heap, D3D12_QUERY_TYPE_TIMESTAMP, 0, count + 1, back, 0);
             }
         }
+        self.textures_back();
         self.widen_close();
         self.hoisted_clamps_close();
         // SAFETY: our list.
@@ -2918,6 +3082,65 @@ impl HostList {
         }
         self.memory_writer.store(uses, Ordering::Relaxed);
         Reset(&self.memory_writer)
+    }
+
+    /// Marks title texture `resource` as GPU-written on this command list so
+    /// eligible 2D textures (`VICTORY_TEXTURE_BACK`) are copied into a readback
+    /// buffer when the list closes.
+    pub(crate) fn texture_written(&self, resource: crate::object::This) {
+        if !crate::texback::wanted(resource) {
+            return;
+        }
+        let mut deferred = self.deferred();
+        if !deferred
+            .back_wanted
+            .iter()
+            .any(|target| target.owner() == resource as usize)
+            && let Some(target) = crate::texback::Target::new(resource)
+        {
+            deferred.back_wanted.push(target);
+        }
+    }
+
+    /// Whether this command list has recorded GPU-to-CPU texture readbacks.
+    #[allow(dead_code)]
+    pub(crate) fn has_texture_backs(&self) -> bool {
+        !self.deferred().texture_backs.is_empty()
+    }
+
+    /// Destination title-memory ranges `[start, end)` updated when this command
+    /// list's GPU-to-CPU texture readbacks land.
+    #[allow(dead_code)]
+    pub(crate) fn texture_back_ranges(&self) -> Vec<(usize, usize)> {
+        self.deferred()
+            .texture_backs
+            .iter()
+            .map(crate::texback::Back::range)
+            .collect()
+    }
+
+    /// Before the list closes: copies eligible GPU-written textures into host
+    /// readback buffers (`crate::texback::record`).
+    fn textures_back(&self) {
+        const COPY_SOURCE: u32 = 0x800;
+        let wanted = std::mem::take(&mut self.deferred().back_wanted);
+        for target in wanted {
+            if !target.is_valid() {
+                continue;
+            }
+            if let Some(barrier) = self.move_texture(&target.copy, COPY_SOURCE) {
+                // SAFETY: open command list and valid resource transition.
+                unsafe { self.list.ResourceBarrier(&[barrier]) };
+            }
+            if let Some(back) = crate::texback::record(&self.list, target) {
+                self.deferred().texture_backs.push(back);
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn keep_upload_for_test(&self, upload: ID3D12Resource) {
+        self.deferred().uploads.push(upload);
     }
 
     /// A copy of ours replaced the compute root signature and pipeline.
@@ -3543,6 +3766,51 @@ impl HostList {
         self.deferred().waits.clone()
     }
 
+    /// Whether a deferred bottom-of-pipe value write recorded on this list
+    /// satisfies `wait` once the list finishes.
+    pub(crate) fn will_write(&self, wait: &crate::hold::ValueWait) -> bool {
+        let addr = wait.address as usize;
+        let need = usize::from(wait.bytes);
+        self.deferred()
+            .writes
+            .iter()
+            .rev()
+            .find(|&&(at, _, n)| at == addr && n >= need)
+            .is_some_and(|&(_, what, _)| match what {
+                crate::queue::Written::Value(v) => wait.holds_for(v) == Some(true),
+                crate::queue::Written::GpuTimestamp | crate::queue::Written::SystemTimestamp => {
+                    false
+                }
+            })
+    }
+
+    /// Summary of deferred CPU/GPU side effects on this list for submission
+    /// coalescing (`crate::hold::can_join_batch`).
+    pub(crate) fn batch_flags(&self) -> crate::hold::BatchFlags {
+        let d = self.deferred();
+        let mut flags = crate::hold::BatchFlags {
+            has_after: !d.after.is_empty(),
+            ..Default::default()
+        };
+        for step in &d.copies {
+            match step {
+                Step::Copy(..) | Step::Move(..) => {
+                    flags.has_title_copy = true;
+                    flags.has_cpu_read = true;
+                }
+                Step::Fill(..) => flags.has_cpu_read = true,
+                Step::GpuWrite(..) => flags.has_gpu_write = true,
+                Step::Texture(..) => flags.has_textures = true,
+                Step::Refresh(..)
+                | Step::Slot(..)
+                | Step::Host(_)
+                | Step::Heap(_)
+                | Step::Memory(_) => {}
+            }
+        }
+        flags
+    }
+
     /// Whether nothing has been recorded since the list was made or reset
     /// that a wait recorded now would have to follow: no work, texture
     /// use, bottom-of-pipe write or pipeline (state settings alone carry
@@ -3729,6 +3997,16 @@ impl HostList {
         self.deferred().textures.insert(key)
     }
 
+    pub(crate) fn alias_source_changed(
+        &self,
+        view: &ID3D12Resource,
+        source: &ID3D12Resource,
+    ) -> bool {
+        let view = view.as_raw() as usize;
+        let source = source.as_raw() as usize;
+        self.deferred().texture_aliases.insert(view, source) != Some(source)
+    }
+
     /// Runs `work` on host memory at submission, in order with the copies.
     pub(crate) fn defer_host(&self, work: impl Fn() + Send + 'static) {
         self.deferred().copies.push(Step::Host(Box::new(work)));
@@ -3784,6 +4062,15 @@ impl HostList {
                         move_mapped(dst as *mut u8, src as *const u8, len);
                     } else {
                         copy_mapped(dst as *mut u8, src as *const u8, len, true);
+                    }
+                    if crate::shadow::shadow_keep_enabled() {
+                        crate::shadow::forget_range(dst, len);
+                        for page in crate::watch::alias_pages(dst, len) {
+                            crate::shadow::forget_range(
+                                page * crate::watch::PAGE,
+                                crate::watch::PAGE,
+                            );
+                        }
                     }
                     len
                 }
@@ -4595,6 +4882,47 @@ impl HostMemory for Host {
 }
 
 impl Host {
+    /// An unmapped `D3D12_HEAP_TYPE_READBACK` buffer of `size` bytes in
+    /// `D3D12_RESOURCE_STATE_COPY_DEST`.
+    pub(crate) fn read_back_buffer(&self, size: u64) -> Option<ID3D12Resource> {
+        let heap = D3D12_HEAP_PROPERTIES {
+            Type: D3D12_HEAP_TYPE_READBACK,
+            ..Default::default()
+        };
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+            Width: size.max(1),
+            Height: 1,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            ..Default::default()
+        };
+        let mut buffer: Option<ID3D12Resource> = None;
+        // SAFETY: plain readback buffer creation.
+        let made = unsafe {
+            self.device.CreateCommittedResource(
+                &heap,
+                D3D12_HEAP_FLAG_NONE,
+                &desc,
+                D3D12_RESOURCE_STATE_COPY_DEST,
+                None,
+                &mut buffer,
+            )
+        };
+        match made {
+            Ok(()) => buffer,
+            Err(e) => {
+                tracing::warn!(error = %e, size, "no readback buffer");
+                None
+            }
+        }
+    }
+
     /// A mapped buffer of `size` bytes: upload memory, or (`readback`)
     /// readback memory in the copy-destination state.
     fn mapped_buffer(&self, size: u64, readback: bool) -> Option<(ID3D12Resource, *mut u8)> {
@@ -5320,6 +5648,17 @@ static RETIRED: Mutex<Vec<ID3D12Resource>> = Mutex::new(Vec::new());
 /// views.
 pub(crate) fn retire(resource: ID3D12Resource) {
     RETIRED.lock().unwrap_or_else(|e| e.into_inner()).push(resource);
+}
+
+/// Batched [`retire`] under one hold of the retired-resources lock.
+pub(crate) fn retire_all(mut resources: Vec<ID3D12Resource>) {
+    if resources.is_empty() {
+        return;
+    }
+    RETIRED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .append(&mut resources);
 }
 
 /// After a submission has run, with none running: the retired resources go.

@@ -114,7 +114,7 @@ type Factory = *const Object;
 /// Opens `path` for reading; the file object owns the handle.
 extern "system" fn open_file(_: Factory, path: *const u16, iid: *const Guid, out: Out) -> HRESULT {
     const GENERIC_READ: u32 = 0x8000_0000;
-    const FILE_SHARE_READ: u32 = 1;
+    const FILE_SHARE_ALL: u32 = 1 | 2 | 4;
     const OPEN_EXISTING: u32 = 3;
     if path.is_null() {
         return E_INVALIDARG;
@@ -123,16 +123,18 @@ extern "system" fn open_file(_: Factory, path: *const u16, iid: *const Guid, out
     let handle = super::files::CreateFileW(
         path,
         GENERIC_READ,
-        FILE_SHARE_READ,
+        FILE_SHARE_ALL,
         std::ptr::null(),
         OPEN_EXISTING,
         0,
         std::ptr::null_mut(),
     );
     // SAFETY: the title passes a NUL-terminated path.
-    let name = unsafe {
+    let (name, wide_path) = unsafe {
         let len = (0..).take_while(|&i| *path.add(i) != 0).count();
-        String::from_utf16_lossy(std::slice::from_raw_parts(path, len))
+        let slice = std::slice::from_raw_parts(path, len);
+        let with_nul: Box<[u16]> = std::slice::from_raw_parts(path, len + 1).into();
+        (String::from_utf16_lossy(slice), with_nul)
     };
     if handle as isize == -1 {
         let error = std::io::Error::last_os_error();
@@ -142,7 +144,13 @@ extern "system" fn open_file(_: Factory, path: *const u16, iid: *const Guid, out
     tracing::info!(path = name, iid = iid_text(iid), "dstorage: file opened");
     // SAFETY: a handle we just opened and nobody else owns.
     let file = unsafe { std::fs::File::from_raw_handle(handle) };
-    let file = Instance::create(Object::new("dstorage file", &FILE_VTABLE), File { file, path: name });
+    let file = Instance::create(
+        Object::new("dstorage file", &FILE_VTABLE),
+        File {
+            files: Files::new_with_path(file, Some(wide_path), Io::chosen()),
+            path: name,
+        },
+    );
     put(out, file)
 }
 
@@ -245,9 +253,337 @@ static FACTORY_VTABLE: Methods<16> = Methods([
 // Files.
 
 struct File {
-    file: std::fs::File,
+    files: Files,
     /// As the title named it (diagnostics).
     path: String,
+}
+
+/// How files are read (`VICTORY_DSTORAGE_IO`, `VICTORY_DSTORAGE_HANDLES`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Io {
+    /// `one` (or `VICTORY_DSTORAGE_HANDLES=0`): all workers read through the
+    /// one handle the title opened, as before. The host serialises synchronous
+    /// reads on a single file object.
+    One,
+    /// `handles` (default): each worker lazily opens its own synchronous
+    /// handle with `ReOpenFile`, falling back to `first` if refused.
+    Handles,
+    /// `overlapped`: one reopened `FILE_FLAG_OVERLAPPED` handle shared across
+    /// workers via per-thread completion events.
+    Overlapped,
+    /// `direct`: a handle per worker opened with `FILE_FLAG_OVERLAPPED |
+    /// FILE_FLAG_NO_BUFFERING`, bypassing the host file cache.
+    Direct,
+}
+
+impl Io {
+    const DEFAULT: Io = Io::Handles;
+
+    fn chosen() -> Io {
+        static CHOSEN: OnceLock<Io> = OnceLock::new();
+        *CHOSEN.get_or_init(|| {
+            let io = match std::env::var("VICTORY_DSTORAGE_IO")
+                .as_deref()
+                .map(str::trim)
+            {
+                Ok("one") => Io::One,
+                Ok("handles") => Io::Handles,
+                Ok("overlapped") => Io::Overlapped,
+                Ok("direct") => Io::Direct,
+                _ if std::env::var_os("VICTORY_DSTORAGE_HANDLES").is_some_and(|v| v == "0") => {
+                    Io::One
+                }
+                _ => Io::DEFAULT,
+            };
+            tracing::info!(?io, "dstorage: how files are read");
+            io
+        })
+    }
+}
+
+/// Per-slot reopened file handle: synchronous handles carry an uncontended
+/// per-slot `Mutex` so two threads can never race `seek_read` (`lseek` +
+/// `read`) on the same synchronous handle under Wine, while `FILE_FLAG_OVERLAPPED`
+/// handles issue true offset-addressed overlapped reads.
+enum SlotFile {
+    Sync(Mutex<std::fs::File>),
+    Overlapped(std::fs::File),
+}
+
+/// A file as the workers read it: the handle the title opened, and handles
+/// made from it when each worker first reads. Synchronous reads on one handle
+/// serialize inside Windows' file-object lock (185 -> 990 MB/s across 24
+/// workers) and race `lseek` + `read` on a shared cursor under macOS Wine
+/// (`hr=0x8007000d` zlib corruption). Each DirectStorage pool worker `i`
+/// indexes `others[i]` directly via [`WORKER_SLOT`] (zero modulo collisions,
+/// zero lock contention), with `CreateFileW` fallback on `wide_path` if
+/// `ReOpenFile` fails and mutex-serialized fallback to `first` if all reopen
+/// paths fail or `Io::One` (`VICTORY_DSTORAGE_HANDLES=0`) is selected.
+struct Files {
+    first: Mutex<std::fs::File>,
+    wide_path: Option<Box<[u16]>>,
+    others: Box<[OnceLock<Option<SlotFile>>]>,
+    io: Io,
+}
+
+impl Files {
+    #[cfg(test)]
+    fn new(first: std::fs::File, io: Io) -> Files {
+        Files::new_with_path(first, None, io)
+    }
+
+    fn new_with_path(first: std::fs::File, wide_path: Option<Box<[u16]>>, io: Io) -> Files {
+        let others = match io {
+            Io::One => 0,
+            Io::Overlapped => 1,
+            Io::Handles | Io::Direct => workers(),
+        };
+        Files::with_path(first, wide_path, io, others)
+    }
+
+    #[cfg(test)]
+    fn with(first: std::fs::File, io: Io, others: usize) -> Files {
+        Files::with_path(first, None, io, others)
+    }
+
+    /// With `others` reopened handle slots besides `first` (0: `first` alone).
+    fn with_path(
+        first: std::fs::File,
+        wide_path: Option<Box<[u16]>>,
+        io: Io,
+        others: usize,
+    ) -> Files {
+        Files {
+            first: Mutex::new(first),
+            wide_path,
+            others: (0..others).map(|_| OnceLock::new()).collect(),
+            io,
+        }
+    }
+
+    /// Reads at `offset`, guaranteeing two threads never invoke `seek_read`
+    /// concurrently on the same synchronous `std::fs::File`.
+    fn read_at(&self, out: &mut [u8], offset: u64) -> std::io::Result<usize> {
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_FLAG_NO_BUFFERING, FILE_FLAG_OVERLAPPED,
+        };
+        let flags = match self.io {
+            Io::One | Io::Handles => 0,
+            Io::Overlapped => FILE_FLAG_OVERLAPPED,
+            Io::Direct => FILE_FLAG_OVERLAPPED | FILE_FLAG_NO_BUFFERING,
+        };
+        let other = match self.others.len() {
+            0 => None,
+            n => {
+                let slot = WORKER_SLOT.get().unwrap_or_else(non_worker_slot) % n;
+                self.others[slot]
+                    .get_or_init(|| {
+                        let raw = {
+                            use std::os::windows::io::AsRawHandle;
+                            let guard = self.first.lock().unwrap_or_else(|e| e.into_inner());
+                            guard.as_raw_handle()
+                        };
+                        let file = reopen(raw, self.wide_path.as_deref(), flags)?;
+                        Some(if flags & FILE_FLAG_OVERLAPPED != 0 {
+                            SlotFile::Overlapped(file)
+                        } else {
+                            SlotFile::Sync(Mutex::new(file))
+                        })
+                    })
+                    .as_ref()
+            }
+        };
+        match (other, self.io) {
+            (Some(SlotFile::Overlapped(file)), Io::Overlapped) => {
+                read_overlapped(file, out, offset)
+            }
+            (Some(SlotFile::Overlapped(file)), Io::Direct) => read_direct(file, out, offset),
+            (Some(SlotFile::Sync(file)), _) => {
+                let guard = file.lock().unwrap_or_else(|e| e.into_inner());
+                guard.seek_read(out, offset)
+            }
+            _ => {
+                let guard = self.first.lock().unwrap_or_else(|e| e.into_inner());
+                guard.seek_read(out, offset)
+            }
+        }
+    }
+}
+
+/// Worker pool size (`VICTORY_DSTORAGE_WORKERS`, else logical CPU count).
+fn workers() -> usize {
+    std::env::var("VICTORY_DSTORAGE_WORKERS")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|&n| (1..=256).contains(&n))
+        .unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get()))
+}
+
+thread_local! {
+    /// Exact `0..workers()` slot index for DirectStorage worker pool threads;
+    /// `None` on title or test threads outside the pool.
+    static WORKER_SLOT: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
+/// Fallback slot counter for non-pool threads (e.g. unit tests calling `Files` directly).
+fn non_worker_slot() -> usize {
+    static NEXT: AtomicU32 = AtomicU32::new(0);
+    thread_local! {
+        static NUMBER: usize = NEXT.fetch_add(1, Ordering::Relaxed) as usize;
+    }
+    NUMBER.with(|n| *n)
+}
+
+/// Opens an independent handle for reading (`ReOpenFile`, falling back to
+/// `super::files::CreateFileW` on `wide_path` when `ReOpenFile` fails or on
+/// virtual drives if needed); returns `None` only if all attempts fail.
+fn reopen(
+    raw_handle: std::os::windows::io::RawHandle,
+    wide_path: Option<&[u16]>,
+    flags: u32,
+) -> Option<std::fs::File> {
+    use windows_sys::Win32::Foundation::{GENERIC_READ, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_READ, OPEN_EXISTING, ReOpenFile};
+    const FILE_SHARE_ALL: u32 = 1 | 2 | 4;
+    static WARNED: AtomicBool = AtomicBool::new(false);
+
+    // Under Wine, prefer opening a fresh OS file description via `CreateFileW`
+    // whenever `wide_path` is known so two handles never share a `dup()`d Unix
+    // `fileglob` file offset across concurrent `lseek` + `read` calls.
+    if super::xmem::on_wine()
+        && let Some(path) = wide_path
+    {
+        let reopened = super::files::CreateFileW(
+            path.as_ptr(),
+            GENERIC_READ,
+            FILE_SHARE_ALL,
+            std::ptr::null(),
+            OPEN_EXISTING,
+            flags,
+            std::ptr::null_mut(),
+        );
+        if reopened != INVALID_HANDLE_VALUE {
+            // SAFETY: freshly opened handle owned exclusively by this slot.
+            return Some(unsafe { std::fs::File::from_raw_handle(reopened) });
+        }
+    }
+
+    // SAFETY: `raw_handle` is kept open by `Files::first` for the duration of this call.
+    let mut handle = unsafe { ReOpenFile(raw_handle, GENERIC_READ, FILE_SHARE_ALL, flags) };
+    if handle == INVALID_HANDLE_VALUE {
+        // SAFETY: retry with `FILE_SHARE_READ` if the file rejected wider sharing.
+        handle = unsafe { ReOpenFile(raw_handle, GENERIC_READ, FILE_SHARE_READ, flags) };
+    }
+    if handle == INVALID_HANDLE_VALUE
+        && let Some(path) = wide_path
+    {
+        handle = super::files::CreateFileW(
+            path.as_ptr(),
+            GENERIC_READ,
+            FILE_SHARE_ALL,
+            std::ptr::null(),
+            OPEN_EXISTING,
+            flags,
+            std::ptr::null_mut(),
+        );
+    }
+    if handle == INVALID_HANDLE_VALUE {
+        let error = std::io::Error::last_os_error();
+        if !WARNED.swap(true, Ordering::Relaxed) {
+            tracing::warn!(%error, flags, "dstorage: reopen failed; falling back to mutex-guarded shared handle");
+        } else {
+            tracing::debug!(%error, flags, "dstorage: reopen failed; falling back to mutex-guarded shared handle");
+        }
+        return None;
+    }
+    // SAFETY: `handle` was freshly opened and belongs solely to this slot.
+    Some(unsafe { std::fs::File::from_raw_handle(handle) })
+}
+
+/// A read through a handle opened with `FILE_FLAG_OVERLAPPED`, waited for on
+/// a per-thread manual-reset event.
+fn read_overlapped(file: &std::fs::File, out: &mut [u8], offset: u64) -> std::io::Result<usize> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Foundation::{CloseHandle, ERROR_HANDLE_EOF, ERROR_IO_PENDING, HANDLE};
+    use windows_sys::Win32::Storage::FileSystem::ReadFile;
+    use windows_sys::Win32::System::IO::{GetOverlappedResult, OVERLAPPED};
+    use windows_sys::Win32::System::Threading::CreateEventW;
+    struct Event(HANDLE);
+    impl Drop for Event {
+        fn drop(&mut self) {
+            if !self.0.is_null() {
+                // SAFETY: `self.0` is a valid event handle created for this thread.
+                unsafe { CloseHandle(self.0) };
+            }
+        }
+    }
+    thread_local! {
+        static DONE: Event = {
+            // SAFETY: creates an unnamed manual-reset event with default security.
+            Event(unsafe { CreateEventW(std::ptr::null(), 1, 0, std::ptr::null()) })
+        };
+    }
+    DONE.with(|done| {
+        if done.0.is_null() {
+            return Err(std::io::Error::last_os_error());
+        }
+        let mut overlapped = OVERLAPPED {
+            hEvent: done.0,
+            ..Default::default()
+        };
+        overlapped.Anonymous.Anonymous.Offset = offset as u32;
+        overlapped.Anonymous.Anonymous.OffsetHigh = (offset >> 32) as u32;
+        let len = out.len().min(1 << 30) as u32;
+        let mut n = 0;
+        // SAFETY: `out` and `overlapped` remain live on the stack until `GetOverlappedResult` completes.
+        let mut read = unsafe {
+            ReadFile(
+                file.as_raw_handle(),
+                out.as_mut_ptr(),
+                len,
+                std::ptr::null_mut(),
+                &mut overlapped,
+            )
+        } != 0;
+        let mut error = std::io::Error::last_os_error();
+        if read || error.raw_os_error() == Some(ERROR_IO_PENDING as i32) {
+            // SAFETY: waits synchronously on `overlapped` before `out` or `overlapped` leave scope.
+            read =
+                unsafe { GetOverlappedResult(file.as_raw_handle(), &overlapped, &mut n, 1) } != 0;
+            error = std::io::Error::last_os_error();
+        }
+        match error.raw_os_error() {
+            _ if read => Ok(n as usize),
+            Some(code) if code == ERROR_HANDLE_EOF as i32 => Ok(0),
+            _ => Err(error),
+        }
+    })
+}
+
+/// Unbuffered sector-aligned read (`FILE_FLAG_NO_BUFFERING`).
+fn read_direct(file: &std::fs::File, out: &mut [u8], offset: u64) -> std::io::Result<usize> {
+    const SECTOR: usize = 4096;
+    const MOST: usize = 1 << 20;
+    let sector = SECTOR as u64;
+    if offset.is_multiple_of(sector)
+        && out.len().is_multiple_of(SECTOR)
+        && (out.as_ptr() as usize).is_multiple_of(SECTOR)
+    {
+        return read_overlapped(file, out, offset);
+    }
+    thread_local! {
+        static BUFFER: std::cell::RefCell<Vec<u8>> = std::cell::RefCell::new(vec![0; MOST + SECTOR]);
+    }
+    BUFFER.with_borrow_mut(|buffer| {
+        let skip = buffer.as_ptr().align_offset(SECTOR);
+        let before = (offset % sector) as usize;
+        let len = (before + out.len()).next_multiple_of(SECTOR).min(MOST);
+        let aligned = &mut buffer[skip..skip + len];
+        let read = read_overlapped(file, aligned, offset - before as u64)?;
+        let n = read.saturating_sub(before).min(out.len());
+        out[..n].copy_from_slice(&aligned[before..before + n]);
+        Ok(n)
+    })
 }
 
 static FILE_VTABLE: Methods<8> = Methods([
@@ -418,16 +754,14 @@ fn scheduler() -> Option<&'static Scheduler> {
     STARTED.call_once(|| {
         // `VICTORY_DSTORAGE_WORKERS`: more reads in flight for storage
         // with a long wait per read (a network share), else one per core.
-        let workers = std::env::var("VICTORY_DSTORAGE_WORKERS")
-            .ok()
-            .and_then(|v| v.trim().parse::<usize>().ok())
-            .filter(|&n| (1..=256).contains(&n))
-            .unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get()));
-        let started = (0..workers)
-            .filter(|i| {
+        let started = (0..workers())
+            .filter(|&i| {
                 std::thread::Builder::new()
                     .name(format!("dstorage {i}"))
-                    .spawn(|| work(scheduler))
+                    .spawn(move || {
+                        WORKER_SLOT.set(Some(i));
+                        work(scheduler);
+                    })
                     .is_ok()
             })
             .count();
@@ -470,7 +804,10 @@ impl Lanes {
     /// Counts a finished request; every 5 s a debug line sums them up.
     fn count(&mut self, job: &Job, started: std::time::Instant) {
         if super::read_stats::on() {
-            super::read_stats::add(source_name(&job.request), u64::from(job.request.source_size));
+            super::read_stats::add(
+                source_name(&job.request),
+                u64::from(job.request.source_size),
+            );
         }
         let (requests, bytes, busy) = &mut self.done;
         *requests += 1;
@@ -495,7 +832,8 @@ impl Lanes {
                 reading_workers = format_args!("{:.2}", reading / elapsed.as_secs_f64()),
                 staging_waits = std::mem::take(&mut self.refused),
                 bcpack_mb = self.bcpack.0 / 1_000_000,
-                bcpack_workers = format_args!("{:.2}", self.bcpack.1.as_secs_f64() / elapsed.as_secs_f64()),
+                bcpack_workers =
+                    format_args!("{:.2}", self.bcpack.1.as_secs_f64() / elapsed.as_secs_f64()),
                 page_destinations = std::mem::take(&mut self.pages),
                 waiting,
                 "dstorage: last {:.1} s",
@@ -584,7 +922,11 @@ impl Lanes {
         if lane.reads.is_empty() {
             lane.clock = lane.clock.max(self.lane_now[class]);
         }
-        let mut commands = if explicit { std::mem::take(&mut lane.held) } else { Vec::new() };
+        let mut commands = if explicit {
+            std::mem::take(&mut lane.held)
+        } else {
+            Vec::new()
+        };
         commands.append(&mut lane.unsubmitted);
         for command in commands {
             let hold = !explicit
@@ -797,7 +1139,9 @@ fn queue(this: QueueRef, command: Command) {
         if !lane.held.is_empty() {
             static WARNED: AtomicBool = AtomicBool::new(false);
             if !WARNED.swap(true, Ordering::Relaxed) {
-                tracing::warn!("dstorage: a full queue's reads into physical pages start before the title's Submit");
+                tracing::warn!(
+                    "dstorage: a full queue's reads into physical pages start before the title's Submit"
+                );
             }
             lanes.submit(id);
             scheduler.work.notify_all();
@@ -835,7 +1179,10 @@ extern "system" fn submit(this: QueueRef) {
         return;
     };
     let mut lanes = scheduler.lock();
-    let pending = lanes.lanes.get(&id).map_or(0, |l| l.unsubmitted.len() + l.held.len());
+    let pending = lanes
+        .lanes
+        .get(&id)
+        .map_or(0, |l| l.unsubmitted.len() + l.held.len());
     tracing::debug!(commands = pending, "dstorage: submit");
     lanes.submit(id);
     scheduler.work.notify_all();
@@ -992,16 +1339,16 @@ fn read_into(request: &Request, out: &mut [u8]) -> Result<(), HRESULT> {
         return Ok(());
     }
     // SAFETY: a file object we created; the title keeps it open.
-    let file = &unsafe { &*request.source.cast::<Instance<File>>() }
+    let files = &unsafe { &*request.source.cast::<Instance<File>>() }
         .state
-        .file;
+        .files;
     let started = std::time::Instant::now();
     let mut done = 0;
     let result = loop {
         if done == out.len() {
             break Ok(());
         }
-        match file.seek_read(&mut out[done..], request.offset + done as u64) {
+        match files.read_at(&mut out[done..], request.offset + done as u64) {
             Ok(0) => break Err(END_OF_FILE),
             Ok(n) => done += n,
             Err(error) => break Err(from_win32(&error)),
@@ -1098,7 +1445,9 @@ fn source_name(request: &Request) -> &str {
         return "memory";
     }
     // SAFETY: a file object we created; the title keeps it open.
-    &unsafe { &*request.source.cast::<Instance<File>>() }.state.path
+    &unsafe { &*request.source.cast::<Instance<File>>() }
+        .state
+        .path
 }
 
 /// Queues that submitted themselves, half full (diagnostics).
@@ -1260,6 +1609,365 @@ mod tests {
 
     fn pattern(n: usize) -> Vec<u8> {
         (0..n).map(|i| (i * 7 + i / 251) as u8).collect()
+    }
+
+    fn read_all(files: &Files, out: &mut [u8], at: u64) {
+        let mut done = 0;
+        while done < out.len() {
+            let n = files.read_at(&mut out[done..], at + done as u64).unwrap();
+            assert_ne!(n, 0, "{at} {}", out.len());
+            done += n;
+        }
+    }
+
+    #[test]
+    fn workers_read_a_file_through_handles_of_their_own() {
+        let plain = pattern(300_001);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("data.bin");
+        std::fs::write(&path, &plain).unwrap();
+        for others in [0, 3] {
+            let files = Files::with(std::fs::File::open(&path).unwrap(), Io::Handles, others);
+            std::thread::scope(|s| {
+                for _ in 0..6 {
+                    s.spawn(|| {
+                        let reads = [
+                            (0, 4096),
+                            (1, 100),
+                            (4095, 2),
+                            (12_345, 250_000),
+                            (299_990, 11),
+                        ];
+                        for (at, len) in reads {
+                            let mut out = vec![0; len];
+                            read_all(&files, &mut out, at as u64);
+                            assert!(out == plain[at..at + len], "{others} {at} {len}");
+                        }
+                        let mut out = [0; 16];
+                        assert_eq!(files.read_at(&mut out, 299_999).unwrap(), 2);
+                        assert_eq!(files.read_at(&mut out, 300_001).unwrap(), 0);
+                        assert_eq!(files.read_at(&mut out, 400_000).unwrap(), 0);
+                    });
+                }
+            });
+            let made = files
+                .others
+                .iter()
+                .filter(|o| o.get().is_some_and(Option::is_some))
+                .count();
+            assert_eq!(
+                made, others,
+                "a reopened handle for each worker slot under Windows/Wine"
+            );
+        }
+    }
+
+    #[test]
+    fn every_way_of_reading_gives_the_same_bytes() {
+        let plain = pattern(300_001);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("data.bin");
+        std::fs::write(&path, &plain).unwrap();
+        for mode in [Io::One, Io::Handles, Io::Overlapped, Io::Direct] {
+            let files = Files::new(std::fs::File::open(&path).unwrap(), mode);
+            for (at, len) in [
+                (0, 4096),
+                (1, 100),
+                (4095, 2),
+                (8192, 200_000),
+                (12_345, 250_000),
+                (299_990, 11),
+                (300_000, 1),
+            ] {
+                let mut out = vec![0u8; len];
+                read_all(&files, &mut out, at as u64);
+                assert!(out == plain[at..at + len], "{mode:?} {at} {len}");
+            }
+            let mut out = [0u8; 16];
+            assert_eq!(files.read_at(&mut out, 299_999).unwrap(), 2, "{mode:?}");
+            assert_eq!(files.read_at(&mut out, 300_001).unwrap(), 0, "{mode:?}");
+            assert_eq!(files.read_at(&mut out, 400_000).unwrap(), 0, "{mode:?}");
+        }
+    }
+
+    #[test]
+    fn multi_worker_reopen_handles_throughput() {
+        const THREADS: usize = 16;
+        const FILE_LEN: usize = 16 << 20;
+        const READ_SIZE: usize = 48 << 10;
+        const READS: usize = 4_000;
+        let plain = pattern(FILE_LEN);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("archive.bin");
+        std::fs::write(&path, &plain).unwrap();
+        let mut seed = 0x9e37_79b9_7f4a_7c15_u64;
+        let offsets: Vec<u64> = (0..READS)
+            .map(|_| {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                (seed % (FILE_LEN - READ_SIZE) as u64) & !15
+            })
+            .collect();
+
+        for (label, mode, slots) in [
+            ("shared handle (Io::One)", Io::One, 0),
+            ("per-worker ReOpenFile (Io::Handles)", Io::Handles, THREADS),
+            ("shared overlapped (Io::Overlapped)", Io::Overlapped, 1),
+            ("per-worker unbuffered (Io::Direct)", Io::Direct, THREADS),
+        ] {
+            let wide: Box<[u16]> = path.as_os_str().encode_wide().chain([0]).collect();
+            let files =
+                Files::with_path(std::fs::File::open(&path).unwrap(), Some(wide), mode, slots);
+            // Warm all worker slots before timing steady-state throughput.
+            let next = std::sync::atomic::AtomicUsize::new(0);
+            let busy_us = AtomicU64::new(0);
+            let start = Instant::now();
+            std::thread::scope(|s| {
+                for tid in 0..THREADS {
+                    let (files, offsets, next, busy_us, plain) =
+                        (&files, &offsets, &next, &busy_us, &plain);
+                    s.spawn(move || {
+                        WORKER_SLOT.set(Some(tid));
+                        let mut out = vec![0u8; READ_SIZE];
+                        while let Some(&at) = offsets.get(next.fetch_add(1, Ordering::Relaxed)) {
+                            let t0 = Instant::now();
+                            read_all(files, &mut out, at);
+                            busy_us.fetch_add(t0.elapsed().as_micros() as u64, Ordering::Relaxed);
+                            let idx = at as usize;
+                            assert_eq!(out[0], plain[idx]);
+                            assert_eq!(out[READ_SIZE - 1], plain[idx + READ_SIZE - 1]);
+                        }
+                        WORKER_SLOT.set(None);
+                    });
+                }
+            });
+            let elapsed = start.elapsed().as_secs_f64().max(1e-6);
+            let mb_s = (READS * READ_SIZE) as f64 / elapsed / 1e6;
+            let avg_ms = busy_us.load(Ordering::Relaxed) as f64 / READS as f64 / 1e3;
+            let reopened = files
+                .others
+                .iter()
+                .filter(|o| o.get().is_some_and(Option::is_some))
+                .count();
+            println!(
+                "[dstorage bench] {label}: {mb_s:.1} MB/s ({avg_ms:.3} ms/read, reopened={reopened}/{slots})"
+            );
+            if slots > 0 {
+                assert!(reopened > 0, "worker handles should open");
+            }
+        }
+    }
+
+    /// Reproduces the live 16-worker M5 Max `offset=69614334544` (>4 GiB)
+    /// concurrent `seek_read` zlib corruption scenario across 8 threads on a
+    /// virtual `G:` drive: tests `ReOpenFile` handles, `CreateFileW` virtual
+    /// drive handles, `Io::One` mutex fallback, modulo-colliding non-worker
+    /// callers, and full DirectStorage `ZLIB` queue submissions simultaneously.
+    #[test]
+    fn concurrent_virtual_drive_high_offset_zlib_reads_never_corrupt() {
+        const CHUNKS: usize = 8;
+        const PLAIN_LEN: usize = 65_536;
+        const BASE_4GIB_PLUS: u64 = 5_000_000_123; // > 4 GiB, unaligned
+        const STRIDE: u64 = 128 << 20;
+
+        let dir = tempfile::tempdir().unwrap();
+        let sub = dir.path().join("levels");
+        std::fs::create_dir_all(&sub).unwrap();
+        let archive_path = sub.join("sparse_archive.rpf");
+
+        // Build 8 distinct 64 KiB payloads compressed with zlib at >4 GiB offsets.
+        let mut expected_plain = Vec::with_capacity(CHUNKS);
+        let mut compressed_chunks = Vec::with_capacity(CHUNKS);
+        let mut chunk_offsets = Vec::with_capacity(CHUNKS);
+        {
+            let f = std::fs::OpenOptions::new()
+                .create(true)
+                .write(true)
+                .read(true)
+                .truncate(true)
+                .open(&archive_path)
+                .unwrap();
+            let total_sparse_len = BASE_4GIB_PLUS + (CHUNKS as u64) * STRIDE + (1 << 20);
+            f.set_len(total_sparse_len).unwrap();
+            for c in 0..CHUNKS {
+                let plain: Vec<u8> = (0..PLAIN_LEN)
+                    .map(|i| ((i * 13 + c * 53 + (i >> 8) * 19) & 0xff) as u8)
+                    .collect();
+                let z = miniz_oxide::deflate::compress_to_vec_zlib(&plain, 6);
+                let off = BASE_4GIB_PLUS + (c as u64) * STRIDE + (c as u64) * 317;
+                let mut written = 0;
+                while written < z.len() {
+                    written += f.seek_write(&z[written..], off + written as u64).unwrap();
+                }
+                expected_plain.push(plain);
+                compressed_chunks.push(z);
+                chunk_offsets.push(off);
+            }
+        }
+
+        // 1) Mount `dir` on a virtual drive letter and open via `open_file` (`G:\levels\...`).
+        let drive = crate::modules::files::mount(dir.path()).expect("virtual drive letter");
+        let virtual_str = format!("{drive}:\\levels\\sparse_archive.rpf");
+        let virtual_wide: Vec<u16> = virtual_str.encode_utf16().chain([0]).collect();
+        let open_fn: extern "system" fn(*mut c_void, *const u16, *const Guid, Out) -> HRESULT =
+            call(factory(), 0x20);
+        let mut dstorage_file = std::ptr::null_mut();
+        assert_eq!(
+            open_fn(
+                factory(),
+                virtual_wide.as_ptr(),
+                std::ptr::null(),
+                &mut dstorage_file
+            ),
+            S_OK
+        );
+
+        // 2) Test 8-thread concurrent reads + zlib inflate at >4 GiB offsets across:
+        //    - raw `ReOpenFile` (`wide_path = None`, 8 slots AND 3 modulo-colliding slots),
+        //    - virtual-drive `Files` (`wide_path = Some(virtual_wide)`, 8 slots),
+        //    - `Io::One` fallback (`0` other slots -> shared `first: Mutex<File>`).
+        let virtual_box: Box<[u16]> = virtual_wide.clone().into_boxed_slice();
+        for (case_name, wide_opt, mode, slots) in [
+            ("ReOpenFile 8 slots", None, Io::Handles, 8usize),
+            ("ReOpenFile 3 colliding slots", None, Io::Handles, 3usize),
+            (
+                "Virtual-drive path 8 slots",
+                Some(virtual_box.clone()),
+                Io::Handles,
+                8usize,
+            ),
+            ("Io::One mutex fallback", None, Io::One, 0usize),
+        ] {
+            let raw_file = std::fs::File::open(&archive_path).unwrap();
+            let files = Files::with_path(raw_file, wide_opt, mode, slots);
+            let barrier = std::sync::Barrier::new(8);
+            std::thread::scope(|s| {
+                for tid in 0..8usize {
+                    let (files, barrier, expected_plain, compressed_chunks, chunk_offsets) = (
+                        &files,
+                        &barrier,
+                        &expected_plain,
+                        &compressed_chunks,
+                        &chunk_offsets,
+                    );
+                    s.spawn(move || {
+                        if slots == 8 {
+                            WORKER_SLOT.set(Some(tid));
+                        } else {
+                            WORKER_SLOT.set(None);
+                        }
+                        barrier.wait();
+                        let mut comp_buf = vec![0u8; PLAIN_LEN * 2];
+                        let mut out_plain = vec![0u8; PLAIN_LEN];
+                        for iter in 0..250usize {
+                            let c = (tid * 3 + iter * 5) % CHUNKS;
+                            let comp_len = compressed_chunks[c].len();
+                            read_all(files, &mut comp_buf[..comp_len], chunk_offsets[c]);
+                            let n = inflate(&comp_buf[..comp_len], &mut out_plain).unwrap_or_else(
+                                |hr| {
+                                    panic!(
+                                        "{case_name} tid={tid} iter={iter} chunk={c} offset={} zlib corrupted: hr={hr:#010x}",
+                                        chunk_offsets[c]
+                                    )
+                                },
+                            );
+                            assert_eq!(n, PLAIN_LEN);
+                            assert_eq!(out_plain, expected_plain[c], "{case_name} byte mismatch");
+                        }
+                        WORKER_SLOT.set(None);
+                    });
+                }
+            });
+            if slots > 0 {
+                let opened = files
+                    .others
+                    .iter()
+                    .filter(|o| o.get().is_some_and(Option::is_some))
+                    .count();
+                assert_eq!(opened, slots, "{case_name}: all slots reopened");
+            }
+        }
+
+        // 3) End-to-end DirectStorage queue submission of 64 concurrent >4 GiB
+        //    zlib requests through the virtual-drive `dstorage_file` handle!
+        let (queue, array) = (new_queue(0), status_array(1));
+        let mut outputs: Vec<Vec<u8>> = (0..64).map(|_| vec![0u8; PLAIN_LEN]).collect();
+        for (req_idx, out_buf) in outputs.iter_mut().enumerate() {
+            let c = req_idx % CHUNKS;
+            let r = request(
+                ZLIB,
+                out_buf.as_mut_ptr().cast(),
+                PLAIN_LEN,
+                dstorage_file,
+                chunk_offsets[c],
+                compressed_chunks[c].len(),
+            );
+            enqueue(queue, &r);
+        }
+        enqueue_status(queue, array, 0);
+        void(queue, 0x30);
+        assert_eq!(wait(array, 0), S_OK);
+        for (req_idx, out_buf) in outputs.iter().enumerate() {
+            assert_eq!(out_buf, &expected_plain[req_idx % CHUNKS]);
+        }
+        void(queue, 0x40);
+        void(dstorage_file, 0x10);
+    }
+
+    /// Benchmark against a real archive at `VICTORY_BENCH_FILE`:
+    /// `VICTORY_BENCH_FILE=... cargo test --release -p victory-hle --lib read_bench -- --ignored --nocapture`
+    #[test]
+    #[ignore = "a benchmark"]
+    fn read_bench() {
+        const SIZE: usize = 48 << 10;
+        const READS: usize = 12_000;
+        let threads = workers();
+        let path = std::env::var("VICTORY_BENCH_FILE").expect("VICTORY_BENCH_FILE");
+        let len = std::fs::metadata(&path).unwrap().len();
+        let mut seed = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos() as u64
+            | 1;
+        let mut random = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for mode in [Io::One, Io::Handles, Io::Overlapped, Io::Direct] {
+            let files = Files::new(std::fs::File::open(&path).unwrap(), mode);
+            let at: Vec<u64> = (0..READS)
+                .map(|_| (random() % (len - SIZE as u64)) & !15)
+                .collect();
+            for pass in ["cold", "again"] {
+                let next = std::sync::atomic::AtomicUsize::new(0);
+                let busy = AtomicU64::new(0);
+                let start = Instant::now();
+                std::thread::scope(|s| {
+                    for _ in 0..threads {
+                        s.spawn(|| {
+                            let mut out = vec![0u8; SIZE];
+                            while let Some(&at) = at.get(next.fetch_add(1, Ordering::Relaxed)) {
+                                let began = Instant::now();
+                                read_all(&files, &mut out, at);
+                                busy.fetch_add(
+                                    began.elapsed().as_micros() as u64,
+                                    Ordering::Relaxed,
+                                );
+                            }
+                        });
+                    }
+                });
+                let took = start.elapsed().as_secs_f64();
+                println!(
+                    "{threads} threads, {mode:?}, {pass}: {:.0} MB/s, {:.2} ms a read",
+                    (READS * SIZE) as f64 / took / 1e6,
+                    busy.load(Ordering::Relaxed) as f64 / READS as f64 / 1e3
+                );
+            }
+        }
     }
 
     #[test]
@@ -1691,7 +2399,11 @@ mod tests {
         read(&mut l, 0, PAGE_DESTINATION, 16);
         read(&mut l, 0, 0, 16);
         add_ref_instance(array);
-        l.lanes.get_mut(&0).unwrap().unsubmitted.push(Command::Status(Status { array, index: 0 }));
+        l.lanes
+            .get_mut(&0)
+            .unwrap()
+            .unsubmitted
+            .push(Command::Status(Status { array, index: 0 }));
         l.submit_as(0, false);
         // Only the plain read starts; the status waits behind the held one.
         let plain = l.start().unwrap();
@@ -1724,7 +2436,10 @@ mod tests {
             0x04,
         );
         assert!(!mapped.is_null());
-        assert_eq!(xmem::XMemMapPhysicalPages(mapped, 2, pages.as_ptr()), mapped);
+        assert_eq!(
+            xmem::XMemMapPhysicalPages(mapped, 2, pages.as_ptr()),
+            mapped
+        );
         // The title's page table: still the page's previous owner when the
         // request is enqueued, the right page by its Submit.
         let mut list = [pages[0]];
@@ -1751,7 +2466,17 @@ mod tests {
         );
         enqueue(queue, &r);
         let mut out = [0u8; 16];
-        enqueue(queue, &request(MEMORY_SOURCE, out.as_mut_ptr().cast(), 16, plain.as_ptr().cast(), 0, 16));
+        enqueue(
+            queue,
+            &request(
+                MEMORY_SOURCE,
+                out.as_mut_ptr().cast(),
+                16,
+                plain.as_ptr().cast(),
+                0,
+                16,
+            ),
+        );
         // Half of four: the queue submitted itself. Time for a read started
         // then to land in the old page.
         std::thread::sleep(std::time::Duration::from_millis(50));

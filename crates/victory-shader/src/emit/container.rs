@@ -89,6 +89,48 @@ pub(crate) fn same_mode_per_row(elements: &mut [SigElement], read: bool) {
     }
 }
 
+/// Repacks register `(row, col)` assignments in element slice order after
+/// [`same_mode_per_row`] and instruction lowering have run, so `OSG1`, `PSG1`,
+/// `ISG1`, and `PSV0` emit arbitrary elements in the exact descending-size
+/// order chosen by `prune_signature` while packing sub-vector elements that
+/// share interpolation and float/integer kind into 4-component rows.
+pub(crate) fn repack_rows(elements: &mut [SigElement]) {
+    let mut sys_rows: Vec<(u32, u32)> = Vec::new();
+    let mut next_row = 0u32;
+    for e in elements.iter_mut().filter(|e| e.kind != 0) {
+        let Some(old) = e.row else { continue };
+        let mapped = match sys_rows.iter().find(|&&(o, _)| o == old) {
+            Some(&(_, r)) => r,
+            None => {
+                let r = next_row;
+                next_row += 1;
+                sys_rows.push((old, r));
+                r
+            }
+        };
+        e.row = Some(mapped);
+    }
+    let mut open: Option<(u32, u8, u8, bool)> = None;
+    for e in elements.iter_mut().filter(|e| e.kind == 0 && e.row.is_some()) {
+        let is_float = e.comp == 9;
+        if let Some((r, used, interp, row_float)) = open
+            && used + e.cols <= 4
+            && e.interp == interp
+            && is_float == row_float
+        {
+            e.row = Some(r);
+            e.col = used;
+            open = (used + e.cols < 4).then_some((r, used + e.cols, interp, row_float));
+        } else {
+            let r = next_row;
+            next_row += 1;
+            e.row = Some(r);
+            e.col = 0;
+            open = (e.cols < 4).then_some((r, e.cols, e.interp, is_float));
+        }
+    }
+}
+
 pub(crate) fn signature(elements: &[SigElement], input: bool) -> Vec<u8> {
     let mut out = Vec::new();
     out.extend((elements.len() as u32).to_le_bytes());
@@ -114,7 +156,7 @@ pub(crate) fn signature(elements: &[SigElement], input: bool) -> Vec<u8> {
         }
     }
     let mut order: Vec<usize> = (0..elements.len()).collect();
-    order.sort_by_key(|&i| elements[i].row.unwrap_or(u32::MAX));
+    order.sort_by_key(|&i| (elements[i].row.unwrap_or(u32::MAX), elements[i].col));
     for i in order {
         let (e, offset) = (&elements[i], offsets[i]);
         let used = e.usage << e.col;

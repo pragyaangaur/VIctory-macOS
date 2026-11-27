@@ -331,7 +331,7 @@ pub(crate) static ALIAS_COPIES: std::sync::atomic::AtomicU64 = std::sync::atomic
 /// subresource with its own format, as many as have the same bytes per
 /// row and rows in both; `to` no longer takes its contents from title
 /// memory.
-pub(crate) fn alias_copy(list: &HostList, from: This, to: This) {
+pub(crate) fn alias_copy(list: &HostList, from: This, to: This) -> bool {
     const COPY_DEST: u32 = 0x400;
     const COPY_SOURCE: u32 = 0x800;
     let (Some(a), Some(b), Some(host)) = (
@@ -339,11 +339,26 @@ pub(crate) fn alias_copy(list: &HostList, from: This, to: This) {
         crate::resource::host_resource(to),
         host(),
     ) else {
-        return;
+        return false;
     };
-    // An odd key: textures' own first uses are keyed by the host texture.
-    if !list.first_use(to as usize | 1) {
-        return;
+    // An upload from title memory can have already used this view; only a
+    // copy from the same GPU source with no intervening state change on the
+    // source can satisfy this read.
+    list.first_use(to as usize | 1);
+    let new_source = list.alias_source_changed(&b, &a);
+    let before = list.transition(from, COPY_SOURCE).map(|(texture, before)| {
+        let state = crate::host::legal_state(&texture, COPY_SOURCE);
+        let barrier = crate::host::transition(
+            &texture,
+            D3D12_RESOURCE_STATES(before as i32),
+            D3D12_RESOURCE_STATES(state as i32),
+        );
+        // SAFETY: an open list and a live texture.
+        unsafe { list.list.ResourceBarrier(&[barrier]) };
+        before
+    });
+    if !new_source && before.is_none() {
+        return true;
     }
     // SAFETY: live resources.
     let (da, db) = unsafe { (a.GetDesc(), b.GetDesc()) };
@@ -377,12 +392,11 @@ pub(crate) fn alias_copy(list: &HostList, from: This, to: This) {
         .count() as u32;
     if n == 0 {
         once!(?da, ?db, "an aliased texture not copied: its layouts differ on the host");
-        return;
+        return false;
     }
-    let Some(buffer) = host.default_buffer(total) else { return };
+    let Some(buffer) = host.default_buffer(total) else { return false };
     list.keep(&buffer);
     crate::texture::host_writes(list, to);
-    crate::list::ensure_state(list, from, COPY_SOURCE);
     crate::list::ensure_state(list, to, COPY_DEST);
     let place = |r: &ID3D12Resource, f: D3D12_PLACED_SUBRESOURCE_FOOTPRINT| D3D12_TEXTURE_COPY_LOCATION {
         // SAFETY: a borrowed pointer the copy does not release.
@@ -418,6 +432,7 @@ pub(crate) fn alias_copy(list: &HostList, from: This, to: This) {
         logged.push((from as usize, to as usize));
         tracing::info!(from = ?from, to = ?to, a = da.Format.0, b = db.Format.0, w = da.Width, h = da.Height, subresources = n, "aliased texture copied");
     }
+    true
 }
 
 /// Has `resource`'s host copy brought up to date at the submission that

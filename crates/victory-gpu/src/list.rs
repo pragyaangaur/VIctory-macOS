@@ -2071,6 +2071,8 @@ pub(crate) fn has_newer_table(list: This) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(windows)]
+    use crate::backend::HostMemory;
     use crate::object::slot;
     use std::sync::{
         Arc,
@@ -2291,6 +2293,131 @@ mod tests {
         assert!(!read_only_transition(&transition(0, NON_PIXEL, COMMON)));
         assert!(!read_only_transition(&transition(2, NON_PIXEL, PIXEL)));
         assert!(!read_only_transition(&UAV_BARRIER));
+    }
+
+    /// List-owned upload/scratch memory (`allocate_upload`) submitted on a held
+    /// queue must stay mapped and GPU-readable across both an immediate list
+    /// `Reset` (while reusing the list for a second distinct upload batch) and
+    /// an immediate `Release`, and then be freed once both batches finish on
+    /// the host GPU.
+    #[cfg(windows)]
+    #[test]
+    fn allocate_upload_survives_early_reset_and_release_while_held_on_gpu() {
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU here
+        };
+        let null = std::ptr::null();
+        let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
+
+        let mut allocator = null;
+        assert_eq!(
+            create_allocator(null, 2, &ALLOCATOR_IIDS[0], &mut allocator),
+            S_OK
+        );
+        let mut list = null;
+        assert_eq!(
+            create_list(null, 0, 2, allocator, null, &LIST_IIDS[1], &mut list),
+            S_OK
+        );
+        let qdesc = crate::queue::QueueDesc::compute();
+        let mut queue = null;
+        assert_eq!(
+            crate::queue::create(null, &qdesc, &crate::queue::QUEUE_IID, &mut queue),
+            S_OK
+        );
+
+        let (dst1_buf, dst1_cpu) = host.shared_buffer(256).unwrap();
+        let (dst2_buf, dst2_cpu) = host.shared_buffer(256).unwrap();
+        // SAFETY: newly allocated mapped shared buffers of 256 bytes each.
+        unsafe {
+            std::ptr::write_bytes(dst1_cpu, 0, 256);
+            std::ptr::write_bytes(dst2_cpu, 0, 256);
+        }
+
+        let flag = Box::new(std::sync::atomic::AtomicU64::new(0));
+        let flag_addr = std::ptr::from_ref(&*flag) as u64;
+        const GREATER_EQUAL: u32 = 7;
+
+        // Batch 1: allocate upload memory, write pattern 1, gate on `flag >= 1`,
+        // copy upload shadow -> dst1 on the host GPU, submit (held), then Reset immediately.
+        let p1 = allocate_upload(list, 256, 64);
+        assert!(!p1.is_null() && (p1 as usize).is_multiple_of(64));
+        for i in 0..64u32 {
+            // SAFETY: 256 bytes were allocated at `p1`.
+            unsafe { p1.cast::<u32>().add(i as usize).write_volatile(0xA1B2_0000 + i) };
+        }
+        let s1 = crate::shadow::find(p1 as u64, 256).expect("upload 1 registered in shadow");
+        wait64(list, flag_addr, GREATER_EQUAL, 1, 0);
+        {
+            let h1 = host_list(list).expect("host list for batch 1");
+            s1.refresh(h1, p1 as u64, 256);
+            let off1 = (p1 as u64) - s1.range().0;
+            // SAFETY: open host list, valid buffers of at least 256 bytes.
+            unsafe { h1.list.CopyBufferRegion(&dst1_buf, 0, &s1.buffer, off1, 256) };
+            h1.keep(&dst1_buf);
+        }
+        drop(s1);
+        assert_eq!(close(list), S_OK);
+        crate::queue::submit_one(queue, list);
+
+        // Still held: dst1 must still be zero, and resetting `list` must transfer
+        // upload 1 to the held HostList rather than freeing it.
+        // SAFETY: mapped readback buffer.
+        assert_eq!(unsafe { dst1_cpu.cast::<u32>().read_volatile() }, 0);
+        assert_eq!(reset(list, allocator, null), S_OK);
+        assert!(
+            crate::shadow::find(p1 as u64, 256).is_some(),
+            "upload 1 must stay registered and mapped after early Reset while held"
+        );
+
+        // Batch 2: reuse the SAME command list while Batch 1 is still held,
+        // allocate a second distinct upload block, write pattern 2, copy -> dst2,
+        // submit (queued behind Batch 1), then Release the list immediately.
+        let p2 = allocate_upload(list, 256, 64);
+        assert!(!p2.is_null() && p2 != p1 && (p2 as usize).is_multiple_of(64));
+        for i in 0..64u32 {
+            // SAFETY: 256 bytes were allocated at `p2`.
+            unsafe { p2.cast::<u32>().add(i as usize).write_volatile(0xC3D4_0000 + i) };
+        }
+        let s2 = crate::shadow::find(p2 as u64, 256).expect("upload 2 registered in shadow");
+        {
+            let h2 = host_list(list).expect("host list for batch 2");
+            s2.refresh(h2, p2 as u64, 256);
+            let off2 = (p2 as u64) - s2.range().0;
+            // SAFETY: open host list, valid buffers of at least 256 bytes.
+            unsafe { h2.list.CopyBufferRegion(&dst2_buf, 0, &s2.buffer, off2, 256) };
+            h2.keep(&dst2_buf);
+        }
+        drop(s2);
+        assert_eq!(close(list), S_OK);
+        crate::queue::submit_one(queue, list);
+        assert_eq!(release(list), 0);
+        assert!(
+            crate::shadow::find(p1 as u64, 256).is_some()
+                && crate::shadow::find(p2 as u64, 256).is_some(),
+            "both uploads must stay registered and mapped after early Reset + Release while held"
+        );
+
+        // Satisfy the wait and pump: both batches run on the live host GPU.
+        flag.store(1, Ordering::Release);
+        crate::queue::pump_held(crate::queue::Why::Submission);
+
+        // SAFETY: GPU execution finished synchronously inside pump_held; dst1_cpu is mapped for 64 u32s.
+        let got1 = unsafe { std::slice::from_raw_parts(dst1_cpu.cast::<u32>(), 64) };
+        // SAFETY: GPU execution finished synchronously inside pump_held; dst2_cpu is mapped for 64 u32s.
+        let got2 = unsafe { std::slice::from_raw_parts(dst2_cpu.cast::<u32>(), 64) };
+        for i in 0..64u32 {
+            assert_eq!(got1[i as usize], 0xA1B2_0000 + i, "batch 1 word {i} corrupted");
+            assert_eq!(got2[i as usize], 0xC3D4_0000 + i, "batch 2 word {i} corrupted");
+        }
+        assert!(
+            crate::shadow::find(p1 as u64, 256).is_none()
+                && crate::shadow::find(p2 as u64, 256).is_none(),
+            "both uploads must be unregistered and freed once held lists finish"
+        );
+
+        assert_eq!(release(queue), 0);
+        assert_eq!(release(allocator), 0);
     }
 
     /// A stand-in host list for `restart_hosts` (tests).
