@@ -421,6 +421,29 @@ FINDING_BODY=$(printf '<!-- fleet-finding\nsig: 0123456789ab\ntest: wine/victory
 export FINDING_BODY
 eq "record_verification posts Verified on a complete clean report" "42:Verified in #99: not seen at \`0123456789ab\` on Apple M3 Pro, macOS 15.4.1." "$(verify_reply "$clean")"
 eq "record_verification stays silent on a trimmed report" "" "$(verify_reply "$trimmed")"
+# A result from a task opened before the finding was closed tested a commit
+# from before the close, so it must not reopen the finding (#321).
+upsert_closed() { # TASK_CREATED
+    GITHUB_REPOSITORY=example/VIctory-macOS bash -c '
+        set -euo pipefail
+        eval "$(sed "/^case \"\${1:-}\"/,\$d" "$0")"
+        api() { echo "api $*" >&2; }
+        reply() { printf "%s:%s\n" "$1" "$2"; }
+        add_label() { echo "label $1:$2" >&2; }
+        load_findings() { FINDINGS=$(jq -nc --arg b "$FINDING_BODY" "[{number: 42, state: \"closed\", closed_at: \"2026-11-26T15:40:29Z\", assignees: [], body: \$b}]"); }
+        load_findings
+        upsert_finding 0123456789ab wine/victory_gpu::tests::depth16 gpu "Seen in #99." "$1"
+    ' "$FLEET_DIR/queue.sh" "$1" 2>&1
+}
+eq "a result from a task opened before the close does not reopen the finding" \
+    "42:Seen in #99. Not reopened: this run's task was opened before the finding was closed." \
+    "$(upsert_closed 2026-11-26T15:09:29Z)"
+eq "a result from a task opened after the close reopens the finding" \
+    "api -X PATCH repos/example/VIctory-macOS/issues/42 -f state=open -f state_reason=reopened
+label 42:fleet:open
+label 42:fleet:regressed
+42:Seen again after this was closed, so it has been reopened as a regression. Seen in #99." \
+    "$(upsert_closed 2026-11-26T15:40:43Z)"
 unset FINDING_BODY
 eq "flaky: a trimmed report is not disagreement" "" "$(flaky_sigs "$good" "$trimmed")"
 eq "flaky: both reports trimmed is not disagreement" "" "$(flaky_sigs "$trimmed" "$trimmed")"
