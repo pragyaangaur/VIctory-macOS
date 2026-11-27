@@ -20,8 +20,8 @@ use crate::native::{HwStage, NativeProgram, ResourceType, RootType, StageIo, Usa
 use crate::resource::{Address, CODE, MEMORY, Resources, Role, Site, Source, USER_DATA};
 use crate::structure::{Atom, Bool, LaneExit, Map, Set, Structured};
 
-mod barriers;
 mod atomics;
+mod barriers;
 mod bvh;
 /// Format loads that move 16-bit halves without the d16 form, a child
 /// module so it shares the emitter's state.
@@ -29,11 +29,29 @@ mod bvh;
 mod half_views;
 mod halves;
 mod mesh;
-use barriers::{split_wave_barriers, step_and_cap};
+mod predicate;
+#[cfg(test)]
+use barriers::split_wave_barriers;
+use barriers::{in_step, split_wave_barriers_with_step, step_and_cap};
 pub(crate) use mesh::KeptOutputs;
 use mesh::prune_signature;
 
 type Why = &'static str;
+
+#[cfg(test)]
+thread_local! {
+    /// Set by a test that probes the value analysis behind a refusal, which
+    /// selective predication would otherwise route around.
+    static NO_PREDICATION: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether the current test turned selective predication off.
+fn predication_off() -> bool {
+    #[cfg(test)]
+    return NO_PREDICATION.with(|c| c.get());
+    #[cfg(not(test))]
+    false
+}
 
 #[derive(Debug, Clone, Copy)]
 enum Val {
@@ -186,17 +204,19 @@ enum Stop {
     Fail(ShaderError),
 }
 
+#[cfg(any(test, all(windows, feature = "host")))]
 pub(crate) fn lower(parts: &Parts) -> Result<Lowered, ShaderError> {
-    lower_pruned(parts, None)
+    lower_pruned(parts, None, false)
 }
 
 pub(crate) fn lower_pruned(
     parts: &Parts,
     keep: Option<&KeptOutputs>,
+    per_vertex_center: bool,
 ) -> Result<Lowered, ShaderError> {
     let mut bad = HashMap::new();
     loop {
-        match Lower::new(parts, &bad, keep).run() {
+        match Lower::new(parts, &bad, keep, per_vertex_center).run() {
             Ok(l) => return Ok(l),
             Err(Stop::Retry(v, why)) => {
                 if bad.insert(v, why).is_some() {
@@ -369,8 +389,21 @@ struct Lower<'a> {
     halves: bool,
     /// Why such a program cannot run in halves.
     halves_refused: Option<Why>,
+    /// Selective acyclic divergent-branch predication plan (`predicate`).
+    pred: predicate::PredicatePlan,
+    /// Per-lane active predicate for each IR block under predication.
+    block_active: Vec<Option<V>>,
+    /// Per-lane active predicate for each predicated CFG edge `(from, to)`.
+    pred_edge_active: Map<(usize, usize), V>,
+    /// Outer active predicate saved before entering a lockstep loop header.
+    loop_outer_active: Map<usize, Option<V>>,
+    /// Lockstep loop active-lane phis `(phi, header, latch)` filled in `fill_phis`.
+    loop_act_phis: Vec<(V, usize, usize)>,
     /// [`Lower::relabelled_flat`], once made.
     relabelled: Option<V>,
+    /// Lower non-provoking per-vertex pixel reads (P10/P20) to zero and
+    /// hardware-interpolate float P0 at pixel center (`Options::per_vertex_center`).
+    per_vertex_center: bool,
     /// In halves: per IR block, whether every lane of the group runs it
     /// together ([`step_and_cap`]), where values can pass between the halves.
     step: Vec<bool>,
@@ -713,7 +746,12 @@ fn code_table_start(p: &crate::ir::Program, addresses: &[&crate::resource::Addre
 }
 
 impl<'a> Lower<'a> {
-    fn new(x: &'a Parts<'a>, bad: &'a HashMap<Value, Why>, keep: Option<&KeptOutputs>) -> Self {
+    fn new(
+        x: &'a Parts<'a>,
+        bad: &'a HashMap<Value, Why>,
+        keep: Option<&KeptOutputs>,
+        per_vertex_center: bool,
+    ) -> Self {
         let p = x.p;
         let mut phi_at = Map::default();
         for (b, block) in p.blocks.iter().enumerate() {
@@ -742,6 +780,7 @@ impl<'a> Lower<'a> {
         let mut console_lanes = false;
         let (mut halves, mut halves_refused) = (false, None);
         let mut split_barriers = Set::default();
+        let mut pred = predicate::PredicatePlan::empty(Vec::new());
         if let StageIo::Cs(cs) = x.native.io {
             s.threads = Some(cs.threads);
             s.lds_dwords = cs.lds_bytes() / 4;
@@ -786,14 +825,25 @@ impl<'a> Lower<'a> {
             let wave = if x.native.wave64 { 64 } else { 32 };
             let group = cs.threads.iter().product::<u32>();
             let one_wave = group <= wave;
+            let one_wave_lds = x.narrow_waves && one_wave && group > 32 && s.lds_dwords > 0;
+            let step_plan = if x.native.wave64
+                && group > 32
+                && (x.host_wave32 || one_wave_lds)
+                && !predication_off()
+            {
+                let base_step = in_step(p, x.st);
+                predicate::PredicatePlan::build(p, x.st, base_step, one_wave_lds, x.host_wave32)
+            } else {
+                predicate::PredicatePlan::empty(Vec::new())
+            };
             // The console's one wave is several host waves: LDS no longer
             // passes between its lanes without a barrier.
             let mut synced = false;
-            if x.narrow_waves && one_wave && group > 32 && s.lds_dwords > 0 {
+            if one_wave_lds {
                 // shortcut: a read in divergent code of what divergent code
                 // wrote gets no barrier (none could be placed there); the
                 // program then runs as before.
-                if let Some(b) = split_wave_barriers(p, x.st) {
+                if let Some(b) = split_wave_barriers_with_step(p, &step_plan.step) {
                     split_barriers = b;
                     synced = true;
                 }
@@ -811,6 +861,12 @@ impl<'a> Lower<'a> {
             }
             if needs_wave {
                 s.wave_size = Some(if halves { 32 } else { wave });
+            } else if synced && !step_plan.lockstep_headers.is_empty() {
+                // Lockstep loops exchange wave ballots via 32-lane `half_words`.
+                s.wave_size = Some(32);
+            }
+            if halves || synced {
+                pred = step_plan;
             }
         }
         let mut no_barrier = Set::default();
@@ -925,8 +981,20 @@ impl<'a> Lower<'a> {
             console_lanes,
             halves,
             halves_refused,
+            step: if !halves {
+                Vec::new()
+            } else if pred.step.is_empty() {
+                step
+            } else {
+                pred.step.clone()
+            },
+            pred,
+            block_active: vec![None; p.blocks.len()],
+            pred_edge_active: Map::default(),
+            loop_outer_active: Map::default(),
+            loop_act_phis: Vec::new(),
             relabelled: None,
-            step: if halves { step } else { Vec::new() },
+            per_vertex_center,
             cap_escaped,
             half_words: None,
             level: 0,
@@ -1398,80 +1466,7 @@ impl<'a> Lower<'a> {
             Shape::Prefix(op, src, mask, ident, inclusive) => {
                 (op, src, mask, ident, Some(inclusive))
             }
-            Shape::Half(_, src, mask, ident, hi) => {
-                // The high half is a console lane's: compute only.
-                if self.mask_data != MaskData::Console {
-                    return Err("a 16-bit wave reduction outside compute");
-                }
-                let across = self.halves && !self.one_host_wave();
-                if across && !self.across_here() {
-                    return Err(ACROSS);
-                }
-                let c = self.cur;
-                let &m = self
-                    .x
-                    .st
-                    .masks
-                    .get(&mask)
-                    .ok_or("a wave reduction's untracked mask")?;
-                let on = self.boolean(m, c)?;
-                let x = self.i32_of(src)?;
-                let id = self.s.m.i32(ident);
-                let x = self.s.m.select(c, on, x, id);
-                self.s.flags |= flags::WAVE_OPS;
-                // shortcut: the f16 sum is taken in f32 and rounded once; the
-                // console rounds each step, in its own order.
-                let low = self.s.m.i32(0xFFFF);
-                let h = self.s.m.bin(c, Bin::And, x, low);
-                let f = self.f16_to_f32(c, h);
-                let (sum, signed) = (self.s.m.i8(0), self.s.m.i8(0));
-                let r = self.s.op(
-                    c,
-                    "waveActiveOp.f32",
-                    Attr::NoUnwind,
-                    self.s.t.f32,
-                    119,
-                    &[f, sum, signed],
-                );
-                // In halves, each host wave reduced its own 32 lanes. Pass
-                // those f32 totals between the halves before rounding once.
-                let r = if across {
-                    self.reduce_across(Op::AddH, r, r, false, ident)?
-                } else {
-                    r
-                };
-                let r = self.f32_to_f16(c, r);
-                let r = self.s.m.bin(c, Bin::And, r, low);
-                // Lane `hi` runs the section on the console even where it is
-                // elsewhere on the host; there it holds the identity.
-                let i32t = self.s.t.i32;
-                let word = if across {
-                    // Lane `hi` may be in the other host wave: both halves'
-                    // ballots, as its value is read across them below.
-                    let (lo, up) = self.ballot_across_halves(on, c)?;
-                    if hi < 32 { lo } else { up }
-                } else {
-                    let four = self.s.m.named_struct("dx.types.fouri32", vec![i32t; 4]);
-                    let b = self
-                        .s
-                        .op(c, "waveActiveBallot", Attr::NoUnwind, four, 116, &[on]);
-                    self.s.m.extract(c, b, hi / 32)
-                };
-                let (sh, one, z) = (self.s.m.i32(hi % 32), self.s.m.i32(1), self.s.m.i32(0));
-                let bit = self.s.m.bin(c, Bin::LShr, word, sh);
-                let bit = self.s.m.bin(c, Bin::And, bit, one);
-                let there = self.s.m.cmp(c, pred::NE, bit, z);
-                let lane = self.s.m.i32(hi);
-                let at = if across {
-                    self.read_lane_across(x, lane)?
-                } else {
-                    self.read_lane(x, lane)
-                };
-                let top = self.s.m.select(c, there, at, id);
-                let high = self.s.m.i32(0xFFFF_0000);
-                let top = self.s.m.bin(c, Bin::And, top, high);
-                return Ok(self.s.m.bin(c, Bin::Or, top, r));
-            }
+            Shape::Half(_, src, mask, ident, hi) => return self.reduce_half(src, mask, ident, hi),
         };
         // A mesh program's lanes are numbered as the console's, its host
         // waves are not the console's: only a minimum or maximum (the loop
@@ -1500,7 +1495,10 @@ impl<'a> Lower<'a> {
             .masks
             .get(&mask)
             .ok_or("a wave reduction's untracked mask")?;
-        let on = self.boolean(m, c)?;
+        let mut on = self.boolean(m, c)?;
+        if let Some(active) = self.pred_active(self.cur_ir) {
+            on = self.s.m.bin(c, Bin::And, on, active);
+        }
         let x = self.i32_of(src)?;
         let id = self.s.m.i32(ident);
         let x = self.s.m.select(c, on, x, id);
@@ -1588,6 +1586,9 @@ impl<'a> Lower<'a> {
             self.rpo[b] = n;
         }
         for (n, &b) in order.iter().enumerate() {
+            if self.pred.dead_blocks.contains(&b) {
+                continue;
+            }
             self.block[b] = Some(if n == 0 {
                 self.s.entry
             } else {
@@ -1596,6 +1597,9 @@ impl<'a> Lower<'a> {
         }
         // Loop headers count iterations (`LOOP_LIMIT`).
         for &b in &order {
+            if self.block[b].is_none() {
+                continue;
+            }
             let header = p.blocks[b]
                 .preds
                 .iter()
@@ -1618,7 +1622,8 @@ impl<'a> Lower<'a> {
             self.block[order[0]] = Some(self.cur);
         }
         for &b in &order {
-            self.cur = self.block[b].expect("reachable");
+            let Some(blk) = self.block[b] else { continue };
+            self.cur = blk;
             self.cur_ir = b;
             let preds: Vec<usize> = p.blocks[b]
                 .preds
@@ -1627,22 +1632,27 @@ impl<'a> Lower<'a> {
                 .filter(|&q| self.block[q].is_some())
                 .collect();
             self.exported[b] = !preds.is_empty() && preds.iter().all(|&q| self.exported_out(q));
-            for (i, phi) in p.blocks[b].phis.iter().enumerate() {
-                let val = match phi.reg {
-                    Reg::S(c) if c == EXEC || c == EXEC + 1 => Val::Missing("a lane mask"),
-                    _ if self.bad.contains_key(&phi.value) => Val::Missing(self.bad[&phi.value]),
-                    Reg::Scc => {
-                        let v = self.s.m.phi(self.cur, self.s.t.i1);
-                        self.data_phis.push((v, b, i));
-                        Val::Bit(v)
-                    }
-                    _ => {
-                        let v = self.s.m.phi(self.cur, self.s.t.i32);
-                        self.data_phis.push((v, b, i));
-                        Val::I32(v)
-                    }
-                };
-                self.vals.insert(phi.value, val);
+            let linear_merge = self.enter_predicated_block(b)?;
+            if !linear_merge {
+                for (i, phi) in p.blocks[b].phis.iter().enumerate() {
+                    let val = match phi.reg {
+                        Reg::S(c) if c == EXEC || c == EXEC + 1 => Val::Missing("a lane mask"),
+                        _ if self.bad.contains_key(&phi.value) => {
+                            Val::Missing(self.bad[&phi.value])
+                        }
+                        Reg::Scc => {
+                            let v = self.s.m.phi(self.cur, self.s.t.i1);
+                            self.data_phis.push((v, b, i));
+                            Val::Bit(v)
+                        }
+                        _ => {
+                            let v = self.s.m.phi(self.cur, self.s.t.i32);
+                            self.data_phis.push((v, b, i));
+                            Val::I32(v)
+                        }
+                    };
+                    self.vals.insert(phi.value, val);
+                }
             }
             let mut i = 0;
             self.mode16 = self.round16[b];
@@ -2275,14 +2285,26 @@ impl<'a> Lower<'a> {
                 let single_half = self.halves && self.one_host_wave();
                 let across = self.halves && !single_half;
                 if across {
-                    at = self.across_at(def).ok_or(halves::MASK_ACROSS)?;
+                    match self.across_at(def) {
+                        Some(a) => at = a,
+                        None => {
+                            if let Ok(xy) = self.mask_number(lo) {
+                                self.ballots.insert(lo, xy);
+                                return Ok(if high { xy.1 } else { xy.0 });
+                            }
+                            return Err(halves::MASK_ACROSS);
+                        }
+                    }
                 }
                 if !self.balloting.insert(lo) {
                     return Err("a lane mask whose lanes depend on its own value");
                 }
                 let bit = self.boolean(m, at);
                 self.balloting.remove(&lo);
-                let bit = bit?;
+                let mut bit = bit?;
+                if let Some(active) = def.and_then(|b| self.pred_active(b)) {
+                    bit = self.s.m.bin(at, Bin::And, bit, active);
+                }
                 let xy = if across {
                     self.ballot_across_halves(bit, at)?
                 } else {
@@ -3115,6 +3137,9 @@ impl<'a> Lower<'a> {
                     .phi_at
                     .get(&id)
                     .ok_or("a lane-mask join without a phi")?;
+                if self.pred.linear_merges.contains(&b) || self.pred.skip_joins.contains_key(&b) {
+                    return self.predicated_mask_phi(id, b, i, at);
+                }
                 let blk = self.block[b].ok_or("an unreachable join")?;
                 let v = self.s.m.phi(blk, self.s.t.i1);
                 self.mask_phis.insert(id, v);
@@ -3243,10 +3268,16 @@ impl<'a> Lower<'a> {
     }
 
     fn guard(&mut self, b: usize, i: usize) -> Result<Option<V>, Why> {
-        match self.x.st.guards[b][i] {
-            None => Ok(None),
-            Some(g) => Ok(Some(self.boolean(g, self.cur)?)),
-        }
+        let base = match self.x.st.guards[b][i] {
+            None => None,
+            Some(g) => Some(self.boolean(g, self.cur)?),
+        };
+        Ok(match (base, self.pred_active(b)) {
+            (Some(g), Some(a)) => Some(self.s.m.bin(self.cur, Bin::And, g, a)),
+            (Some(g), None) => Some(g),
+            (None, Some(a)) => Some(a),
+            (None, None) => None,
+        })
     }
 
     /// Whether every lane outside the guard of the export at (b, i) runs
@@ -6518,9 +6549,10 @@ impl<'a> Lower<'a> {
             return r;
         }
         // A scalar result (`v_readlane`, `v_readfirstlane`) is written
-        // whatever EXEC holds.
+        // whatever EXEC holds; `v_readfirstlane_b32` still reads the active
+        // lane predicate to pick its source lane.
         let mut guard = match v.dst {
-            Some(Operand::Scalar { .. }) => None,
+            Some(Operand::Scalar { .. }) if name != "v_readfirstlane_b32" => None,
             _ => self.guard(b, i)?,
         };
         if let Some(d) = v.dpp {
@@ -7475,8 +7507,8 @@ impl<'a> Lower<'a> {
                         return Err(halves::FIRST_ACROSS);
                     }
                     let a = s(self, 0)?;
-                    let r = self.first_lane_across(a)?;
-                    return int(self, r);
+                    let r = self.first_lane_across(a, guard)?;
+                    return self.write_i(inst, r, None);
                 }
                 let a = s(self, 0)?;
                 // shortcut: without console lanes, the first lane of the host
@@ -7493,7 +7525,7 @@ impl<'a> Lower<'a> {
                     &[a],
                 );
                 let r = self.helper_reads_own(a, r);
-                int(self, r)
+                self.write_i(inst, r, None)
             }
             _ => {
                 let r = self.integer(inst, name)?;
@@ -8847,6 +8879,7 @@ impl<'a> Lower<'a> {
         let Some(&interp) = self.interps.get(&site) else {
             return Err("the first half of an interpolation");
         };
+        let mut from_vertex_p0 = false;
         let (attribute, mode) = match interp {
             Interp::Interpolated { unless, .. } if !self.avoids(site, unless) => {
                 return Err("an interpolation with computed barycentrics");
@@ -8867,11 +8900,35 @@ impl<'a> Lower<'a> {
                     Barycentric::PerspectivePullModel => return Err("pull-model interpolation"),
                 },
             ),
-            // P0, the provoking vertex: a flat (nointerpolation) input.
+            // P0, the provoking vertex: a flat (nointerpolation) input, or
+            // perspective-center interpolated for float inputs under
+            // `per_vertex_center` (where P10 and P20 collapse to 0).
             Interp::Vertex {
                 attribute,
                 vertex: 2,
-            } => (attribute, 1),
+            } => {
+                from_vertex_p0 = true;
+                (attribute, 1)
+            }
+            Interp::Vertex {
+                attribute: _,
+                vertex: 0 | 1,
+            } if self.per_vertex_center => {
+                let z = self.s.m.i32(0);
+                if inst.name().ends_with("_f16") {
+                    return self.write_half(inst, z, None);
+                }
+                let dst = match &inst.fields {
+                    Fields::Vintrp { dst, .. } => *dst,
+                    Fields::Valu(v) => v.dst.ok_or("an interpolation")?,
+                    _ => unreachable!(),
+                };
+                let Operand::Vector { reg, .. } = dst else {
+                    return Err("an interpolation");
+                };
+                self.write(inst, Reg::V(reg), z, None);
+                return Ok(());
+            }
             Interp::Vertex {
                 attribute,
                 vertex: vertex @ (0 | 1),
@@ -8892,10 +8949,28 @@ impl<'a> Lower<'a> {
                 .find_input(row, ch)
                 .ok_or("an input the signature lacks")?;
             let e = &mut l.s.inputs[id];
-            if e.interp != mode && e.usage != 0 {
-                return Err("one input interpolated two ways");
+            let want = if from_vertex_p0 && l.per_vertex_center {
+                if e.comp == 9 {
+                    if e.usage != 0 && e.interp != 0 {
+                        e.interp
+                    } else {
+                        2
+                    }
+                } else {
+                    1
+                }
+            } else {
+                mode
+            };
+            if e.interp != want && e.usage != 0 {
+                if l.per_vertex_center && e.comp == 9 && e.interp == 2 && want != 1 {
+                    e.interp = want;
+                } else {
+                    return Err("one input interpolated two ways");
+                }
+            } else {
+                e.interp = want;
             }
-            e.interp = mode;
             match l.load_any_input(id, col) {
                 Val::I32(x) => Ok(x),
                 _ => Err("an input"),
@@ -8937,8 +9012,9 @@ impl<'a> Lower<'a> {
                     // picks the destination half.
                     let lo = self.half_modifiers(inst, lo);
                     return self.write_half(inst, lo, None);
-                } else if mode == 1 {
-                    // The whole dword of a flat input: both halves.
+                } else if mode == 1 || (self.per_vertex_center && from_vertex_p0) {
+                    // The whole dword of a flat (or center-approximated P0)
+                    // 16-bit input: both halves.
                     let z = self.s.m.i32(0);
                     let lo = half(self, h)?.unwrap_or(z);
                     let hi = half(self, h + 1)?.unwrap_or(z);
@@ -11020,6 +11096,10 @@ impl<'a> Lower<'a> {
     }
 
     fn exit(&mut self, b: usize) -> Result<(), Stop> {
+        if let Some(term) = self.exit_predicated_block(b)? {
+            self.s.m.terminate(self.cur, term);
+            return Ok(());
+        }
         let offset = self.x.p.blocks[b]
             .insts
             .last()
@@ -11707,6 +11787,9 @@ impl<'a> Lower<'a> {
             let bit = phi.reg == Reg::Scc;
             let mut incoming = Vec::new();
             for (n, &q) in p.blocks[b].preds.iter().enumerate() {
+                if self.pred.skipped_edges.contains(&(q, b)) {
+                    continue;
+                }
                 let Some(qb) = self.tail[q] else { continue };
                 let qb = self.edges.get(&(q, b)).copied().unwrap_or(qb);
                 let arg = phi.args[n];
@@ -11766,6 +11849,9 @@ impl<'a> Lower<'a> {
             let offset = p.blocks[b].offset;
             let mut incoming = Vec::new();
             for (n, &q) in p.blocks[b].preds.iter().enumerate() {
+                if self.pred.skipped_edges.contains(&(q, b)) {
+                    continue;
+                }
                 let Some(qb) = self.tail[q] else { continue };
                 let qb = self.edges.get(&(q, b)).copied().unwrap_or(qb);
                 let arg = phi.args[n];
@@ -11786,6 +11872,7 @@ impl<'a> Lower<'a> {
             }
             self.s.m.set_phi(v, incoming);
         }
+        self.fill_predicated_phis();
         Ok(())
     }
 }

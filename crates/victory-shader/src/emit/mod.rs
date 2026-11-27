@@ -296,6 +296,44 @@ pub use shader::{
     VIEW_WRITES_BYTES,
 };
 
+/// Whether compute programs with console lanes in groups larger than one host
+/// wave claim aligned console-thread blocks from a group-shared ticket counter
+/// (`VICTORY_THREAD_TICKET=0` reverts to rounding each wave's first flat id
+/// down). Default on: 32-lane hosts can pack 2-D threadgroups into 2-D tiles,
+/// causing two waves to round down to the same base and collide on thread ids.
+pub fn thread_ticket() -> bool {
+    #[cfg(test)]
+    if let Some(enabled) = TEST_THREAD_TICKET.with(|c| c.get()) {
+        return enabled;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        thread_ticket_value(std::env::var_os("VICTORY_THREAD_TICKET").as_deref())
+    })
+}
+
+fn thread_ticket_value(value: Option<&std::ffi::OsStr>) -> bool {
+    value != Some(std::ffi::OsStr::new("0"))
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static TEST_THREAD_TICKET: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn with_thread_ticket<R>(enabled: bool, f: impl FnOnce() -> R) -> R {
+    struct Restore(Option<bool>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            TEST_THREAD_TICKET.with(|c| c.set(self.0));
+        }
+    }
+    let prev = TEST_THREAD_TICKET.with(|c| c.replace(Some(enabled)));
+    let _restore = Restore(prev);
+    f()
+}
+
 /// The loop limit without an override: 2^14.
 pub const DEFAULT_LOOP_LIMIT: u32 = lower::LOOP_LIMIT;
 
@@ -483,6 +521,12 @@ pub struct Options {
     /// answers the undefined level with a size of 0. Off by default. The
     /// translation differs, so the shader cache keys on it.
     pub uav_size_level0: bool,
+    /// Pixel shaders that read non-provoking triangle vertex values
+    /// (`v_interp_mov_f32` of P10/P20) evaluate P10/P20 as zero and
+    /// hardware-interpolate float P0 at pixel center instead of requesting
+    /// `VICTORY_P10`/`VICTORY_P20` inputs from a geometry shader. Used as a
+    /// mesh+pixel fallback where no geometry stage exists.
+    pub per_vertex_center: bool,
 }
 
 /// Metal's limit on a mesh shader's outputs per thread group, in bytes
@@ -1007,14 +1051,14 @@ fn emit_pruned(
         narrow_waves: options.narrow_waves,
         uav_size_level0: options.uav_size_level0,
     };
-    let l = match lower::lower_pruned(&parts(st, res), keep) {
+    let l = match lower::lower_pruned(&parts(st, res), keep, options.per_vertex_center) {
         // Discarded lanes kept on as helpers can read what no surviving
         // lane does (a register only killed lanes skipped writing); such a
         // program kills them as the console does (`structure::killing`).
         Err(_) if !st.discards.is_empty() => {
             let st = structure::killing(p)?;
             let res = resource::track(p, &native.layout, native.stage, Some(&st))?;
-            lower::lower_pruned(&parts(&st, &res), keep)?
+            lower::lower_pruned(&parts(&st, &res), keep, options.per_vertex_center)?
         }
         l => l?,
     };

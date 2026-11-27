@@ -330,6 +330,10 @@ cmd_run() {
         '{schema: 1, kind: "test-matrix", upstream_commit: $commit, hw_model: $model, chip: $chip,
           macos: $macos, gptk: $gptk, setup: $setup, native: $native, wine: $wine, failures: $failed,
           timings: {setup: $ts, native: $tn, wine: $tw}, binaries: $binaries}')
+    # Store and validate the compact form; a pretty-printed result can exceed
+    # the size limit while its compact form does not.
+    result=$(shrink_result "$result") ||
+        die "the result still exceeds $RESULT_MAX_BYTES bytes after trimming; please report this"
     validate_result "$result" "$T_COMMIT" "$T_CHIP" "$T_MACOS" > "$logs/result-errors.txt" ||
         die "the result does not pass the schema (see $logs/result-errors.txt); please report this"
     printf '%s\n' "$result" > "$logs/result.json" || return 1

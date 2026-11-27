@@ -68,6 +68,8 @@ pub(crate) fn all() -> Vec<HleModule> {
     #[cfg(windows)]
     all.push(apu::module());
     #[cfg(windows)]
+    all.push(audio::silent::module());
+    #[cfg(windows)]
     all.push(media::module());
     #[cfg(windows)]
     all.push(dstorage::module());

@@ -31,6 +31,8 @@ use crate::{HleModule, hle_export};
 
 #[cfg(all(windows, feature = "diagnostics"))]
 pub mod capture;
+#[cfg(windows)]
+pub(crate) mod silent;
 
 // The APU heap.
 

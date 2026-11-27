@@ -1039,8 +1039,13 @@ impl HostTexture {
     pub(crate) fn note_state(&self, state: u32) {
         const RENDER_TARGET_UNORDERED_DEPTH_WRITE: u32 = 0x4 | 0x8 | 0x10;
         if state & RENDER_TARGET_UNORDERED_DEPTH_WRITE != 0 {
-            self.gpu_written.store(true, std::sync::atomic::Ordering::Relaxed);
+            self.gpu_written.store(true, std::sync::atomic::Ordering::Release);
         }
+    }
+
+    /// Whether a list has moved this host texture into a GPU write state.
+    pub(crate) fn is_gpu_written(&self) -> bool {
+        self.gpu_written.load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// A heap slot views it for unordered access.
@@ -2222,6 +2227,10 @@ fn hand_out_resource(
         crate::shadow::register(at, resource.data() as u64, desc.width);
     } else if host_desc(&desc).is_some() {
         let at = std::ptr::from_ref::<Resource>(&resource) as usize;
+        LIVE_TEXTURES
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(at);
         let data_at = resource.data() as usize;
         let size = texture_layout(&desc).map_or(0, |t| t.size as usize);
         crate::texback::replaced(data_at, size);
@@ -2229,6 +2238,24 @@ fn hand_out_resource(
         map.entry(data_at as u64).or_default().push(at);
     }
     object::hand_out(RESOURCE, resource, iid, &RESOURCE_IIDS, out)
+}
+
+/// Live title textures (by raw pointer), for fast [`hold`] checks from
+/// background threads before `Resource::drop` frees the allocation.
+#[cfg(windows)]
+static LIVE_TEXTURES: std::sync::Mutex<std::collections::BTreeSet<usize>> =
+    std::sync::Mutex::new(std::collections::BTreeSet::new());
+
+/// Holds title texture `this` alive for work on a background thread. Returns
+/// `None` if `this` is not a live texture or is already being released.
+#[cfg(windows)]
+pub(crate) fn hold(this: This) -> Option<Held> {
+    if this.is_null() {
+        return None;
+    }
+    // `Resource::drop` removes `this` under `LIVE_TEXTURES` before freeing it.
+    let live = LIVE_TEXTURES.lock().unwrap_or_else(|e| e.into_inner());
+    (live.contains(&(this as usize)) && crate::object::try_add_ref(this)).then_some(Held(this))
 }
 
 /// Title textures with a host copy, by the console memory they start at.
@@ -2244,6 +2271,11 @@ static TEXTURES_AT: std::sync::Mutex<std::collections::BTreeMap<u64, Vec<usize>>
 /// so the title cannot free it while the caller uses it.
 #[cfg(windows)]
 pub(crate) struct Held(This);
+
+// SAFETY: owns a COM reference to a live `Resource`; only atomic refcounts and
+// locked/immutable fields are accessed across threads.
+#[cfg(windows)]
+unsafe impl Send for Held {}
 
 #[cfg(windows)]
 impl Held {
@@ -2330,6 +2362,10 @@ impl Drop for Resource {
         }
         crate::bindless::forget(std::ptr::from_ref::<Resource>(self) as usize);
         if self.desc.dimension != BUFFER {
+            LIVE_TEXTURES
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&(std::ptr::from_ref::<Resource>(self) as usize));
             let address = std::ptr::from_ref::<Resource>(self) as usize;
             crate::texback::released(address);
             let mut map = TEXTURES_AT.lock().unwrap_or_else(|e| e.into_inner());

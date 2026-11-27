@@ -233,7 +233,9 @@ record_verification() { # RESULT TASK_ISSUE FINDING
     sig=$(parse_finding "$(jq -r '.body // ""' <<< "$finding")" | cut -d ' ' -f 1)
     if jq -e --arg s "$sig" 'any(.failures[]; .sig == $s)' > /dev/null <<< "$json"; then
         return 0
-    elif jq -e '.native != null and .wine != null' > /dev/null <<< "$json"; then
+    elif failures_complete "$json"; then
+        # Only a complete failure list proves the signature absent: a trimmed
+        # list may simply have dropped it.
         reply "$f" "Verified in #$task: not seen at $(jq -r '"`\(.upstream_commit[0:12])` on \(.chip), macOS \(.macos)"' <<< "$json")."
     fi
 }

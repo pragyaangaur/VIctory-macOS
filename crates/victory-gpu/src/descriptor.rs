@@ -125,6 +125,20 @@ impl Heap {
         let index = at / step;
         (index < u64::from(self.desc.count)).then_some(index as u32)
     }
+
+    /// The descriptor handle for title slot `index` in this heap, if in range.
+    #[cfg(windows)]
+    pub(crate) fn handle(&self, index: u32) -> Option<u64> {
+        let step = u64::from(increment(self.desc.kind)?);
+        (index < self.desc.count).then(|| self.start + u64::from(index) * step)
+    }
+
+    /// The host heap if it has already been created (never allocates or calls
+    /// `Host::quiet`).
+    #[cfg(windows)]
+    pub(crate) fn made_host(&self) -> Option<&host::HostHeap> {
+        self.host.get()?.as_ref()
+    }
 }
 
 const VIEWS_KIND: u32 = 0;
@@ -337,6 +351,52 @@ pub(crate) fn sync_heaps() {
 /// they view as used (`crate::resource::evict`).
 #[cfg(windows)]
 pub(crate) fn make_read(slots: &[u32]) {
+    if crate::heap_worker::on() {
+        let frame = crate::queue::presented();
+        let mut kick_heaps: Vec<usize> = Vec::new();
+        let mut sync_uavs: Vec<(usize, u32)> = Vec::new();
+        {
+            let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
+            for &(_, _, at) in heaps.iter() {
+                // SAFETY: registered heaps are live (removed when dropped).
+                let heap = unsafe { &*(at as *const Heap) };
+                let Some(host) = heap.made_host() else {
+                    continue;
+                };
+                if heap.desc.kind != VIEWS_KIND {
+                    continue;
+                }
+                let mut unmade = Vec::new();
+                for &i in slots.iter().filter(|&&i| i < heap.desc.count) {
+                    host.stamp_read(i);
+                    match host.unmade_read_kind(i) {
+                        host::UnmadeRead::None => {}
+                        host::UnmadeRead::Background => unmade.push(i),
+                        host::UnmadeRead::Sync => sync_uavs.push((at, i)),
+                    }
+                }
+                if !unmade.is_empty() {
+                    host.prioritize_texture_slots(&unmade, frame);
+                    kick_heaps.push(at);
+                }
+            }
+            for (at, i) in sync_uavs {
+                // SAFETY: registered heaps are live under `SHADER_HEAPS`.
+                let heap = unsafe { &*(at as *const Heap) };
+                if let (Some(host), Some(handle)) = (heap.made_host(), heap.handle(i)) {
+                    host.mirror(i, handle, true);
+                    host.stamp_read(i);
+                }
+            }
+            // Kick while holding `SHADER_HEAPS.read()` so each heap stays live
+            // while `kick` increments its refcount (never locks `Host::submitted`).
+            for at in kick_heaps {
+                // SAFETY: registered heaps are live under `SHADER_HEAPS`.
+                crate::heap_worker::kick(unsafe { &*(at as *const Heap) });
+            }
+        }
+        return;
+    }
     // The placed textures those slots view are made first, without the
     // heaps' lock, which every title thread writing a view waits on (making
     // a texture takes up to milliseconds; title threads waited 1-6 s a frame,
@@ -373,6 +433,29 @@ pub(crate) fn make_read(slots: &[u32]) {
         for &i in slots.iter().filter(|&&i| i < heap.desc.count) {
             host.mirror(i, start + u64::from(i) * u64::from(step), true);
             host.stamp_read(i);
+        }
+    }
+}
+
+/// Wakes the background heap worker for any shader-visible view heap that has
+/// queued texture slots or tracked bindless textures.
+#[cfg(windows)]
+pub(crate) fn kick_worker_heaps() {
+    if !crate::heap_worker::on() {
+        return;
+    }
+    let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
+    for &(_, _, at) in heaps.iter() {
+        // SAFETY: registered heaps are live under `SHADER_HEAPS`.
+        let heap = unsafe { &*(at as *const Heap) };
+        if heap.desc.kind != VIEWS_KIND {
+            continue;
+        }
+        let Some(host) = heap.made_host() else {
+            continue;
+        };
+        if host.has_queued_textures() || host.viewed.has_textures() {
+            crate::heap_worker::kick(heap);
         }
     }
 }
@@ -990,6 +1073,24 @@ pub(crate) fn view(handle: u64) -> Option<ViewPin> {
     // SAFETY: the handle is a descriptor slot the title passes back.
     let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
     (tag == VIEW_TAG).then(|| view_at(i, generation)).flatten()
+}
+
+/// The view recorded at `handle` and the `(generation << 32) | index` key that
+/// identifies that specific record (`host::HostHeap::publish`).
+#[cfg(any(windows, test))]
+pub(crate) fn view_and_key(handle: u64) -> Option<(ViewPin, u64)> {
+    if handle == 0 {
+        return None;
+    }
+    // SAFETY: as in `view`.
+    let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
+    if tag != VIEW_TAG {
+        return None;
+    }
+    Some((
+        view_at(i, generation)?,
+        u64::from(generation) << 32 | u64::from(i),
+    ))
 }
 
 /// A description of `N` words, if the title passes one.

@@ -610,9 +610,15 @@ type Array = *mut Instance<StatusArray>;
 extern "system" fn status_result(this: Array, index: u32) -> HRESULT {
     // SAFETY: an array we created and the title still holds.
     let entries = &unsafe { &*this }.state.entries;
-    entries
+    let result = entries
         .get(index as usize)
-        .map_or(E_INVALIDARG, |e| e.load(Ordering::Acquire))
+        .map_or(E_INVALIDARG, |e| e.load(Ordering::Acquire));
+    if result == E_PENDING
+        && let Some(scheduler) = scheduler()
+    {
+        scheduler.lock().note_poll(index);
+    }
+    result
 }
 
 /// Grand Theft Auto VI polls this (entry 0, a `Sleep(1)` loop) and never
@@ -684,6 +690,15 @@ struct Lanes {
     /// Requests into physical pages.
     pages: u64,
     since: Option<std::time::Instant>,
+    /// When a request last started or finished, or a command was enqueued
+    /// or submitted, and whether the queues being idle since then was said.
+    moved: std::time::Instant,
+    said_idle: Option<std::time::Instant>,
+
+    /// Status entries the title polled while pending, and since when.
+    polls: u64,
+    polling_since: Option<std::time::Instant>,
+    said_polling: bool,
 }
 
 /// A queue's requests in the scheduler.
@@ -704,6 +719,11 @@ struct Lane {
     running: BTreeSet<u64>,
     failures: BTreeMap<u64, HRESULT>,
     closed: bool,
+    /// Since when reads into physical pages wait for the title's Submit.
+    held_since: Option<std::time::Instant>,
+    /// A batch of 64 requests or more waiting, since when: said once it
+    /// finishes, so a load's streaming shows its ends.
+    batch: Option<(usize, std::time::Instant)>,
 }
 
 // SAFETY: requests point into title memory and our own objects, which stay
@@ -745,6 +765,11 @@ fn scheduler() -> Option<&'static Scheduler> {
                     bcpack: Default::default(),
                     pages: 0,
                     since: None,
+                    moved: std::time::Instant::now(),
+                    said_idle: None,
+                    polls: 0,
+                    polling_since: None,
+                    said_polling: false,
                 }),
                 work: Condvar::new(),
                 finished: Condvar::new(),
@@ -766,13 +791,123 @@ fn scheduler() -> Option<&'static Scheduler> {
             })
             .count();
         tracing::info!(workers = started, "dstorage: workers");
+        // A queue the title waits on and nothing fills is invisible
+        // otherwise: requests only log when they finish.
+        let _ = std::thread::Builder::new()
+            .name("dstorage watch".into())
+            .spawn(|| watch(scheduler));
     });
     Some(scheduler)
+}
+
+/// Says what the queues hold when nothing has started or finished for a
+/// while (a wait nothing ends).
+fn watch(scheduler: &'static Scheduler) {
+    loop {
+        std::thread::sleep(std::time::Duration::from_secs(1));
+        let mut lanes = scheduler.lock();
+        lanes.release_held(hold_delay());
+        lanes.report_stuck();
+    }
 }
 
 impl Scheduler {
     fn lock(&self) -> MutexGuard<'_, Lanes> {
         self.lanes.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
+/// How long the queues may hold work with nothing starting or finishing
+/// before the watchdog says what they hold.
+const STUCK: std::time::Duration = std::time::Duration::from_secs(5);
+/// How long the title may poll a pending status entry before that is said.
+const POLLING: std::time::Duration = std::time::Duration::from_secs(2);
+
+impl Lanes {
+    /// A request started or finished, or a command was enqueued or
+    /// submitted: the queues are moving.
+    fn moved(&mut self) {
+        self.moved = std::time::Instant::now();
+        self.said_idle = None;
+        self.polls = 0;
+        self.polling_since = None;
+        self.said_polling = false;
+    }
+
+    /// The title asked for a status entry still pending. Grand Theft Auto VI
+    /// polls entry 0 in a `Sleep(1)` loop and never reads the result, so a
+    /// poll that goes on means the load waits for these reads.
+    fn note_poll(&mut self, index: u32) {
+        self.polls += 1;
+        let since = *self
+            .polling_since
+            .get_or_insert_with(std::time::Instant::now);
+        let held = since.elapsed();
+        if held < POLLING || self.said_polling {
+            return;
+        }
+        self.said_polling = true;
+        tracing::info!(
+            index,
+            polls = self.polls,
+            seconds = format_args!("{:.1}", held.as_secs_f64()),
+            "dstorage: the title polls a status entry that is still pending"
+        );
+        self.say_lanes("a queue holds what the title polls for");
+        // The title is waiting on this entry: whatever reads stand in front
+        // of it must run, or nothing after them ever will.
+        self.release_held(std::time::Duration::ZERO);
+    }
+
+    /// Says what the queues hold when nothing has moved for [`STUCK`], every
+    /// 30 s while it lasts.
+    fn report_stuck(&mut self) {
+        if !self.lanes.values().any(|l| l.entries() > 0) {
+            self.said_idle = None;
+            return;
+        }
+        if self.moved.elapsed() < STUCK {
+            return;
+        }
+        if self
+            .said_idle
+            .is_some_and(|at| at.elapsed() < std::time::Duration::from_secs(30))
+        {
+            return;
+        }
+        self.said_idle = Some(std::time::Instant::now());
+        self.say_lanes("no request started or finished");
+    }
+
+    /// One info line per queue with work left, with the ages that say what
+    /// it waits for: `why` names the wait.
+    fn say_lanes(&self, why: &str) {
+        let idle = self.moved.elapsed().as_secs_f64() * 1e3;
+        for (&id, lane) in &self.lanes {
+            if lane.entries() == 0 {
+                continue;
+            }
+            let held_ms = lane
+                .held_since
+                .map_or(0.0, |t| t.elapsed().as_secs_f64() * 1e3);
+            let batch = lane.batch.map(|(n, _)| n).unwrap_or(0);
+            tracing::info!(
+                queue = id,
+                class = lane.class,
+                capacity = lane.capacity,
+                unsubmitted = lane.unsubmitted.len(),
+                held = lane.held.len(),
+                reads = lane.reads.len(),
+                statuses = lane.statuses.len(),
+                running = lane.running.len(),
+                failures = lane.failures.len(),
+                batch,
+                held_ms,
+                staged_mb = format_args!("{:.1}", self.staged as f64 / 1e6),
+                idle_ms = format_args!("{:.0}", idle),
+                "dstorage: {why}"
+            );
+        }
     }
 }
 
@@ -871,6 +1006,7 @@ impl Lanes {
         self.clock[class] += size * COST[class];
         self.lane_now[class] = lane.clock;
         lane.clock += size;
+        self.moved();
         Some(Job {
             lane: id,
             seq,
@@ -887,23 +1023,53 @@ impl Lanes {
                 lane.failures.insert(job.seq, hr);
             }
             lane.flush();
+            if lane.entries() == 0
+                && let Some((requests, at)) = lane.batch.take()
+            {
+                tracing::info!(
+                    requests,
+                    seconds = format_args!("{:.1}", at.elapsed().as_secs_f64()),
+                    "dstorage: a batch of reads finished"
+                );
+            }
         }
+        self.moved();
     }
 
     /// Moves a queue's enqueued commands to the workers (the title's
     /// Submit).
     fn submit(&mut self, id: u64) {
-        self.submit_as(id, true);
+        self.submit_as(id, By::Title);
     }
 
-    /// As [`Lanes::submit`]; `explicit` false when a half-full queue submits
+    /// Starts the reads a queue has held for the title's Submit for longer
+    /// than `older`: a Submit that never comes is a load that never
+    /// finishes, and the console's hardware would have run them already.
+    fn release_held(&mut self, older: std::time::Duration) {
+        let ids: Vec<u64> = self
+            .lanes
+            .iter()
+            .filter(|(_, l)| {
+                !l.held.is_empty() && l.held_since.is_some_and(|t| t.elapsed() >= older)
+            })
+            .map(|(&id, _)| id)
+            .collect();
+        for id in ids {
+            self.submit_as(id, By::Late);
+        }
+    }
+
+    /// As [`Lanes::submit`]; [`By::Auto`] when a half-full queue submits
     /// itself, which leaves reads into physical pages for the title's
     /// Submit: their page lists point into the title's page table, which
     /// Grand Theft Auto VI fills for the batch in its own submit path, right
     /// before Submit (`sub_1400e88f0`), so until then they name no page or a
     /// page that now holds something else. A status entry behind a held
-    /// read waits with it.
-    fn submit_as(&mut self, id: u64, explicit: bool) {
+    /// read waits with it, so a Submit that never comes holds the status the
+    /// title polls. [`By::Late`] starts them anyway once
+    /// [`VICTORY_DSTORAGE_HOLD_MS`] has passed; a list the title has not
+    /// filled yet is read again there (`into_destination`).
+    fn submit_as(&mut self, id: u64, by: By) {
         let Some(class) = self.lanes.get(&id).map(|l| l.class) else {
             return;
         };
@@ -922,19 +1088,35 @@ impl Lanes {
         if lane.reads.is_empty() {
             lane.clock = lane.clock.max(self.lane_now[class]);
         }
+        let explicit = by != By::Auto;
         let mut commands = if explicit {
             std::mem::take(&mut lane.held)
         } else {
             Vec::new()
         };
+        if !commands.is_empty() {
+            let held = commands.len();
+            let waited = lane
+                .held_since
+                .take()
+                .map_or(0.0, |t| t.elapsed().as_secs_f64() * 1e3);
+            tracing::info!(
+                held,
+                waited_ms = waited,
+                by = by.name(),
+                "dstorage: reads held for a Submit start"
+            );
+        }
         commands.append(&mut lane.unsubmitted);
+        let hold_page_reads = by == By::Auto && hold_delay() > std::time::Duration::ZERO;
         for command in commands {
-            let hold = !explicit
+            let hold = hold_page_reads
                 && match &command {
                     Command::Read(r) => r.options & PAGE_DESTINATION != 0,
                     Command::Status(_) => !lane.held.is_empty(),
                 };
             if hold {
+                lane.held_since.get_or_insert_with(std::time::Instant::now);
                 lane.held.push(command);
                 continue;
             }
@@ -946,6 +1128,8 @@ impl Lanes {
             }
         }
         lane.flush();
+        lane.note_batch();
+        self.moved();
     }
 }
 
@@ -962,6 +1146,8 @@ impl Lane {
             running: BTreeSet::new(),
             failures: BTreeMap::new(),
             closed: false,
+            held_since: None,
+            batch: None,
         }
     }
 
@@ -972,6 +1158,16 @@ impl Lane {
             + self.reads.len()
             + self.statuses.len()
             + self.running.len()
+    }
+
+    /// Remembers a batch of 64 entries or more waiting, to say when it ends.
+    fn note_batch(&mut self) {
+        let entries = self.entries();
+        match &mut self.batch {
+            Some(batch) => batch.0 = batch.0.max(entries),
+            None if entries >= 64 => self.batch = Some((entries, std::time::Instant::now())),
+            None => {}
+        }
     }
 
     /// Writes the status entries whose earlier reads have all finished.
@@ -1076,6 +1272,43 @@ enum Command {
     Status(Status),
 }
 
+/// What moved a queue's commands to the workers.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum By {
+    /// The title's `Submit`.
+    Title,
+    /// The queue submitting itself once half full.
+    Auto,
+    /// Held for a Submit that did not come; started once the hold passed.
+    Late,
+}
+
+impl By {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Title => "the title's Submit",
+            Self::Auto => "the queue itself",
+            Self::Late => "the hold's delay",
+        }
+    }
+}
+
+/// How long reads into physical pages wait for the title's Submit before
+/// they start anyway. `VICTORY_DSTORAGE_HOLD_MS`, 0 for as the queue
+/// submits itself.
+fn hold_delay() -> std::time::Duration {
+    static DELAY: OnceLock<std::time::Duration> = OnceLock::new();
+    *DELAY.get_or_init(|| {
+        std::env::var("VICTORY_DSTORAGE_HOLD_MS")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .map_or(
+                std::time::Duration::from_secs(2),
+                std::time::Duration::from_millis,
+            )
+    })
+}
+
 /// A status entry to write, holding a reference on its array.
 struct Status {
     array: Array,
@@ -1155,9 +1388,10 @@ fn queue(this: QueueRef, command: Command) {
         return;
     };
     lane.unsubmitted.push(command);
+    lane.note_batch();
     if lane.unsubmitted.len() >= (lane.capacity / 2).max(1) {
         let capacity = lane.capacity;
-        lanes.submit_as(id, false);
+        lanes.submit_as(id, By::Auto);
         scheduler.work.notify_all();
         let held = lanes.lanes.get(&id).map_or(0, |l| l.held.len());
         let n = AUTO_SUBMITS.fetch_add(1, Ordering::Relaxed) + 1;
@@ -1170,6 +1404,8 @@ fn queue(this: QueueRef, command: Command) {
             );
         }
     }
+    // Enqueuing is progress too: a batch of 2,000 takes a while to build.
+    lanes.moved();
 }
 
 extern "system" fn submit(this: QueueRef) {
@@ -2106,6 +2342,11 @@ mod tests {
             bcpack: Default::default(),
             pages: 0,
             since: None,
+            moved: std::time::Instant::now(),
+            said_idle: None,
+            polls: 0,
+            polling_since: None,
+            said_polling: false,
         }
     }
 
@@ -2404,7 +2645,7 @@ mod tests {
             .unwrap()
             .unsubmitted
             .push(Command::Status(Status { array, index: 0 }));
-        l.submit_as(0, false);
+        l.submit_as(0, By::Auto);
         // Only the plain read starts; the status waits behind the held one.
         let plain = l.start().unwrap();
         assert_eq!(plain.request.options, 0);
@@ -2418,6 +2659,58 @@ mod tests {
         assert!(!l.lanes[&0].statuses.is_empty());
         l.finish(&paged, Ok(()));
         assert!(l.lanes[&0].statuses.is_empty());
+    }
+
+    /// A queue that submitted itself, holding a read into pages and the
+    /// status behind it, after its plain read ran.
+    fn held_page_read() -> Lanes {
+        let mut l = lanes(STAGING);
+        l.lanes.insert(0, Lane::new(0, 64));
+        let array = status_array(1).cast::<Instance<StatusArray>>();
+        read(&mut l, 0, PAGE_DESTINATION, 16);
+        read(&mut l, 0, 0, 16);
+        add_ref_instance(array);
+        l.lanes
+            .get_mut(&0)
+            .unwrap()
+            .unsubmitted
+            .push(Command::Status(Status { array, index: 0 }));
+        l.submit_as(0, By::Auto);
+        let plain = l.start().unwrap();
+        l.finish(&plain, Ok(()));
+        assert_eq!(l.lanes[&0].held.len(), 2);
+        assert!(l.lanes[&0].held_since.is_some());
+        l
+    }
+
+    #[test]
+    fn held_reads_start_once_the_hold_has_passed() {
+        let mut l = held_page_read();
+        // Not yet: the hold has not passed.
+        l.release_held(Duration::from_secs(3600));
+        assert_eq!(l.lanes[&0].held.len(), 2);
+        assert!(l.start().is_none());
+        // The Submit never came: they start anyway.
+        l.release_held(Duration::ZERO);
+        assert!(l.lanes[&0].held.is_empty());
+        let paged = l.start().unwrap();
+        assert_eq!(paged.request.options, PAGE_DESTINATION);
+        l.finish(&paged, Ok(()));
+        assert!(l.lanes[&0].statuses.is_empty());
+    }
+
+    #[test]
+    fn polling_a_pending_status_releases_held_reads() {
+        let mut l = held_page_read();
+        // A first poll only starts the clock.
+        l.note_poll(0);
+        assert_eq!(l.lanes[&0].held.len(), 2);
+        // Polled for longer than POLLING: the title waits for these reads.
+        l.polling_since = Some(Instant::now() - POLLING);
+        l.note_poll(0);
+        assert!(l.lanes[&0].held.is_empty());
+        let paged = l.start().unwrap();
+        assert_eq!(paged.request.options, PAGE_DESTINATION);
     }
 
     #[test]

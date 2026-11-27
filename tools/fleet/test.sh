@@ -104,7 +104,7 @@ eq "result" result "$(parse_command "/result")"
 # --- results
 good=$(jq -cn --arg c "$SHA" '{schema: 1, kind: "test-matrix", upstream_commit: $c, hw_model: "Mac15,12",
     chip: "Apple M3 Pro", macos: "15.4.1", gptk: "3.0", setup: "ok",
-    native: {passed: 300, failed: 0, ignored: 2}, wine: {passed: 340, failed: 3, ignored: 0},
+    native: {passed: 300, failed: 0, ignored: 2}, wine: {passed: 340, failed: 1, ignored: 0},
     failures: [{test: "wine/victory_gpu::tests::depth16", sig: "0123456789ab", topic: "gpu"}],
     timings: {setup: 61, native: 42, wine: 130},
     binaries: [{suite: "native", name: "victory_gpu", seconds: 1.25}, {suite: "wine", name: "victory_gpu", seconds: 20.5}]}')
@@ -164,6 +164,88 @@ ok "failing result" result_failing "$good"
 no "passing result" result_failing "$(jq -c '.wine.failed = 0' <<< "$good")"
 ok "setup failure is failing" result_failing "$(jq -c '.setup = "failed" | .native = null | .wine = null' <<< "$good")"
 eq "validation error text" "upstream_commit is not the task commit" "$(validate_result "$good" "${SHA%7}8" m3 || true)"
+
+# --- result size: compact before validating, shrink when even compact is too big
+mk_report() { # NFAILURES NBINARIES -> pretty-printed result JSON, as cmd_run builds it
+    jq -n --arg c "$SHA" --argjson nf "$1" --argjson nb "$2" '
+        {schema: 1, kind: "test-matrix", upstream_commit: $c, hw_model: "Mac15,12",
+         chip: "Apple M3 Pro", macos: "15.4.1", gptk: "3.0", setup: "ok",
+         native: {passed: 300, failed: 40, ignored: 2}, wine: {passed: 340, failed: 50, ignored: 0},
+         failures: [range($nf) | {test: "native/victory_gpu::tests::t\(.)", sig: "0123456789ab", topic: "gpu"}],
+         timings: {setup: 61, native: 42, wine: 130},
+         binaries: [range($nb) | {suite: "native", name: "victory_gpu_\(.)", seconds: 12.5}]}'
+}
+eq "a small result is only compacted" "$(jq -c . <<< "$good")" "$(shrink_result "$good")"
+# 55 failures + 26 binaries: pretty over 8000 bytes, compact under it.
+r55=$(mk_report 55 26)
+c55=$(jq -c . <<< "$r55")
+ok "55-failure report is over the limit pretty" test "$(byte_len "$r55")" -gt "$RESULT_MAX_BYTES"
+ok "55-failure report fits when compact" test "$(byte_len "$c55")" -le "$RESULT_MAX_BYTES"
+s55=$(shrink_result "$r55")
+eq "55-failure report is only compacted" "$c55" "$s55"
+ok "compact 55-failure report validates" validate_result "$s55" "$SHA" m3
+eq "all 55 failures kept" 55 "$(jq '.failures | length' <<< "$s55")"
+eq "all 26 binaries kept" 26 "$(jq '.binaries | length' <<< "$s55")"
+# 90 failures + 26 binaries: over 8000 bytes even compact.
+r90=$(mk_report 90 26)
+c90=$(jq -c . <<< "$r90")
+ok "90-failure report is over the limit even compact" test "$(byte_len "$c90")" -gt "$RESULT_MAX_BYTES"
+s90=$(shrink_result "$r90")
+ok "90-failure report shrunk to the limit" test "$(byte_len "$s90")" -le "$RESULT_MAX_BYTES"
+ok "shrunk 90-failure report validates" validate_result "$s90" "$SHA" m3
+eq "native counts preserved" '{"passed":300,"failed":40,"ignored":2}' "$(jq -c .native <<< "$s90")"
+eq "wine counts preserved" '{"passed":340,"failed":50,"ignored":0}' "$(jq -c .wine <<< "$s90")"
+ok "binaries dropped to fit" test "$(jq '.binaries | length' <<< "$s90")" -lt 26
+# 100 failures and no binaries: dropping binaries is not enough, trim the tail.
+r100=$(mk_report 100 0)
+c100=$(jq -c . <<< "$r100")
+ok "100-failure report is over the limit with no binaries" test "$(byte_len "$c100")" -gt "$RESULT_MAX_BYTES"
+s100=$(shrink_result "$r100")
+ok "100-failure report trimmed to the limit" test "$(byte_len "$s100")" -le "$RESULT_MAX_BYTES"
+ok "trimmed 100-failure report validates" validate_result "$s100" "$SHA" m3
+ok "failures trimmed from the tail" test "$(jq '.failures | length' <<< "$s100")" -lt 100
+eq "first failure kept" "native/victory_gpu::tests::t0" "$(jq -r '.failures[0].test' <<< "$s100")"
+
+# --- the limit is in bytes, not characters: multi-byte UTF-8 at the boundary
+# (the test runs in a UTF-8 locale, where ${#var} would undercount).
+eq "é is two bytes" 2 "$(byte_len é)"
+eq "€ is three bytes" 3 "$(byte_len €)"
+mb8000=$(printf 'é%.0s' $(seq 1 4000))          # 4000 characters, 8000 bytes
+eq "4000 é are 8000 bytes" 8000 "$(byte_len "$mb8000")"
+eq "8000 bytes passes the size check (fails later as JSON)" "result is not valid JSON" \
+    "$(validate_result "$mb8000" "$SHA" m3 || true)"
+mb8001="$mb8000"x                                # 4001 characters, 8001 bytes
+eq "8001 bytes is over the limit" "result is larger than $RESULT_MAX_BYTES bytes" \
+    "$(validate_result "$mb8001" "$SHA" m3 || true)"
+mb3_8000="$(printf '€%.0s' $(seq 1 2666))ab"     # 2668 characters, 8000 bytes
+eq "2666 € plus ab are 8000 bytes" 8000 "$(byte_len "$mb3_8000")"
+eq "8000 bytes of three-byte characters pass the size check" "result is not valid JSON" \
+    "$(validate_result "$mb3_8000" "$SHA" m3 || true)"
+mb3_8001="$(printf '€%.0s' $(seq 1 2667))"        # 2667 characters, 8001 bytes
+eq "8001 bytes of three-byte characters is over the limit" "result is larger than $RESULT_MAX_BYTES bytes" \
+    "$(validate_result "$mb3_8001" "$SHA" m3 || true)"
+# shrink_result measures bytes too: a pad of two-byte characters decides the boundary.
+pad_json() { # PAD -> {"failures":[],"binaries":[],"pad":PAD}; the fixed part is 38 bytes
+    jq -cn --arg p "$1" '{failures: [], binaries: [], pad: $p}'
+}
+p8000=$(pad_json "$(printf 'é%.0s' $(seq 1 3981))")   # 38 + 2*3981 = 8000 bytes
+p8001=$(pad_json "$(printf 'é%.0s' $(seq 1 3981))x")  # 8001 bytes
+eq "pad result is exactly 8000 bytes" 8000 "$(byte_len "$p8000")"
+eq "pad result is exactly 8001 bytes" 8001 "$(byte_len "$p8001")"
+eq "an 8000-byte result is kept as is" "$p8000" "$(shrink_result "$p8000")"
+no "an 8001-byte result with nothing left to trim fails" shrink_result "$p8001"
+# Trimming with a multi-byte pad stops at the byte limit and keeps the pad.
+pad_fail() { # NFAILURES PAD -> result-shaped JSON with a pad field
+    jq -cn --arg p "$2" --argjson n "$1" '{failures: [range($n) |
+        {test: "native/victory_gpu::tests::t\(.)", sig: "0123456789ab", topic: "gpu"}],
+        binaries: [], pad: $p}'
+}
+pf=$(pad_fail 30 "$(printf 'é%.0s' $(seq 1 3500))")   # 7000-byte pad plus 30 failures
+ok "multi-byte pad plus failures is over the limit" test "$(byte_len "$pf")" -gt "$RESULT_MAX_BYTES"
+s_pf=$(shrink_result "$pf")
+ok "multi-byte result is trimmed to the byte limit" test "$(byte_len "$s_pf")" -le "$RESULT_MAX_BYTES"
+ok "trimming kept the leading failures" test "$(jq '.failures | length' <<< "$s_pf")" -gt 0
+eq "the multi-byte pad survives trimming" "$(jq -r .pad <<< "$pf")" "$(jq -r .pad <<< "$s_pf")"
 
 # --- moderation
 verdict() { moderate "$1" | cut -d ' ' -f 1; }
@@ -298,10 +380,32 @@ eq "time limit default with few samples" 6 "$(printf '3600\n3600\n' | time_limit
 eq "time limit from the 90th percentile" 6 "$(printf '3600\n3600\n7200\n' | time_limit_hours 6)"
 eq "time limit at least 2 hours" 2 "$(printf '60\n60\n60\n' | time_limit_hours 6)"
 eq "time limit at most 12 hours" 12 "$(printf '90000\n90000\n90000\n' | time_limit_hours 6)"
-clean=$(jq -c '.failures = []' <<< "$good")
+clean=$(jq -c '.failures = [] | .wine.failed = 0' <<< "$good")
 eq "flaky: one run saw it, the other did not" 0123456789ab "$(flaky_sigs "$good" "$clean")"
 eq "flaky: same failures" "" "$(flaky_sigs "$good" "$good")"
 eq "flaky: a suite did not run" "" "$(flaky_sigs "$good" "$(jq -c '.wine = null' <<< "$clean")")"
+# A trimmed report lists fewer failures than the suite's failed count, so it
+# proves neither disagreement (flaky) nor absence (Verified).
+trimmed=$(jq -c '.wine.failed = 3' <<< "$clean")
+ok "a complete failure list is complete" failures_complete "$good"
+no "a trimmed failure list is incomplete" failures_complete "$trimmed"
+verify_reply() {
+    GITHUB_REPOSITORY=example/VIctory-macOS bash -c '
+        set -euo pipefail
+        eval "$(sed "/^case \"\${1:-}\"/,\$d" "$0")"
+        api() { jq -n --arg body "$FINDING_BODY" "{user:{login:\"github-actions[bot]\"}, body:\$body}"; }
+        reply() { printf "%s:%s\n" "$1" "$2"; }
+        record_verification "$1" 99 42
+    ' "$FLEET_DIR/queue.sh" "$1"
+}
+FINDING_BODY=$(printf '<!-- fleet-finding\nsig: 0123456789ab\ntest: wine/victory_gpu::tests::depth16\ntopic: gpu\n-->\n')
+export FINDING_BODY
+eq "record_verification posts Verified on a complete clean report" "42:Verified in #99: not seen at \`0123456789ab\` on Apple M3 Pro, macOS 15.4.1." "$(verify_reply "$clean")"
+eq "record_verification stays silent on a trimmed report" "" "$(verify_reply "$trimmed")"
+unset FINDING_BODY
+eq "flaky: a trimmed report is not disagreement" "" "$(flaky_sigs "$good" "$trimmed")"
+eq "flaky: both reports trimmed is not disagreement" "" "$(flaky_sigs "$trimmed" "$trimmed")"
+eq "flaky: a complete run against a trimmed one is not disagreement" "" "$(flaky_sigs "$clean" "$trimmed")"
 
 # --- report
 r1=$(jq -c '. + {n: 1, closed: "2026-11-20T10:00:00Z", worker: "alice"}' <<< "$good")
@@ -311,6 +415,9 @@ report=$(printf '%s\n%s\n%s\n' "$r1" "$r2" "$r3" | report_markdown)
 ok "report counts results" grep -q '^3 accepted results across 1 commits' <<< "$report"
 ok "report coverage" grep -q '3 of 5: m1, m2, m3 | 2 of 3' <<< "$report"
 ok "report chip-specific failure" grep -q 'victory_gpu::tests::depth16` (gpu, sig `0123456789ab`): fails on m3; passes on m1' <<< "$report"
+r2_trimmed=$(jq -c '. + {n: 2, closed: "2026-11-21T10:00:00Z", chip: "Apple M1", hw_model: "MacBookAir10,1", failures: [], wine: {passed: 243, failed: 100, ignored: 0}}' <<< "$good")
+report_trimmed=$(printf '%s\n%s\n' "$r1" "$r2_trimmed" | report_markdown)
+no "report does not claim pass on a chip with a trimmed failure list" grep -q 'passes on m1' <<< "$report_trimmed"
 ok "report lists every result" grep -q '^| #3 |' <<< "$report"
 ok "report workers" grep -q '^| @alice | 1 | m3 | 0.1 | 2026-11-20 |' <<< "$report"
 ok "report slowest binaries" grep -q 'm3 (`0123456789ab`): wine/victory_gpu 20.5 s' <<< "$report"
@@ -327,6 +434,7 @@ validation_status=$3
 stub_native_status=$4
 stub_wine_status=$5
 git_fail=${6:-none}
+mode=${7:-}
 set -- help
 . "$0" > /dev/null
 CACHE="$case_dir/cache"
@@ -351,7 +459,20 @@ gh() { echo 'unexpected GitHub call' >&2; exit 99; }
 # Replace the heartbeat subshell itself with sleep, so tests leave no sleep child.
 sleep() { exec /bin/sleep 30; }
 kill() { printf '%s\n' "$1" > "$case_dir/killed-pid"; builtin kill "$@"; }
-cargo() { echo 'test result: ok. 1 passed; 0 failed; 0 ignored;'; return "$stub_native_status"; }
+cargo() {
+    echo 'test result: ok. 1 passed; 0 failed; 0 ignored;'
+    if [ "$mode" = oversized ]; then
+        # 120 failures with long names: the result is over the byte limit even
+        # compact, so cmd_run must trim it while keeping signatures.tsv whole.
+        echo '     Running unittests src/lib.rs (target/debug/deps/victory_gpu-0f1e2d3c4b5a6978)'
+        echo 'running 120 tests'
+        for i in $(seq 1 120); do echo "test tests::oversized_padding_t$i ... FAILED"; done
+        echo 'failures:'
+        for i in $(seq 1 120); do printf '\n---- tests::oversized_padding_t%s stdout ----\nboom %s\n' "$i" "$i"; done
+        echo 'test result: FAILED. 0 passed; 120 failed; 0 ignored; 0 measured; 0 filtered out; finished in 12.00s'
+    fi
+    return "$stub_native_status"
+}
 sysctl() { echo Mac15,11; }
 sw_vers() { echo 15.4; }
 brand() { echo 'Apple M3 Max'; }
@@ -360,6 +481,7 @@ say() {
     case "$*" in "running setup.sh"*) jobs -p > "$case_dir/heartbeat-pid" ;; esac
 }
 if [ "$validation_status" != 0 ]; then validate_result() { return 1; }; fi
+if [ "$mode" = shrink-fails ]; then shrink_result() { echo 'stub: cannot fit' >&2; return 1; }; fi
 # Run cmd_run the way cmd_work does, inside an if condition, where set -e
 # does not reach cmd_run's call stack.
 cmd_submit() { echo submitted > "$case_dir/submitted"; }
@@ -375,7 +497,7 @@ EOF
 worker_case() {
     local dir="$tmp/worker-$1" status=0
     mkdir -p "$dir"
-    bash -c '. "$1" "$2" "$3" "$4" "$5" "$6" "$7"' "$FLEET_DIR/fleet.sh" "$tmp/worker-cleanup.sh" "$dir" "$2" "$3" "${6:-0}" "${7:-0}" "${8:-none}" > "$dir/output" 2>&1 || status=$?
+    bash -c '. "$1" "$2" "$3" "$4" "$5" "$6" "$7" "$8"' "$FLEET_DIR/fleet.sh" "$tmp/worker-cleanup.sh" "$dir" "$2" "$3" "${6:-0}" "${7:-0}" "${8:-none}" "${9:-}" > "$dir/output" 2>&1 || status=$?
     eq "worker $1 exit status" "$4" "$status"
     no "worker $1 has no unbound variable" grep -q 'unbound variable' "$dir/output"
     ok "worker $1 ran heartbeat cleanup" test -s "$dir/killed-pid"
@@ -414,6 +536,20 @@ suite_exit_case native-error 101 0 null "$passed_counts"
 suite_exit_case wine-error 0 101 "$passed_counts" null
 suite_exit_case both-error 101 101 null null
 suite_exit_case wine-aborted 0 137 "$passed_counts" null
+
+# An oversized report is trimmed to the byte limit in result.json, but the
+# local signatures.tsv keeps the text behind every signature.
+worker_case oversized 0 0 0 ok 0 0 none oversized
+big="$tmp/worker-oversized/cache/logs/1/result.json"
+ok "oversized result.json fits the byte limit" test "$(byte_len "$(cat "$big")")" -le "$RESULT_MAX_BYTES"
+ok "oversized result.json passes the schema" validate_result "$(cat "$big")" "$SHA" m3
+ok "oversized result.json was trimmed" test "$(jq '.failures | length' < "$big")" -lt 100
+eq "oversized result kept the suite's failed count" 120 "$(jq '.native.failed' < "$big")"
+eq "signatures.tsv keeps every failure locally" 120 "$(wc -l < "$tmp/worker-oversized/cache/logs/1/signatures.tsv" | tr -d '[:space:]')"
+
+# When even a trimmed result cannot fit, cmd_run fails cleanly instead of posting.
+worker_case shrink-fails 0 0 1 unused 0 0 none shrink-fails
+ok "shrink failure says so" grep -q "still exceeds $RESULT_MAX_BYTES bytes" "$tmp/worker-shrink-fails/output"
 
 # A failed checkout must stop cmd_run even when it runs inside an if
 # condition (as in cmd_work), where set -e does not reach it: no heartbeat,

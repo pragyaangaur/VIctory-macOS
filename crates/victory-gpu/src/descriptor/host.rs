@@ -22,6 +22,228 @@ use crate::host::host;
 
 const SYNC_BLOCK_SLOTS: u32 = 128;
 
+thread_local! {
+    /// True while this thread is inside [`HostHeap::publish`], preventing
+    /// `mirror(..., true)` from re-enqueuing the slot being published.
+    static PUBLISHING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+struct PublishingGuard(bool);
+
+impl Drop for PublishingGuard {
+    fn drop(&mut self) {
+        PUBLISHING.set(self.0);
+    }
+}
+
+/// Whether due texture slots in [`UploadQueue`] alternate retries and fresh
+/// slots 1:1 (`VICTORY_FAIR_DUE=0` restores retries-first ordering).
+fn fair_due() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_FAIR_DUE").is_none_or(|v| v != "0"))
+}
+
+/// Maximum backoff interval in milliseconds for re-checking unmapped slots
+/// (`VICTORY_RELOOK_MS`, default 20,000 ms).
+pub(crate) fn relook_ms() -> u64 {
+    static MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *MS.get_or_init(|| {
+        std::env::var("VICTORY_RELOOK_MS")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(20_000)
+    })
+}
+
+/// Backoff cap in presented frames for a frame interval `frame_ms` and relook
+/// ceiling `relook_ms`.
+pub(crate) fn relook_frames(frame_ms: u64, relook_ms: u64) -> u64 {
+    (relook_ms / frame_ms.max(1)).clamp(16, 1024)
+}
+
+/// Classification of an unmade slot reported by GPU read-marks when the
+/// background heap worker is enabled.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum UnmadeRead {
+    None,
+    Background,
+    Sync,
+}
+
+#[derive(Clone, Copy)]
+struct QueuedSlot {
+    write: u64,
+    due_frame: u64,
+    looks: u32,
+    urgent: bool,
+}
+
+/// Queue of shader-visible texture slots waiting for background creation and
+/// detiling (`crate::heap_worker`).
+///
+/// Serves GPU read-marked (`urgent`) slots first, then alternates previously
+/// retried slots (`again`, newest write first) 1:1 with never-looked-at slots
+/// (`fresh`, alternating newest/oldest write) so streaming backlogs never
+/// starve newly visible textures.
+#[derive(Default)]
+pub(crate) struct UploadQueue {
+    next_write: u64,
+    slots: HashMap<u32, QueuedSlot>,
+}
+
+impl UploadQueue {
+    pub(crate) fn written(&mut self, index: u32, frame: u64) {
+        self.next_write += 1;
+        self.slots.insert(
+            index,
+            QueuedSlot {
+                write: self.next_write,
+                due_frame: frame,
+                looks: 0,
+                urgent: false,
+            },
+        );
+    }
+
+    pub(crate) fn prioritize(&mut self, indices: &[u32], frame: u64) {
+        for &index in indices {
+            match self.slots.get_mut(&index) {
+                Some(entry) => {
+                    entry.urgent = true;
+                    entry.due_frame = entry.due_frame.min(frame);
+                }
+                None => {
+                    self.next_write += 1;
+                    self.slots.insert(
+                        index,
+                        QueuedSlot {
+                            write: self.next_write,
+                            due_frame: frame,
+                            looks: 0,
+                            urgent: true,
+                        },
+                    );
+                }
+            }
+        }
+    }
+
+    #[allow(dead_code)] // hook for urgent bake-source pre-upload
+    pub(crate) fn requeue(&mut self, indices: &[u32], frame: u64) {
+        for &index in indices {
+            if !self.slots.contains_key(&index) {
+                self.next_write += 1;
+                self.slots.insert(
+                    index,
+                    QueuedSlot {
+                        write: self.next_write,
+                        due_frame: frame,
+                        looks: 0,
+                        urgent: true,
+                    },
+                );
+            }
+        }
+    }
+
+    #[allow(dead_code)] // hook for urgent bake-source pre-upload
+    pub(crate) fn queued(&self, indices: &[u32]) -> Vec<(u32, u64)> {
+        indices
+            .iter()
+            .filter_map(|&index| self.slots.get(&index).map(|w| (index, w.write)))
+            .collect()
+    }
+
+    pub(crate) fn remove(&mut self, index: u32) {
+        self.slots.remove(&index);
+    }
+
+    pub(crate) fn done(&mut self, index: u32, write: u64) {
+        if self.slots.get(&index).is_some_and(|w| w.write == write) {
+            self.slots.remove(&index);
+        }
+    }
+
+    pub(crate) fn later(&mut self, index: u32, write: u64, frame: u64, max_wait: u64) {
+        if let Some(entry) = self.slots.get_mut(&index)
+            && entry.write == write
+        {
+            entry.looks = entry.looks.saturating_add(1);
+            entry.urgent = false;
+            let backoff = (1u64 << entry.looks.saturating_sub(1).min(10)).min(max_wait.max(1));
+            entry.due_frame = frame.saturating_add(backoff);
+        }
+    }
+
+    pub(crate) fn due(&self, frame: u64, max: usize) -> Vec<(u32, u64)> {
+        self.due_with(frame, max, fair_due())
+    }
+
+    pub(crate) fn due_with(&self, frame: u64, max: usize, fair: bool) -> Vec<(u32, u64)> {
+        if max == 0 || self.slots.is_empty() {
+            return Vec::new();
+        }
+        let mut urgent: Vec<(u32, u64)> = Vec::new();
+        let mut again: Vec<(u32, u64)> = Vec::new();
+        let mut fresh: Vec<(u32, u64)> = Vec::new();
+        for (&index, w) in &self.slots {
+            if w.due_frame > frame {
+                continue;
+            }
+            if w.urgent {
+                urgent.push((index, w.write));
+            } else if w.looks > 0 {
+                again.push((index, w.write));
+            } else {
+                fresh.push((index, w.write));
+            }
+        }
+        let newest_first = |a: &(u32, u64), b: &(u32, u64)| b.1.cmp(&a.1);
+        urgent.sort_unstable_by(newest_first);
+        again.sort_unstable_by(newest_first);
+        fresh.sort_unstable_by(newest_first);
+
+        let mut order = Vec::with_capacity(max.min(urgent.len() + again.len() + fresh.len()));
+        order.extend(urgent.into_iter().take(max));
+        if order.len() >= max {
+            return order;
+        }
+        let remaining = max - order.len();
+        let mut fresh_order: Vec<(u32, u64)> = Vec::with_capacity(fresh.len().min(remaining));
+        let (mut new, mut old) = (0, fresh.len());
+        while new < old && fresh_order.len() < remaining {
+            fresh_order.push(fresh[new]);
+            new += 1;
+            if new < old && fresh_order.len() < remaining {
+                old -= 1;
+                fresh_order.push(fresh[old]);
+            }
+        }
+        if !fair {
+            order.extend(again.into_iter().chain(fresh_order).take(remaining));
+            return order;
+        }
+        let mut again_iter = again.into_iter();
+        let mut fresh_iter = fresh_order.into_iter();
+        while order.len() < max {
+            let (a, b) = (again_iter.next(), fresh_iter.next());
+            if a.is_none() && b.is_none() {
+                break;
+            }
+            order.extend(a);
+            if order.len() < max {
+                order.extend(b);
+            }
+        }
+        order
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.slots.is_empty()
+    }
+}
+
+
 /// Pre-populated null descriptor templates in [`StagingHeap`] (slot 0 for
 /// sampler heaps; slots `0..17` covering every null SRV/UAV kind for view
 /// heaps). Remaining slots hold per-batch templates for repeated views.
@@ -270,6 +492,8 @@ pub(crate) struct HostHeap {
     /// Live widened SRV buffers, by host address, with the number of slots
     /// showing each. Heap-indexing shaders can read any of them.
     widened: Mutex<HashMap<usize, (usize, std::sync::Weak<crate::shadow::Widened>)>>,
+    /// Slots queued for background texture upload (`crate::heap_worker`).
+    uploads: Mutex<UploadQueue>,
 }
 
 /// Host heaps' GPU ranges (start, bytes, bytes per slot, sampler), for
@@ -441,6 +665,7 @@ impl HostHeap {
             addresses: std::sync::OnceLock::new(),
             viewed: Default::default(),
             widened: Default::default(),
+            uploads: Default::default(),
         };
         if !sampler {
             crate::bindless::register(&h.viewed);
@@ -1720,6 +1945,18 @@ impl HostHeap {
     /// as long as the caller uses it. Buffer views are made only for draws
     /// (`for_draw`), which also copy their data: a host copy of a buffer is
     /// made on first use.
+    /// Whether host slot `index` already holds the mirrored view currently
+    /// named by `handle`, without taking any lock.
+    pub(crate) fn slot_ready(&self, index: u32, handle: u64) -> bool {
+        let Some(slot) = self.ready.get(index as usize) else {
+            return false;
+        };
+        // SAFETY: `handle` is a descriptor slot in a live title heap.
+        let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
+        let key = u64::from(generation) << 32 | u64::from(i);
+        tag == VIEW_TAG && key != 0 && slot.load(Ordering::Acquire) == key
+    }
+
     pub(crate) fn mirror(&self, index: u32, handle: u64, for_draw: bool) -> Option<ViewPin> {
         if index >= self.count {
             // Diagnostic (NVIDIA heap cap): the highest title slot past the
@@ -1777,6 +2014,13 @@ impl HostHeap {
                 self.set_made_nonzero(index, false);
                 self.make_null(index);
                 self.note_address(index, None);
+            }
+            drop(made);
+            if !self.sampler && crate::heap_worker::on() {
+                self.uploads
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .remove(index);
             }
             return None;
         }
@@ -1844,7 +2088,99 @@ impl HostHeap {
             self.synced[index as usize].store(key, Ordering::Release);
             self.ready[index as usize].store(ready, Ordering::Release);
         }
+        drop(made);
+        if !self.sampler && !PUBLISHING.get() && crate::heap_worker::on() {
+            let mut uploads = self.uploads.lock().unwrap_or_else(|e| e.into_inner());
+            if !for_draw && is_texture_view(&view) {
+                uploads.written(index, crate::queue::presented());
+            } else {
+                uploads.remove(index);
+            }
+        }
         Some(view)
+    }
+
+    /// Publishes host slot `index` from `handle` if the title slot still holds
+    /// record `key`. Called inside `Host::execute` once the texture's upload is
+    /// recorded in the submission's upload list (`crate::heap_worker`).
+    pub(crate) fn publish(&self, index: u32, handle: u64, key: u64) -> bool {
+        if handle == 0 || index >= self.count {
+            return false;
+        }
+        // SAFETY: the handle is a descriptor slot in title memory.
+        let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
+        if tag != VIEW_TAG || (u64::from(generation) << 32 | u64::from(i)) != key {
+            return false;
+        }
+        let _guard = PublishingGuard(PUBLISHING.replace(true));
+        self.mirror(index, handle, true).is_some()
+    }
+
+    /// Whether slot `index` currently shows a non-null host view made from the
+    /// exact record at `handle`.
+    pub(crate) fn texture_slot_made_from(&self, index: u32, handle: u64) -> bool {
+        if handle == 0 || index >= self.count {
+            return false;
+        }
+        // SAFETY: descriptor slot in title memory.
+        let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
+        if tag != VIEW_TAG {
+            return false;
+        }
+        let key = u64::from(generation) << 32 | u64::from(i);
+        self.ready[index as usize].load(Ordering::Acquire) == key
+    }
+
+    pub(crate) fn texture_slots_due(&self, frame: u64, max: usize) -> Vec<(u32, u64)> {
+        self.uploads
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .due(frame, max)
+    }
+
+    pub(crate) fn texture_slot_done(&self, index: u32, write: u64) {
+        self.uploads
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .done(index, write);
+    }
+
+    pub(crate) fn texture_slot_later(&self, index: u32, write: u64, frame: u64, max_wait: u64) {
+        self.uploads
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .later(index, write, frame, max_wait);
+    }
+
+    pub(crate) fn prioritize_texture_slots(&self, indices: &[u32], frame: u64) {
+        self.uploads
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .prioritize(indices, frame);
+    }
+
+    #[allow(dead_code)] // hook for urgent bake-source pre-upload
+    pub(crate) fn requeue_texture_slots(&self, indices: &[u32], frame: u64) {
+        self.uploads
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .requeue(indices, frame);
+    }
+
+    #[allow(dead_code)] // hook for urgent bake-source pre-upload
+    pub(crate) fn texture_slots_queued(&self, indices: &[u32]) -> Vec<(u32, u64)> {
+        self.uploads
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .queued(indices)
+    }
+
+    pub(crate) fn has_queued_textures(&self) -> bool {
+        !self
+            .uploads
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_empty()
     }
 
     /// The view host slot `index` was made from, in a few words, with the
@@ -1952,6 +2288,41 @@ impl HostHeap {
         let view = (key != 0).then(|| view_at(key as u32, (key >> 32) as u32)).flatten()?;
         let kept = self.kept.lock().unwrap_or_else(|e| e.into_inner()).get(index as usize).is_some();
         (is_placed_texture(&view) && !kept).then(|| (*view).clone())
+    }
+
+    /// How `make_read` should handle an unmade slot when `heap_worker::on()`.
+    pub(crate) fn unmade_read_kind(&self, index: u32) -> UnmadeRead {
+        let Some(key) = self
+            .made
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(index as usize)
+            .copied()
+        else {
+            return UnmadeRead::None;
+        };
+        if key == 0 {
+            return UnmadeRead::None;
+        }
+        let kept = self
+            .kept
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(index as usize)
+            .is_some();
+        if kept {
+            return UnmadeRead::None;
+        }
+        let Some(view) = view_at(key as u32, (key >> 32) as u32) else {
+            return UnmadeRead::None;
+        };
+        if is_texture_view(&view) {
+            UnmadeRead::Background
+        } else if is_placed_texture(&view) {
+            UnmadeRead::Sync
+        } else {
+            UnmadeRead::None
+        }
     }
 
     /// A shader read slot `index` through the heap: the texture it views
@@ -2939,6 +3310,14 @@ fn prepare(view: &View) {
 /// resource object's): such a slot left null is made when read.
 fn is_texture(view: &View) -> bool {
     is_placed_texture(view)
+        || matches!(view, View::Shader(r, _) if crate::resource::texture_memory(*r as crate::object::This).is_some())
+}
+
+/// Whether `view` is a read-only (SRV) texture view suitable for background
+/// creation and upload (`View::Placed(false, ..)` texture or `View::Shader` of
+/// a title texture).
+pub(crate) fn is_texture_view(view: &View) -> bool {
+    matches!(view, View::Placed(false, resource, _) if resource[0] != 1)
         || matches!(view, View::Shader(r, _) if crate::resource::texture_memory(*r as crate::object::This).is_some())
 }
 
@@ -4271,6 +4650,130 @@ mod tests {
 
         crate::object::release(resource);
         let _ = title_heap.as_mut_ptr();
+    }
+
+    /// PR #1246 fair queue: previously retried slots and never-looked-at fresh
+    /// slots alternate 1:1 (a retried slot first), so a large retry backlog
+    /// cannot starve fresh slots; `fair = false` restores retries-first order.
+    #[test]
+    fn upload_queue_interleaves_retries_and_fresh_slots() {
+        let mut q = UploadQueue::default();
+        for i in 0..10u32 {
+            q.written(100 + i, 1);
+        }
+        for i in 0..10u32 {
+            let w = q
+                .due_with(u64::MAX, 100, true)
+                .into_iter()
+                .find(|d| d.0 == 100 + i)
+                .unwrap()
+                .1;
+            q.later(100 + i, w, 1, 1);
+        }
+        for i in 1..4u32 {
+            q.written(i, 2);
+        }
+        let fair: Vec<u32> = q.due_with(10, 6, true).into_iter().map(|d| d.0).collect();
+        assert_eq!(fair.len(), 6);
+        assert!(fair[0] >= 100, "first slot is a retry: {fair:?}");
+        assert!(fair[1] < 100, "second slot is fresh: {fair:?}");
+        assert!(fair[2] >= 100, "third slot is a retry: {fair:?}");
+        assert!(fair[3] < 100, "fourth slot is fresh: {fair:?}");
+        assert_eq!(
+            fair.iter().filter(|&&i| i < 100).count(),
+            3,
+            "all fresh slots reached in pass of 6: {fair:?}"
+        );
+        let legacy: Vec<u32> = q.due_with(10, 6, false).into_iter().map(|d| d.0).collect();
+        assert!(
+            legacy.iter().all(|&i| i >= 100),
+            "legacy mode puts retries ahead of fresh: {legacy:?}"
+        );
+    }
+
+    /// Tier-0 read-marked slots preempt retries and fresh slots, `requeue`
+    /// restores unqueued slots without disturbing queued ones, and relook
+    /// backoff clamps to `(VICTORY_RELOOK_MS / frame_ms).clamp(16, 1024)`.
+    #[test]
+    fn upload_queue_prioritizes_tier0_reads_and_respects_relook_cap() {
+        assert_eq!(relook_frames(1000, 20_000), 20);
+        assert_eq!(relook_frames(5000, 20_000), 16, "clamps low at 16");
+        assert_eq!(relook_frames(1, 20_000), 1024, "clamps high at 1024");
+        assert_eq!(relook_frames(250, 20_000), 80);
+
+        let mut q = UploadQueue::default();
+        q.written(10, 1);
+        q.written(11, 1);
+        let w10 = q.due_with(1, 10, true).into_iter().find(|d| d.0 == 10).unwrap().1;
+        q.later(10, w10, 1, 16);
+        // After 1 look, due_frame = 2; after repeated looks, backoff caps at 16.
+        for f in [2u64, 4, 8, 16, 32, 64] {
+            let w = q.queued(&[10])[0].1;
+            q.later(10, w, f, 16);
+        }
+        assert!(
+            !q.due_with(79, 10, true).iter().any(|d| d.0 == 10),
+            "capped at +16 frames (due at 80)"
+        );
+        assert!(q.due_with(80, 10, true).iter().any(|d| d.0 == 10));
+
+        // Tier-0 prioritize puts slot 50 ahead of both retries and fresh slots.
+        q.prioritize(&[50], 1);
+        let first = q.due_with(80, 3, true);
+        assert_eq!(first[0].0, 50, "Tier-0 read-marked slot comes first");
+
+        // `requeue` adds unqueued slot 60 as urgent without resetting slot 11.
+        let before11 = q.queued(&[11]);
+        q.requeue(&[11, 60], 80);
+        assert_eq!(q.queued(&[11]), before11);
+        let due = q.due_with(80, 4, true);
+        assert_eq!(due[0].0, 60);
+        assert_eq!(due[1].0, 50);
+    }
+
+    /// PR #1007 publication invariant: a slot published with its matching key
+    /// becomes live without re-entering the upload queue, and a stale key is
+    /// rejected after the title overwrites the slot.
+    #[test]
+    fn published_slot_stays_out_of_queue_and_rejects_stale_key() {
+        let Some(heap) = HostHeap::new(false, 8) else {
+            return; // no host GPU
+        };
+        let _worker = crate::heap_worker::EnableForTest::new();
+        let mem = crate::watch::tests::pool(1);
+        let placed = |at: u64| {
+            let mut desc = [0u32; 16];
+            // RGBA8 4x1 linear, 1 mip
+            (desc[0], desc[1], desc[2], desc[5]) = (28, 4, 0x1688, 1);
+            (desc[10], desc[11]) = (at as u32, (at >> 32) as u32);
+            View::Placed(
+                false,
+                [3, 0, 0, 0, 4, 0, 1, 1 | 1 << 16, 28, 1, 0, 0x100, 0, 0],
+                desc,
+            )
+        };
+        let mut title = [0u32; 8];
+        let handle = title.as_mut_ptr() as u64;
+        crate::descriptor::record(handle, placed(mem as u64));
+        let (_, key1) = crate::descriptor::view_and_key(handle).unwrap();
+        assert!(heap.mirror(1, handle, false).is_some());
+        assert!(!heap.kept(1), "placed texture starts null until published");
+        let due = heap.texture_slots_due(u64::MAX, 8);
+        assert_eq!(due.len(), 1);
+        assert_eq!(due[0].0, 1);
+        heap.texture_slot_done(1, due[0].1);
+        assert!(heap.publish(1, handle, key1));
+        assert!(heap.kept(1), "slot now shows the published texture");
+        assert!(
+            heap.texture_slots_due(u64::MAX, 8).is_empty(),
+            "publish must not re-enqueue the slot"
+        );
+        // Overwrite the slot with another record: stale `key1` must be rejected.
+        crate::descriptor::record(handle, placed((mem + 256) as u64));
+        let (_, key2) = crate::descriptor::view_and_key(handle).unwrap();
+        assert_ne!(key1, key2);
+        assert!(!heap.publish(1, handle, key1));
+        crate::watch::tests::free(mem);
     }
 
     #[test]

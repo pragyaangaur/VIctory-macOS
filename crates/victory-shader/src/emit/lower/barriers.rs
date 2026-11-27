@@ -25,7 +25,18 @@ use super::*;
 /// `None`: a read in divergent code may see a write made in divergent code
 /// since the last barrier. A write in divergent code after a read there gets
 /// no barrier, as before.
+#[cfg(test)]
 pub(crate) fn split_wave_barriers(p: &Program, st: &Structured) -> Option<Set<(usize, usize)>> {
+    let step = step_and_cap(p, st, true).0;
+    split_wave_barriers_with_step(p, &step)
+}
+
+/// [`split_wave_barriers`] using a precomputed `step` vector (which may
+/// include blocks legalized by acyclic predication in `halves`).
+pub(crate) fn split_wave_barriers_with_step(
+    p: &Program,
+    step: &[bool],
+) -> Option<Set<(usize, usize)>> {
     /// LDS accesses since the last barrier.
     #[derive(Clone, Copy, Default, PartialEq)]
     struct Since {
@@ -56,7 +67,6 @@ pub(crate) fn split_wave_barriers(p: &Program, st: &Structured) -> Option<Set<(u
     };
     let n = p.blocks.len();
     let succ = |b: usize| p.blocks[b].exit.successors();
-    let step = step_and_cap(p, st, true).0;
     let divergent_writes = (0..n).any(|b| {
         !step[b]
             && p.blocks[b]
@@ -159,6 +169,22 @@ pub(crate) fn step_and_cap(
     st: &Structured,
     need_step: bool,
 ) -> (Vec<bool>, Vec<bool>) {
+    step_and_cap_with(p, st, &st.exits, &Set::default(), need_step)
+}
+
+/// [`step_and_cap`] evaluated over `exits` (either `st.exits` or exits after
+/// selective predication), with `uniform_branches` naming latch blocks whose
+/// branch condition has been promoted to a group-wide predicate. It tracks
+/// both group-uniform SGPRs and group-uniform VGPRs, so a uniform loop bound
+/// loaded via `buffer_load` / `global_load` / `image_load` / `ds_read` and
+/// moved through `v_readfirstlane_b32` stays group-uniform.
+pub(crate) fn step_and_cap_with(
+    p: &Program,
+    st: &Structured,
+    exits: &[LaneExit],
+    uniform_branches: &Set<usize>,
+    need_step: bool,
+) -> (Vec<bool>, Vec<bool>) {
     let n = p.blocks.len();
     // Reverse postorder ranks, as lowering numbers them: a Jump to a block at
     // or before the jump is a back edge.
@@ -172,7 +198,7 @@ pub(crate) fn step_and_cap(
     // loop's iterations and at the limit leaves the program from the latch
     // with an early return.
     let capped: Vec<(usize, usize)> = (0..n)
-        .filter_map(|b| match st.exits[b] {
+        .filter_map(|b| match exits[b] {
             LaneExit::Jump(t) if back(b, t) => Some((b, t)),
             _ => None,
         })
@@ -186,7 +212,7 @@ pub(crate) fn step_and_cap(
     {
         return (Vec::new(), vec![false; n]);
     }
-    let Some(regions) = halves::branch_regions(p, st) else {
+    let Some(regions) = halves::branch_regions_with(p, exits) else {
         return (
             if need_step {
                 once_per_lane(p)
@@ -197,7 +223,7 @@ pub(crate) fn step_and_cap(
         );
     };
     let mut succ: Vec<Vec<usize>> = vec![Vec::new(); n];
-    for (b, e) in st.exits.iter().enumerate() {
+    for (b, e) in exits.iter().enumerate() {
         match *e {
             LaneExit::Jump(t) => succ[b].push(t),
             LaneExit::Branch {
@@ -212,8 +238,8 @@ pub(crate) fn step_and_cap(
     // Every back edge to each header: the header's iteration counter is
     // shared by all of them.
     let mut back_to: Vec<Vec<usize>> = vec![Vec::new(); n];
-    for b in 0..n {
-        match st.exits[b] {
+    for (b, e) in exits.iter().enumerate() {
+        match *e {
             LaneExit::Jump(t) if back(b, t) => back_to[t].push(b),
             LaneExit::Branch {
                 taken, not_taken, ..
@@ -229,6 +255,7 @@ pub(crate) fn step_and_cap(
         }
     }
     let scalar = |r: Reg| matches!(r, Reg::S(_) | Reg::Scc);
+    let vector = |r: Reg| matches!(r, Reg::V(_));
     // Not EXEC or VCC: lane masks.
     let mask = |r: Reg| matches!(r, Reg::S(k) if [EXEC, EXEC + 1, VCC, VCC + 1].contains(&k));
     // Scalar writes no host wave can compute alike: other lanes' values,
@@ -247,11 +274,13 @@ pub(crate) fn step_and_cap(
             _ => true,
         }
     };
-    let together = |when: Bool, alike: &Set<Value>| {
-        st.bools
-            .support(when)
-            .iter()
-            .all(|a| matches!(a, Atom::Uniform(v) if alike.contains(v)))
+    let together = |d: usize, when: Bool, alike: &Set<Value>| {
+        uniform_branches.contains(&d)
+            || st
+                .bools
+                .support(when)
+                .iter()
+                .all(|a| matches!(a, Atom::Uniform(v) if alike.contains(v)))
     };
     let mut alike: Set<Value> = p
         .inputs
@@ -270,13 +299,31 @@ pub(crate) fn step_and_cap(
                 )
         }))
         .collect();
+    // Group-uniform VGPRs: optimistically all non-entry VGPRs, narrowed with
+    // `alike` in lockstep. Entry VGPRs (`v0`/`v1`/`v2` thread ids) are never
+    // group-uniform.
+    let mut alike_v: Set<Value> = p
+        .blocks
+        .iter()
+        .flat_map(|b| {
+            b.phis
+                .iter()
+                .filter(|f| vector(f.reg))
+                .map(|f| f.value)
+                .chain(
+                    b.insts
+                        .iter()
+                        .flat_map(|i| i.writes.iter().filter(|w| vector(w.0)).map(|w| w.1)),
+                )
+        })
+        .collect();
     loop {
         let mut step = vec![true; n];
         for (d, region) in &regions {
-            let LaneExit::Branch { when, .. } = st.exits[*d] else {
+            let LaneExit::Branch { when, .. } = exits[*d] else {
                 continue;
             };
-            if !together(when, &alike) {
+            if !together(*d, when, &alike) {
                 for (b, &r) in region.iter().enumerate() {
                     step[b] &= !r;
                 }
@@ -296,7 +343,7 @@ pub(crate) fn step_and_cap(
                     if !step[b] {
                         return false;
                     }
-                    match st.exits[b] {
+                    match exits[b] {
                         LaneExit::Jump(t) => t == header,
                         LaneExit::Branch {
                             when,
@@ -304,7 +351,7 @@ pub(crate) fn step_and_cap(
                             not_taken,
                         } => {
                             (taken == header || not_taken == header)
-                                && together(when, alike)
+                                && together(b, when, alike)
                         }
                         _ => false,
                     }
@@ -366,8 +413,8 @@ pub(crate) fn step_and_cap(
                 // every lane runs, and a uniform branch sends every lane the
                 // same way, so neither is marked here.)
                 let arms = |d: usize, escaped: &mut Vec<bool>| {
-                    if let LaneExit::Branch { when, .. } = st.exits[d]
-                        && !together(when, &alike)
+                    if let LaneExit::Branch { when, .. } = exits[d]
+                        && !together(d, when, &alike)
                     {
                         for &s in &succ[d] {
                             mark(s, escaped);
@@ -410,29 +457,195 @@ pub(crate) fn step_and_cap(
             .filter(|(r, _)| scalar(*r))
             .map(|(_, v)| *v)
             .collect();
+        let mut next_v: Set<Value> = Set::default();
         for (b, block) in p.blocks.iter().enumerate() {
             // Every host wave enters by the same edge.
             let entered = step[b] && block.preds.iter().all(|&q| step[q]);
             for phi in &block.phis {
                 if scalar(phi.reg) && entered && phi.args.iter().all(|a| alike.contains(a)) {
                     next.insert(phi.value);
+                } else if vector(phi.reg) && entered && phi.args.iter().all(|a| alike_v.contains(a))
+                {
+                    next_v.insert(phi.value);
                 }
             }
-            for inst in &block.insts {
-                let from = inst
+            for (i, inst) in block.insts.iter().enumerate() {
+                let name = inst.name();
+                // Group-uniform scalar ops.
+                let from_scalar = inst
                     .reads
                     .iter()
                     .all(|&(r, v)| scalar(r) && !mask(r) && alike.contains(&v));
-                if from && !own(inst) {
+                if from_scalar && !own(inst) {
                     next.extend(inst.writes.iter().filter(|w| scalar(w.0)).map(|w| w.1));
+                    continue;
+                }
+                // `v_readfirstlane_b32` of a group-uniform VGPR yields a
+                // group-uniform SGPR.
+                if name == "v_readfirstlane_b32"
+                    && let Fields::Valu(v) = &inst.fields
+                    && let Some(&Operand::Vector { reg, .. }) = v.src.first()
+                    && inst.read(Reg::V(reg)).is_some_and(|x| alike_v.contains(&x))
+                {
+                    next.extend(inst.writes.iter().filter(|w| scalar(w.0)).map(|w| w.1));
+                    continue;
+                }
+                // Guarded VGPR writes only stay group-uniform when the guard
+                // itself is group-uniform (for simplicity, require no guard).
+                if st.guards[b][i].is_some() {
+                    continue;
+                }
+                // Buffer / global / LDS loads at group-uniform addresses.
+                match &inst.fields {
+                    Fields::Buffer {
+                        addr,
+                        rsrc,
+                        soffset,
+                        offen,
+                        idxen,
+                        cache,
+                        ..
+                    } if (name.starts_with("buffer_load") || name.starts_with("tbuffer_load"))
+                        && !cache.glc =>
+                    {
+                        let addr_ok = !(*offen || *idxen)
+                            || match *addr {
+                                Operand::Vector { reg, dwords } => (0..dwords).all(|k| {
+                                    inst.read(Reg::V(reg + k))
+                                        .is_some_and(|v| alike_v.contains(&v))
+                                }),
+                                _ => true,
+                            };
+                        let sc_ok = |op: &Operand| match *op {
+                            Operand::Scalar { code, dwords } if code != NULL => (0..dwords)
+                                .all(|k| {
+                                    let r = Reg::S(code + k);
+                                    !mask(r) && inst.read(r).is_none_or(|v| alike.contains(&v))
+                                }),
+                            _ => true,
+                        };
+                        if addr_ok && sc_ok(rsrc) && sc_ok(soffset) {
+                            next_v.extend(inst.writes.iter().filter(|w| vector(w.0)).map(|w| w.1));
+                        }
+                    }
+                    Fields::Flat {
+                        addr: Some(Operand::Vector { reg, dwords }),
+                        saddr,
+                        cache,
+                        ..
+                    } if name.starts_with("global_load") && !cache.glc => {
+                        let addr_ok = (0..*dwords).all(|k| {
+                            inst.read(Reg::V(reg + k))
+                                .is_some_and(|v| alike_v.contains(&v))
+                        });
+                        let saddr_ok = match saddr {
+                            Some(Operand::Scalar { code, dwords }) if *code != NULL => (0..*dwords)
+                                .all(|k| {
+                                    let r = Reg::S(code + k);
+                                    !mask(r) && inst.read(r).is_none_or(|v| alike.contains(&v))
+                                }),
+                            _ => true,
+                        };
+                        if addr_ok && saddr_ok {
+                            next_v.extend(inst.writes.iter().filter(|w| vector(w.0)).map(|w| w.1));
+                        }
+                    }
+                    Fields::Image {
+                        addr,
+                        rsrc,
+                        sampler,
+                        cache,
+                        ..
+                    } if (name.starts_with("image_load")
+                        || name.starts_with("image_sample")
+                        || name.starts_with("image_gather"))
+                        && !cache.glc =>
+                    {
+                        let addr_ok = addr.iter().all(|op| match *op {
+                            Operand::Vector { reg, dwords } => (0..dwords).all(|k| {
+                                inst.read(Reg::V(reg + k))
+                                    .is_some_and(|v| alike_v.contains(&v))
+                            }),
+                            _ => true,
+                        });
+                        let sc_ok = |op: &Operand| match *op {
+                            Operand::Scalar { code, dwords } if code != NULL => (0..dwords)
+                                .all(|k| {
+                                    let r = Reg::S(code + k);
+                                    !mask(r) && inst.read(r).is_none_or(|v| alike.contains(&v))
+                                }),
+                            _ => true,
+                        };
+                        if addr_ok && sc_ok(rsrc) && sampler.as_ref().is_none_or(sc_ok) {
+                            next_v.extend(inst.writes.iter().filter(|w| vector(w.0)).map(|w| w.1));
+                        }
+                    }
+                    Fields::Ds {
+                        addr: Some(Operand::Vector { reg, .. }),
+                        dst: Some(_),
+                        data,
+                        ..
+                    } if step[b] && name.starts_with("ds_read") && data.is_empty() => {
+                        if inst.read(Reg::V(*reg)).is_some_and(|v| alike_v.contains(&v)) {
+                            next_v.extend(inst.writes.iter().filter(|w| vector(w.0)).map(|w| w.1));
+                        }
+                    }
+                    Fields::Valu(v)
+                        if v.dpp.is_none()
+                            && v.sdwa.is_none()
+                            && !name.starts_with("v_mbcnt")
+                            && !name.starts_with("v_cmpx")
+                            && !name.contains("lane")
+                            && !name.contains("cndmask")
+                            && !name.contains("_co_ci_")
+                            && !name.contains("mac")
+                            && !name.contains("dot") =>
+                    {
+                        let ops_ok = v.src.iter().all(|op| match *op {
+                            Operand::Vector { reg, dwords } => (0..dwords).all(|k| {
+                                inst.read(Reg::V(reg + k))
+                                    .is_some_and(|val| alike_v.contains(&val))
+                            }),
+                            Operand::Scalar { code, dwords } if code != NULL => {
+                                (0..dwords).all(|k| {
+                                    let r = Reg::S(code + k);
+                                    !mask(r) && inst.read(r).is_none_or(|val| alike.contains(&val))
+                                })
+                            }
+                            Operand::Const(_) | Operand::Literal(_) | Operand::Scalar { .. } => {
+                                true
+                            }
+                            Operand::Attr { .. } => false,
+                        });
+                        if ops_ok {
+                            next_v.extend(inst.writes.iter().filter(|w| vector(w.0)).map(|w| w.1));
+                        }
+                    }
+                    _ => {}
                 }
             }
         }
-        if next.len() == alike.len() {
+        if next.len() == alike.len() && next_v.len() == alike_v.len() {
             return (step, escaped);
         }
         alike = next;
+        alike_v = next_v;
     }
+}
+
+/// The step half of [`step_and_cap`].
+pub(crate) fn in_step(p: &Program, st: &Structured) -> Vec<bool> {
+    step_and_cap(p, st, true).0
+}
+
+/// The step half of [`step_and_cap_with`].
+pub(crate) fn in_step_with(
+    p: &Program,
+    st: &Structured,
+    exits: &[LaneExit],
+    uniform_branches: &Set<usize>,
+) -> Vec<bool> {
+    step_and_cap_with(p, st, exits, uniform_branches, true).0
 }
 
 /// Per block, whether each lane of the group runs it exactly once: no cycle

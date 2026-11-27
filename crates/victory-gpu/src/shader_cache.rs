@@ -65,7 +65,13 @@ fn build() -> &'static [u8; 32] {
                 "VICTORY_SHADER_LOOP_LIMIT: translated loops stop sooner"
             );
         }
-        key(victory_shader::SOURCE_HASH, ENCODING, limit, host_wave32())
+        key(
+            victory_shader::SOURCE_HASH,
+            ENCODING,
+            limit,
+            host_wave32(),
+            victory_shader::emit::thread_ticket(),
+        )
     })
 }
 
@@ -79,12 +85,18 @@ fn host_wave32() -> bool {
 /// This file, whose `encode` and `decode` define the entries.
 const ENCODING: &[u8] = include_bytes!("shader_cache.rs");
 
-fn key(translator: &str, encoding: &[u8], limit: u32, wave32: bool) -> [u8; 32] {
+fn key(
+    translator: &str,
+    encoding: &[u8],
+    limit: u32,
+    wave32: bool,
+    thread_ticket: bool,
+) -> [u8; 32] {
     let mut h = blake3::Hasher::new();
     h.update(translator.as_bytes());
     h.update(blake3::hash(encoding).as_bytes());
     h.update(&limit.to_le_bytes());
-    h.update(&[u8::from(wave32)]);
+    h.update(&[u8::from(wave32), u8::from(thread_ticket)]);
     *h.finalize().as_bytes()
 }
 
@@ -292,6 +304,7 @@ pub(crate) fn runtime_options() -> victory_shader::emit::Options {
         bias_as_gradients: bias_as_gradients(),
         host_wave32: host_wave32(),
         narrow_waves: narrow_waves(),
+        per_vertex_center: false,
         uav_size_level0: uav_size_level0(),
     }
 }
@@ -765,19 +778,21 @@ mod tests {
     /// another key, so no entry written before it is read.
     #[test]
     fn the_key_covers_translator_encoding_and_settings() {
-        let k = key("0123456789abcdef", b"encoding", 1 << 20, false);
-        assert_eq!(k, key("0123456789abcdef", b"encoding", 1 << 20, false));
-        assert_ne!(k, key("0123456789abcdee", b"encoding", 1 << 20, false));
-        assert_ne!(k, key("0123456789abcdef", b"encoding.", 1 << 20, false));
-        assert_ne!(k, key("0123456789abcdef", b"encoding", 1 << 19, false));
-        assert_ne!(k, key("0123456789abcdef", b"encoding", 1 << 20, true));
+        let k = key("0123456789abcdef", b"encoding", 1 << 20, false, true);
+        assert_eq!(k, key("0123456789abcdef", b"encoding", 1 << 20, false, true));
+        assert_ne!(k, key("0123456789abcdee", b"encoding", 1 << 20, false, true));
+        assert_ne!(k, key("0123456789abcdef", b"encoding.", 1 << 20, false, true));
+        assert_ne!(k, key("0123456789abcdef", b"encoding", 1 << 19, false, true));
+        assert_ne!(k, key("0123456789abcdef", b"encoding", 1 << 20, true, true));
+        assert_ne!(k, key("0123456789abcdef", b"encoding", 1 << 20, false, false));
         assert_eq!(
             *build(),
             key(
                 victory_shader::SOURCE_HASH,
                 ENCODING,
                 victory_shader::emit::loop_limit(),
-                host_wave32()
+                host_wave32(),
+                victory_shader::emit::thread_ticket(),
             )
         );
         // The encoding part is this file as built.

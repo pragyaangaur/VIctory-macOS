@@ -180,11 +180,19 @@ else
    then empty else "binaries must be up to 80 {suite, name, seconds} entries" end)
 end'
 
+# Results are posted as issue comments, so a result must stay small.
+RESULT_MAX_BYTES=8000
+
+# The byte length of a string. ${#var} counts characters in a UTF-8 locale,
+# but the size limit is in bytes, so measure with wc -c (printf adds no
+# trailing newline).
+byte_len() { printf '%s' "$1" | wc -c | tr -d '[:space:]'; }
+
 # Prints one error per line and fails if the result is not valid for the task.
 validate_result() { # JSON COMMIT CHIP [MACOS_MAJOR]
     local errors
-    if [ "${#1}" -gt 8000 ]; then
-        echo "result is larger than 8000 bytes"
+    if [ "$(byte_len "$1")" -gt "$RESULT_MAX_BYTES" ]; then
+        echo "result is larger than $RESULT_MAX_BYTES bytes"
         return 1
     fi
     if ! jq -e . > /dev/null 2>&1 <<< "$1"; then
@@ -196,6 +204,27 @@ validate_result() { # JSON COMMIT CHIP [MACOS_MAJOR]
         printf '%s\n' "$errors"
         return 1
     fi
+}
+
+# Compacts a result and, when even the compact form is over the size limit,
+# shrinks it while staying schema-valid: first the binary timings, then
+# failures from the tail. The suite counts always survive. Prints the result
+# to keep (compact, at most RESULT_MAX_BYTES) and fails when even an empty
+# failure list does not fit.
+shrink_result() { # JSON -> compact JSON
+    local r n
+    r=$(jq -c . <<< "$1")
+    [ "$(byte_len "$r")" -le "$RESULT_MAX_BYTES" ] || r=$(jq -c '.binaries = []' <<< "$r")
+    n=$(jq '.failures | length' <<< "$r")
+    while [ "$(byte_len "$r")" -gt "$RESULT_MAX_BYTES" ] && [ "$n" -gt 0 ]; do
+        n=$((n - 1))
+        r=$(jq -c --argjson n "$n" '.failures = .failures[:$n]' <<< "$r")
+    done
+    if [ "$(byte_len "$r")" -gt "$RESULT_MAX_BYTES" ]; then
+        echo "result is still larger than $RESULT_MAX_BYTES bytes after trimming" >&2
+        return 1
+    fi
+    printf '%s\n' "$r"
 }
 
 # A result counts as failing unless setup worked and both suites ran clean.
@@ -385,12 +414,24 @@ time_limit_hours() { # DEFAULT
                | if . < 2 then 2 elif . > 12 then 12 else . end end'
 }
 
+# Whether a result lists every failed test of both suites. shrink_result trims
+# the failure list, so only a complete list proves that a signature did not
+# fail (a "Verified" reply or flaky disagreement must not rest on a trimmed
+# list).
+failures_complete() { # JSON
+    jq -e '.native != null and .wine != null
+        and (.failures | length) >= (.native.failed + .wine.failed)' > /dev/null <<< "$1"
+}
+
 # Signatures that one of two results of the same commit and chip has and the
-# other lacks, when both ran both suites: the likely flaky tests.
+# other lacks, when both ran both suites and listed all their failures: the
+# likely flaky tests. A trimmed failure list proves nothing.
 flaky_sigs() { # RESULT_A RESULT_B
     jq -rn --argjson a "$1" --argjson b "$2" '
-        if [$a, $b] | any(.native == null or .wine == null) then empty
-        else (([$a.failures[].sig] - [$b.failures[].sig]) + ([$b.failures[].sig] - [$a.failures[].sig])) | unique[] end'
+        if [$a, $b] | all(.native != null and .wine != null
+                and (.failures | length) >= (.native.failed + .wine.failed))
+        then (([$a.failures[].sig] - [$b.failures[].sig]) + ([$b.failures[].sig] - [$a.failures[].sig])) | unique[]
+        else empty end'
 }
 
 # PREVIOUS CURRENT (results) -> lines "suite/binary<TAB>old<TAB>new" for
@@ -422,11 +463,12 @@ report_markdown() {
           | join("\n"))
         + "\n\n## Tests that fail on some chips but not others\n\n"
         + none([$commits[] | . as $g
-            | ($g | map(select(.native != null and .wine != null)) | map(fam) | unique) as $ran
+            | ($g | map(select(.native != null and .wine != null and (.failures | length) >= (.native.failed + .wine.failed))) | map(fam) | unique) as $complete
             | ($g | map(fam as $c | .failures[] | {t: .test, s: .sig, k: .topic, c: $c}) | group_by(.t)[]
                | {t: .[0].t, s: .[0].s, k: .[0].k, bad: (map(.c) | unique)})
-            | select((.bad | length) < ($ran | length))
-            | "- `\($g[0].upstream_commit[0:12])` `\(.t)` (\(.k), sig `\(.s)`): fails on \(.bad | join(", ")); passes on \($ran - .bad | join(", "))"])
+            | ($complete - .bad) as $passed
+            | select(($passed | length) > 0)
+            | "- `\($g[0].upstream_commit[0:12])` `\(.t)` (\(.k), sig `\(.s)`): fails on \(.bad | join(", ")); passes on \($passed | join(", "))"])
         + "\n\n## Slowest test binaries (latest result per chip family)\n\n"
         + none([$rs | group_by(fam)[] | last | . as $r
             | (.binaries | sort_by(-.seconds) | .[0:3][])

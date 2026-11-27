@@ -223,7 +223,7 @@ mod tests {
 
     /// A console pixel program writing target 0 from TEXCOORD (attribute 0,
     /// row 1): P10 of x, P20 of x, P10 of y, P0 of y.
-    fn pixel_shader() -> Vec<u8> {
+    fn pixel_shader_with(per_vertex_center: bool) -> Vec<u8> {
         let code: [u32; 7] = [
             0xC802_0000, // v_interp_mov_f32 v0, p10, attr0.x
             0xC806_0001, // v_interp_mov_f32 v1, p20, attr0.x
@@ -260,30 +260,98 @@ mod tests {
         let st = crate::structure::structure(&p).unwrap();
         let res = crate::resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
         let io = crate::io::raise(&p, &native).unwrap();
-        super::super::lower::lower(&super::super::lower::Parts {
-            native: &native,
-            p: &p,
-            st: &st,
-            io: &io,
-            res: &res,
-            inputs: vec![SigElement {
-                usage: 0,
-                ..element("TEXCOORD", 0, 0, 1, 2)
-            }],
-            outputs: vec![element("SV_Target", 16, 0, 0, 4)],
-            prims: Vec::new(),
-            mesh_stride: 0,
-            atomic_locks: false,
-            atomic_lock_rounds: false,
-            atomic_umax: false,
-            bias_as_gradients: false,
-            narrow_waves: false,
-            uav_size_level0: false,
-            host_wave32: false,
-            view_marks: false,
-        })
+        super::super::lower::lower_pruned(
+            &super::super::lower::Parts {
+                native: &native,
+                p: &p,
+                st: &st,
+                io: &io,
+                res: &res,
+                inputs: vec![SigElement {
+                    usage: 0,
+                    ..element("TEXCOORD", 0, 0, 1, 2)
+                }],
+                outputs: vec![element("SV_Target", 16, 0, 0, 4)],
+                prims: Vec::new(),
+                mesh_stride: 0,
+                atomic_locks: false,
+                atomic_lock_rounds: false,
+                atomic_umax: false,
+                bias_as_gradients: false,
+                narrow_waves: false,
+                uav_size_level0: false,
+                host_wave32: false,
+                view_marks: false,
+            },
+            None,
+            per_vertex_center,
+        )
         .unwrap()
         .dxil
+    }
+
+    fn pixel_shader() -> Vec<u8> {
+        pixel_shader_with(false)
+    }
+
+    /// With `per_vertex_center`, non-provoking vertex delta reads (P10/P20)
+    /// evaluate to zero without requesting `VICTORY_P10`/`VICTORY_P20` inputs
+    /// or a geometry shader, and float P0 is hardware-interpolated at pixel
+    /// center so mesh+pixel pipelines can draw smoothly without a GS stage.
+    #[test]
+    fn per_vertex_center_lowers_deltas_to_zero_and_interpolates_p0() {
+        let (vs, ps) = (vertex_shader(), pixel_shader_with(true));
+        assert!(
+            !super::needs_vertex_deltas(&ps),
+            "center fallback must not emit VICTORY_P10/P20 inputs"
+        );
+        if let Ok(mut v) = Validator::load(Validator::default_path().as_deref()) {
+            for c in [&vs, &ps] {
+                v.validate(&mut c.clone()).unwrap();
+            }
+        }
+        let vertices = [
+            [-1.0, -1.0, 0.5, 1.0, 1.0, 10.0],
+            [3.0, -1.0, 0.5, 1.0, 4.0, 30.0],
+            [-1.0, 3.0, 0.5, 1.0, 9.0, 70.0],
+        ]
+        .concat();
+        let mut drawn = false;
+        for warp in [false, true] {
+            let Ok(host) = Host::new(warp) else { continue };
+            let root = host.root_signature_for(&[]).unwrap();
+            let pso = host.pipeline_with(&root, &vs, &ps).unwrap();
+            let draw = Draw {
+                roots: Vec::new(),
+                textures: &[],
+                samplers: &[],
+                vertices: &vertices,
+                stride: 24,
+                size: (8, 8),
+                mesh_groups: 0,
+            };
+            let texels = host.draw(&root, &pso, &draw).unwrap();
+            let mut min_y = f32::INFINITY;
+            let mut max_y = f32::NEG_INFINITY;
+            for (i, t) in texels.iter().enumerate() {
+                assert_eq!(t[0], 0.0, "warp {warp} pixel {i} P10.x");
+                assert_eq!(t[1], 0.0, "warp {warp} pixel {i} P20.x");
+                assert_eq!(t[2], 0.0, "warp {warp} pixel {i} P10.y");
+                assert!(
+                    (10.0..=70.0).contains(&t[3]),
+                    "warp {warp} pixel {i} P0.y={} out of triangle range",
+                    t[3]
+                );
+                min_y = min_y.min(t[3]);
+                max_y = max_y.max(t[3]);
+            }
+            assert!(
+                max_y - min_y > 15.0,
+                "warp {warp} float P0 should interpolate across pixels (range {min_y}..{max_y})"
+            );
+            drawn = true;
+        }
+        assert!(drawn, "no device");
     }
 
     /// The pixel shader reads P10 and P20 as inputs of their own, which the
