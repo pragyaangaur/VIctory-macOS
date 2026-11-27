@@ -3368,7 +3368,13 @@ impl HostList {
         #[cfg(feature = "diagnostics")]
         use crate::copystat::{C, add};
         for step in &self.deferred().copies {
+            #[cfg(feature = "diagnostics")]
             let started = std::time::Instant::now();
+            // The preparing report counts the copies' time only (the other
+            // steps `continue` before it): they read no clock without
+            // diagnostics.
+            let copy_started = matches!(step, Step::Copy(..) | Step::Move(..) | Step::Fill(..))
+                .then(std::time::Instant::now);
             #[cfg(feature = "diagnostics")]
             let _timed = crate::watch::Timed(
                 started,
@@ -3448,8 +3454,11 @@ impl HostList {
                     continue;
                 }
             };
-            PREPARING[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
-            PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
+            if let Some(copy_started) = copy_started {
+                let us = copy_started.elapsed().as_micros() as u64;
+                PREPARING[0].fetch_add(us, Ordering::Relaxed);
+                PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
+            }
         }
     }
 }
