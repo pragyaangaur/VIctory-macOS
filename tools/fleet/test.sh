@@ -335,6 +335,10 @@ english_sig=$(failures_json "$(parse_cargo "$tmp/english-os.log")" wine | jq -r 
 french_sig=$(failures_json "$(parse_cargo "$tmp/french-os.log")" wine | jq -r '.[0].sig')
 eq "localized OS error text gives the same signature" "$english_sig" "$french_sig"
 eq "binaries json" '[{"suite":"wine","name":"victory_gpu","seconds":0.52},{"suite":"wine","name":"load_probe","seconds":12},{"suite":"wine","name":"doc_victory_core","seconds":0}]' "$(binaries_json "$parsed" wine)"
+for checkout in '/Users/worker/Project (copy)' '/Users/worker/Project (nested (copy))'; do
+    sed "s|target/|$checkout/target/|g" "$tmp/native.log" > "$tmp/parenthesized.log"
+    eq "Cargo parsing preserves binary names under $checkout" "$parsed" "$(parse_cargo "$tmp/parenthesized.log")"
+done
 eq "signature lines keep the text locally" "native/victory_gpu::tests::two" "$(signature_lines "$parsed" native | head -n 1 | cut -f 2)"
 eq "topic: timeout wins" timeout "$(failure_topic "victory_gpu::x" "timed out after #s")"
 eq "topic: crate" shader "$(failure_topic "victory_shader::t" "assertion failed")"

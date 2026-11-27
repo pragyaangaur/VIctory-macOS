@@ -307,7 +307,7 @@ parse_cargo() { # LOG
         }
         /^ *Running .*\(/ {
             flush()
-            b = $0; sub(/.*\(/, "", b); sub(/\).*/, "", b); n = split(b, parts, "/"); b = parts[n]
+            b = $0; sub(/.*\(/, "", b); sub(/\)[ \t]*$/, "", b); n = split(b, parts, "/"); b = parts[n]
             sub(/\.exe$/, "", b); sub(/-[0-9a-f]+$/, "", b); gsub(/-/, "_", b); bin = tolower(b); next
         }
         /^ *Doc-tests / { flush(); bin = "doc_" tolower($2); gsub(/-/, "_", bin); next }
