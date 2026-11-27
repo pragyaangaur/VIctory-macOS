@@ -4252,7 +4252,7 @@ impl<'a> Lower<'a> {
                 // A lane may have left the program early at a capped back
                 // edge's iteration limit before this block; a group barrier
                 // here would wait for lanes that are gone.
-                if self.cap_escaped.get(b).copied().unwrap_or(false) {
+                if self.cap_escaped.get(b).copied().unwrap_or(false) && super::cap_barriers_refused() {
                     Err("an s_barrier where a lane may have left the program early at a loop's iteration limit")
                 } else {
                     self.group_barrier();
