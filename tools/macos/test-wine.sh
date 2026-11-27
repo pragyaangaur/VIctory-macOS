@@ -25,11 +25,14 @@ WINE="${WINE:-$(command -v wine || true)}"
 TARGET=x86_64-pc-windows-gnullvm
 mkdir -p target/macos
 # A wrapper rather than a symlink: some Wine builds find their loader next
-# to the path they were started from.
+# to the path they were started from. It reads the path from the
+# environment: written into the script, a `$`, backtick or quote in the
+# checkout's path would be expanded when the wrapper runs.
 RUNNER_DIR="$(mktemp -d /tmp/victory-wine.XXXXXX)"
 LINK="$RUNNER_DIR/wine"
 trap 'rm -f "$LINK" && rmdir "$RUNNER_DIR" || true' EXIT
-printf '#!/bin/sh\nexec "%s" "$@"\n' "$WINE" > "$LINK"
+export VICTORY_TEST_WINE="$WINE"
+printf '#!/bin/sh\nexec "$VICTORY_TEST_WINE" "$@"\n' > "$LINK"
 chmod +x "$LINK"
 export WINEPREFIX="${WINEPREFIX:-$ROOT/target/wineprefix}"
 export WINEDEBUG="${WINEDEBUG:--all}"
