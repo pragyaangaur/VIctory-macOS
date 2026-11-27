@@ -501,13 +501,25 @@ fn track_as(start: usize, len: usize, views: bool, copy: bool) -> Option<Tracked
     })
 }
 
-/// Whether the page holding `at` is in a write-watched pool (one lookup).
-fn write_watched(at: usize) -> bool {
+/// Whether every byte of `[at, at + len)` lies in a single write-watched pool
+/// (one lookup).
+fn write_watched_range(at: usize, len: usize) -> bool {
     use windows_sys::Win32::System::Memory::GetWriteWatch;
-    let page = at & !(4096 - 1);
+    if len == 0 {
+        return false;
+    }
     let (mut found, mut count, mut granularity) = (0usize, 1usize, 0u32);
     // SAFETY: room for one answer; no reset, so nothing changes.
-    unsafe { GetWriteWatch(0, page as *const _, 4096, (&raw mut found).cast(), &mut count, &mut granularity) == 0 }
+    unsafe {
+        GetWriteWatch(
+            0,
+            at as *const _,
+            len,
+            (&raw mut found).cast(),
+            &mut count,
+            &mut granularity,
+        ) == 0
+    }
 }
 
 /// The pages of `[start, end)` that are the runtime's GPU memory: a
@@ -526,17 +538,12 @@ fn write_watched(at: usize) -> bool {
 /// have it guarded.
 fn runtime_pages(start: usize, end: usize, views: bool) -> Vec<usize> {
     use windows_sys::Win32::System::Memory::{
-        GetWriteWatch, MEM_COMMIT, MEM_IMAGE, MEM_PRIVATE, MEMORY_BASIC_INFORMATION, VirtualQuery,
-    };
-    let watched = |at: usize, len: usize| {
-        let (mut found, mut count, mut granularity) = (0usize, 1usize, 0u32);
-        // SAFETY: room for one answer; no reset, so nothing changes.
-        unsafe { GetWriteWatch(0, at as *const _, len, (&raw mut found).cast(), &mut count, &mut granularity) == 0 }
+        MEM_COMMIT, MEM_IMAGE, MEM_PRIVATE, MEMORY_BASIC_INFORMATION, VirtualQuery,
     };
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
     // One pool holds it all (the common case; asking `VirtualQuery` costs
     // milliseconds in the runtime's big pools).
-    if watched(start & !(4096 - 1), end - (start & !(4096 - 1))) {
+    if write_watched_range(start & !(4096 - 1), end - (start & !(4096 - 1))) {
         return (first..last).collect();
     }
     let (mut runtime, mut other) = (std::collections::BTreeSet::new(), std::collections::BTreeSet::new());
@@ -549,7 +556,7 @@ fn runtime_pages(start: usize, end: usize, views: bool) -> Vec<usize> {
             break;
         }
         let next = (info.BaseAddress as usize + info.RegionSize).max(at + 1).min(end);
-        let ours = watched(at, next - at)
+        let ours = write_watched_range(at, next - at)
             || views && info.Type != MEM_IMAGE && !(info.State == MEM_COMMIT && info.Type == MEM_PRIVATE);
         (if ours { &mut runtime } else { &mut other }).extend(at / PAGE..next.div_ceil(PAGE));
         at = next;
@@ -726,10 +733,11 @@ impl Tracked {
         set_dirty(self.changed.2, !changed.is_empty());
         drop(changed);
         drop(g);
+        unmapped.sort_unstable();
         let (mut copy, mut zero): (Runs, Runs) = (Vec::new(), Vec::new());
         for p in pages {
             let (a, b) = ((p * PAGE).max(from), ((p + 1) * PAGE).min(to));
-            let runs = if unmapped.contains(&p) { &mut zero } else { &mut copy };
+            let runs = if unmapped.binary_search(&p).is_ok() { &mut zero } else { &mut copy };
             match runs.last_mut() {
                 Some((_, end)) if *end == a => *end = b,
                 _ => runs.push((a, b)),
@@ -912,16 +920,12 @@ fn protect_noting(g: &mut Guards, pages: &[usize], unmapped_pages: &mut Vec<usiz
     // takes one view at a time under Wine, so a run that crossed two views
     // (the runtime's page mappings make one per page) failed and was then
     // guarded page by page, one call more than needed.
-    let mut allowed = RuntimeRegions::default();
-    let (pages, ends): (Vec<usize>, Vec<usize>) = pages
-        .into_iter()
-        .filter_map(|p| {
-            if g.protected.contains(&p) {
-                return Some((p, usize::MAX));
-            }
-            allowed.region(p).map(|end| (p, end))
-        })
-        .unzip();
+    let (pages, ends) = filter_runtime_pages(
+        &pages,
+        &g.protected,
+        |first, count| write_watched_range(first * PAGE, count * PAGE),
+        query_runtime_region,
+    );
     let mut i = 0;
     while i < pages.len() {
         if g.protected.contains(&pages[i]) {
@@ -958,49 +962,124 @@ fn protect_noting(g: &mut Guards, pages: &[usize], unmapped_pages: &mut Vec<usiz
     taken
 }
 
-/// Which pages are the runtime's GPU memory ([`runtime_memory`]), asked
-/// once per memory region: a region shares its state, type and write watch.
-#[derive(Default)]
-struct RuntimeRegions {
-    /// The last region asked about: its pages and whether it is runtime
-    /// memory.
-    last: Option<(usize, usize, bool)>,
+/// Asks `VirtualQuery` for the region containing `page` and whether it is
+/// runtime memory (anything other than plain committed private memory, since
+/// write-watched pools are already handled by `write_watched_range`).
+fn query_runtime_region(page: usize) -> Option<(usize, usize, bool)> {
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEM_PRIVATE, MEMORY_BASIC_INFORMATION, VirtualQuery,
+    };
+    // SAFETY: plain data filled in by the query.
+    let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: a valid out pointer of the right size.
+    let n = unsafe { VirtualQuery((page * PAGE) as *const _, &mut info, size_of_val(&info)) };
+    if n == 0 {
+        return None;
+    }
+    let yes = !(info.State == MEM_COMMIT && info.Type == MEM_PRIVATE);
+    let (base, size) = (info.BaseAddress as usize, info.RegionSize);
+    // In our pages, rounded inward so the region never claims a page it
+    // only shares.
+    let (a, b) = (base.div_ceil(PAGE).min(page), ((base + size) / PAGE).max(page + 1));
+    Some((a, b, yes))
 }
 
-impl RuntimeRegions {
-    /// If `page` is the runtime's GPU memory, the page its region is known
-    /// to end before (`usize::MAX` for a pool, whose end is not asked).
-    fn region(&mut self, page: usize) -> Option<usize> {
-        use windows_sys::Win32::System::Memory::{
-            MEM_COMMIT, MEM_PRIVATE, MEMORY_BASIC_INFORMATION, VirtualQuery,
-        };
-        if let Some((a, b, yes)) = self.last
-            && (a..b).contains(&page)
-        {
-            return yes.then_some(b);
+/// Filters `pages` to those already guarded or in the runtime's GPU memory,
+/// returning each kept page together with the exclusive end of its known
+/// region.
+///
+/// Contiguous unprotected runs are probed as a whole with `watched_range`
+/// (one `GetWriteWatch` call for an entire write-watched pool run instead of
+/// one per page under the global `Guards` lock, #460). When a run crosses a
+/// pool boundary, an exponential + binary search finds the exact prefix in
+/// `O(log n)` calls without falling back to `VirtualQuery` on the pool.
+fn filter_runtime_pages(
+    pages: &[usize],
+    protected: &BTreeSet<usize>,
+    mut watched_range: impl FnMut(usize, usize) -> bool,
+    mut query_region: impl FnMut(usize) -> Option<(usize, usize, bool)>,
+) -> (Vec<usize>, Vec<usize>) {
+    let mut out_pages = Vec::with_capacity(pages.len());
+    let mut out_ends = Vec::with_capacity(pages.len());
+    let mut last: Option<(usize, usize, bool)> = None;
+    let mut i = 0;
+    while i < pages.len() {
+        if protected.contains(&pages[i]) {
+            out_pages.push(pages[i]);
+            out_ends.push(usize::MAX);
+            i += 1;
+            continue;
         }
-        // A pool's write watch answers with one lookup. `VirtualQuery` walks
-        // Wine's page table to the region's end, under the guard lock that
-        // every fault waits for.
-        if write_watched(page * PAGE) {
-            return Some(usize::MAX);
+        // Gather a maximal contiguous ascending run of unprotected pages.
+        let first = i;
+        let mut j = i + 1;
+        while j < pages.len() && pages[j] == pages[j - 1] + 1 && !protected.contains(&pages[j]) {
+            j += 1;
         }
-        // SAFETY: plain data filled in by the query.
-        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
-        // SAFETY: a valid out pointer of the right size.
-        let n = unsafe { VirtualQuery((page * PAGE) as *const _, &mut info, size_of_val(&info)) };
-        if n == 0 {
-            return None;
+        let run = &pages[first..j];
+        i = j;
+
+        let mut k = 0;
+        while k < run.len() {
+            let p = run[k];
+            let rem = run.len() - k;
+            if let Some((a, b, yes)) = last
+                && (a..b).contains(&p)
+            {
+                let take = (b - p).min(rem);
+                if yes {
+                    out_pages.extend_from_slice(&run[k..k + take]);
+                    out_ends.extend(std::iter::repeat_n(b, take));
+                }
+                k += take;
+                continue;
+            }
+            // Fast path: the entire remaining run lies in one write-watched pool.
+            if watched_range(p, rem) {
+                let end = p + rem;
+                out_pages.extend_from_slice(&run[k..]);
+                out_ends.extend(std::iter::repeat_n(end, rem));
+                last = Some((p, end, true));
+                break;
+            }
+            // If the run starts in a write-watched pool and crosses a boundary,
+            // find the exact watched prefix in O(log rem) probes so we neither
+            // call VirtualQuery on a pool nor probe page by page.
+            if rem > 1 && watched_range(p, 1) {
+                let mut lo = 1usize;
+                let mut hi = 2usize.min(rem);
+                while hi < rem && watched_range(p, hi) {
+                    lo = hi;
+                    hi = (hi * 2).min(rem);
+                }
+                while lo + 1 < hi {
+                    let mid = lo + (hi - lo) / 2;
+                    if watched_range(p, mid) {
+                        lo = mid;
+                    } else {
+                        hi = mid;
+                    }
+                }
+                let end = p + lo;
+                out_pages.extend_from_slice(&run[k..k + lo]);
+                out_ends.extend(std::iter::repeat_n(end, lo));
+                k += lo;
+                continue;
+            }
+            if let Some((a, b, yes)) = query_region(p) {
+                last = Some((a, b, yes));
+                let take = b.saturating_sub(p).max(1).min(rem);
+                if yes {
+                    out_pages.extend_from_slice(&run[k..k + take]);
+                    out_ends.extend(std::iter::repeat_n(b, take));
+                }
+                k += take;
+            } else {
+                k += 1;
+            }
         }
-        // Not watched: what `runtime_memory` asks of views, from this query.
-        let yes = !(info.State == MEM_COMMIT && info.Type == MEM_PRIVATE);
-        let (base, size) = (info.BaseAddress as usize, info.RegionSize);
-        // In our pages, rounded inward so the region never claims a page it
-        // only shares.
-        let (a, b) = (base.div_ceil(PAGE).min(page), ((base + size) / PAGE).max(page + 1));
-        self.last = Some((a, b, yes));
-        yes.then_some(b)
     }
+    (out_pages, out_ends)
 }
 
 /// Pages `[first, last)` changed, and so the pages showing the same memory
@@ -2231,5 +2310,62 @@ pub(crate) mod tests {
         drop(t);
         // SAFETY: our reservation.
         unsafe { VirtualFree(base as *mut _, 0, MEM_RELEASE) };
+    }
+
+    /// A contiguous run inside one write-watched pool is checked with a single
+    /// `GetWriteWatch` range probe instead of one per page (#460), and a run
+    /// crossing a pool boundary splits in `O(log n)` probes without querying
+    /// `VirtualQuery` on the pool.
+    #[test]
+    fn filter_runtime_pages_batches_watched_runs_and_splits_boundaries() {
+        let protected = BTreeSet::new();
+
+        // Single pool of 4096 pages: 1 watched_range call, 0 query_region calls.
+        let pages: Vec<usize> = (100..4196).collect();
+        let (mut watch_calls, mut query_calls) = (0usize, 0usize);
+        let (kept, ends) = filter_runtime_pages(
+            &pages,
+            &protected,
+            |first, count| {
+                watch_calls += 1;
+                first >= 100 && first + count <= 4196
+            },
+            |_| {
+                query_calls += 1;
+                None
+            },
+        );
+        assert_eq!(watch_calls, 1);
+        assert_eq!(query_calls, 0);
+        assert_eq!(kept, pages);
+        assert!(ends.iter().all(|&e| e == 4196));
+
+        // Mixed run: pool A [0..1000), plain private [1000..1500), view [1500..2000).
+        let mixed: Vec<usize> = (0..2000).collect();
+        let (mut watch_calls, mut query_calls) = (0usize, 0usize);
+        let (kept, ends) = filter_runtime_pages(
+            &mixed,
+            &protected,
+            |first, count| {
+                watch_calls += 1;
+                first < 1000 && first + count <= 1000
+            },
+            |p| {
+                query_calls += 1;
+                if (1000..1500).contains(&p) {
+                    Some((1000, 1500, false))
+                } else if (1500..2000).contains(&p) {
+                    Some((1500, 2000, true))
+                } else {
+                    None
+                }
+            },
+        );
+        assert!(watch_calls <= 32, "expected O(log n) probes, got {watch_calls}");
+        assert_eq!(query_calls, 2, "one query per non-pool region");
+        let expected: Vec<usize> = (0..1000).chain(1500..2000).collect();
+        assert_eq!(kept, expected);
+        assert!(ends[..1000].iter().all(|&e| e == 1000));
+        assert!(ends[1000..].iter().all(|&e| e == 2000));
     }
 }
