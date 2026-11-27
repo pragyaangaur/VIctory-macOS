@@ -3477,6 +3477,79 @@ fn a_ds_read_u16_d16_into_a_lane_varying_destination_keeps_the_first_lane_refusa
     );
 }
 
+/// A `ds_read_b32` at a uniform address stays lane-uniform even when the
+/// shader writes LDS, provided every LDS write before and after it is
+/// separated by an `s_barrier`. Without a barrier before (RAW) or after (WAR)
+/// the read, it stays lane-varying and the divergent `v_readfirstlane_b32`
+/// keeps the cross-half refusal.
+#[test]
+fn a_barrier_isolated_ds_read_stays_uniform_with_lds_writes_present() {
+    let lower = |words: &[u32]| {
+        lower_halves_io(
+            words,
+            vec![RootParam {
+                sgprs: 4,
+                ..root(RootType::Constants, 0, 0)
+            }],
+            vec![],
+            1 << 15 | 4 << 1,
+            [128, 1, 1],
+        )
+    };
+    const S_BARRIER: u32 = 0xBF8A_0000;
+    const DS_WRITE_B32_V2_V0: [u32; 2] = [0xD834_0000, 0x0000_0002];
+    const DS_READ_B32_V1_V2: [u32; 2] = [0xD8D8_0000, 0x0100_0002];
+    let preamble = [
+        0x7E04_02FF,
+        0x0000_0000, // v_mov_b32 v2, 0 (uniform LDS address)
+    ];
+    let first_across = super::halves::FIRST_ACROSS;
+
+    // 1. ds_write -> s_barrier -> ds_read (no write after): uniform.
+    let mut w = Vec::from(preamble);
+    w.extend(DS_WRITE_B32_V2_V0);
+    w.push(S_BARRIER);
+    w.extend(DS_READ_B32_V1_V2);
+    divergent_read(&mut w, 0x7E0C_0501, 0xBF07_8006); // v_readfirstlane_b32 s6, v1; s_cmp_lg_u32 s6, 0
+    let l = lower(&w).expect("barrier before ds_read makes uniform LDS read lower in halves");
+    assert_eq!(l.wave_size, Some(32));
+    assert_eq!(l.shape.barriers, 1);
+
+    // 2. ds_write -> s_barrier -> ds_read -> s_barrier -> ds_write: uniform.
+    let mut w = Vec::from(preamble);
+    w.extend(DS_WRITE_B32_V2_V0);
+    w.push(S_BARRIER);
+    w.extend(DS_READ_B32_V1_V2);
+    w.push(S_BARRIER);
+    w.extend(DS_WRITE_B32_V2_V0);
+    divergent_read(&mut w, 0x7E0C_0501, 0xBF07_8006);
+    let l = lower(&w).expect("barriers on both sides make uniform LDS read lower in halves");
+    assert_eq!(l.wave_size, Some(32));
+    assert_eq!(l.shape.barriers, 2);
+
+    // 3. ds_write -> ds_read (RAW hazard, no barrier): refused.
+    let mut w = Vec::from(preamble);
+    w.extend(DS_WRITE_B32_V2_V0);
+    w.extend(DS_READ_B32_V1_V2);
+    divergent_read(&mut w, 0x7E0C_0501, 0xBF07_8006);
+    assert!(
+        matches!(lower(&w), Err(crate::ShaderError::Unsupported { what, .. }) if what == first_across),
+        "RAW hazard without s_barrier keeps the cross-half refusal"
+    );
+
+    // 4. ds_write -> s_barrier -> ds_read -> ds_write (WAR hazard, no barrier after): refused.
+    let mut w = Vec::from(preamble);
+    w.extend(DS_WRITE_B32_V2_V0);
+    w.push(S_BARRIER);
+    w.extend(DS_READ_B32_V1_V2);
+    w.extend(DS_WRITE_B32_V2_V0);
+    divergent_read(&mut w, 0x7E0C_0501, 0xBF07_8006);
+    assert!(
+        matches!(lower(&w), Err(crate::ShaderError::Unsupported { what, .. }) if what == first_across),
+        "WAR hazard without s_barrier after ds_read keeps the cross-half refusal"
+    );
+}
+
 /// A `global_load_dword` from the code's own table stays lane-uniform even
 /// where the shader performs stores that could alias other loads (here a
 /// `global_store_dword`): the first-lane read of it in a divergent block

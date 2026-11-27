@@ -884,6 +884,7 @@ pub(super) fn lane_uniform(x: &Parts) -> HashSet<Value> {
         .iter()
         .flat_map(|b| &b.insts)
         .any(|inst| matches!(&inst.fields, Fields::Ds { gds: false, .. }) && ds_writes(inst));
+    let lds_hazard = writes_lds.then(|| lds_write_hazards(p, &ds_writes));
     let writes_gds = p
         .blocks
         .iter()
@@ -1217,10 +1218,11 @@ pub(super) fn lane_uniform(x: &Parts) -> HashSet<Value> {
                     }
                     continue;
                 }
-                // An LDS read reads one value in every lane only where no
-                // data-share write can alias it (`!writes_lds`, or
-                // `!writes_gds` for a GDS read), and where its address (and
-                // any other register it reads) is proven uniform.
+                // An LDS read reads one value in every lane where no
+                // data-share write can race with it without an intervening
+                // `s_barrier` (either before or after the read, or `!writes_gds`
+                // for a GDS read), and where its address (and any other
+                // register it reads) is proven uniform.
                 if let Fields::Ds {
                     dst: Some(_),
                     data,
@@ -1230,7 +1232,11 @@ pub(super) fn lane_uniform(x: &Parts) -> HashSet<Value> {
                     && name.starts_with("ds_read")
                     && data.is_empty()
                 {
-                    let mem_written = if *gds { writes_gds } else { writes_lds };
+                    let mem_written = if *gds {
+                        writes_gds
+                    } else {
+                        lds_hazard.as_ref().is_some_and(|h| h[b][i])
+                    };
                     let operands_alike =
                         reads_alike(inst, &next, &next_s, st.guards[b][i].is_some());
                     if !mem_written && operands_alike {
@@ -1648,6 +1654,101 @@ fn mask_bit_alike(
         }
         _ => false,
     }
+}
+
+/// For each instruction `(b, i)`, whether an LDS write can reach `(b, i)`
+/// without an intervening `s_barrier` (RAW hazard) or be reached from `(b, i)`
+/// without an intervening `s_barrier` (WAR hazard).
+///
+/// When both are false for a `ds_read*` at a uniform address, all waves in the
+/// workgroup observe the same LDS contents even when the console wave runs as
+/// two host wave32 halves.
+fn lds_write_hazards(p: &Program, ds_writes: &impl Fn(&Inst) -> bool) -> Vec<Vec<bool>> {
+    let n = p.blocks.len();
+    let is_lds_write = |inst: &Inst| {
+        matches!(&inst.fields, Fields::Ds { gds: false, .. }) && ds_writes(inst)
+    };
+
+    let mut before_in = vec![false; n];
+    let mut before_out = vec![false; n];
+    loop {
+        let mut changed = false;
+        for b in 0..n {
+            let incoming = p.blocks[b].preds.iter().any(|&pred| before_out[pred]);
+            before_in[b] = incoming;
+            let mut dirty = incoming;
+            for inst in &p.blocks[b].insts {
+                if inst.name() == "s_barrier" {
+                    dirty = false;
+                } else if is_lds_write(inst) {
+                    dirty = true;
+                }
+            }
+            if dirty != before_out[b] {
+                before_out[b] = dirty;
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+
+    let mut after_in = vec![false; n];
+    let mut after_out = vec![false; n];
+    loop {
+        let mut changed = false;
+        for b in (0..n).rev() {
+            let outgoing = p.blocks[b]
+                .exit
+                .successors()
+                .iter()
+                .any(|&succ| after_in[succ]);
+            after_out[b] = outgoing;
+            let mut dirty = outgoing;
+            for inst in p.blocks[b].insts.iter().rev() {
+                if inst.name() == "s_barrier" {
+                    dirty = false;
+                } else if is_lds_write(inst) {
+                    dirty = true;
+                }
+            }
+            if dirty != after_in[b] {
+                after_in[b] = dirty;
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+
+    let mut hazard: Vec<Vec<bool>> = p
+        .blocks
+        .iter()
+        .map(|blk| vec![false; blk.insts.len()])
+        .collect();
+    for b in 0..n {
+        let mut dirty = before_in[b];
+        for (i, inst) in p.blocks[b].insts.iter().enumerate() {
+            hazard[b][i] = dirty;
+            if inst.name() == "s_barrier" {
+                dirty = false;
+            } else if is_lds_write(inst) {
+                dirty = true;
+            }
+        }
+        let mut dirty = after_out[b];
+        for (i, inst) in p.blocks[b].insts.iter().enumerate().rev() {
+            hazard[b][i] |= dirty;
+            if inst.name() == "s_barrier" {
+                dirty = false;
+            } else if is_lds_write(inst) {
+                dirty = true;
+            }
+        }
+    }
+    hazard
 }
 
 /// Scalar ops that write what they read, one value in every lane of a console
