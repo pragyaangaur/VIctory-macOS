@@ -2981,10 +2981,11 @@ fn make_marked(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> (Option<Kept>, O
 /// format of its family takes the texture's format unless it is castable.
 /// shortcut: such a view (sRGB of UNORM, say, on a texture the host made
 /// without castable formats) reads without its conversion.
-fn fits(texture: &ID3D12Resource, castable: &[u32], mut format: Option<&mut DXGI_FORMAT>, unordered: bool) -> bool {
+fn fits(copy: &crate::resource::HostTexture, mut format: Option<&mut DXGI_FORMAT>, unordered: bool) -> bool {
     use crate::resource::{DEPTH_FORMATS, family};
     // SAFETY: a live resource.
-    let d = unsafe { texture.GetDesc() };
+    let d = unsafe { copy.texture.GetDesc() };
+    let castable = &copy.castable;
     let allowed = if unordered {
         d.Flags.0 & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0 != 0
     } else {
@@ -3027,7 +3028,10 @@ fn fits(texture: &ID3D12Resource, castable: &[u32], mut format: Option<&mut DXGI
     }
     // A packed 16-bit target made R8G8B8A8_UNORM on this GPU
     // (`resource::target_format`): views name the format it has.
-    if view != own && crate::resource::target_format(view) == own {
+    if let Some(packed) = copy.promoted_from {
+        if packed != view {
+            return false;
+        }
         if let Some(format) = format {
             *format = d.Format;
         }
@@ -3150,7 +3154,7 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
                 {
                     desc.Format = DXGI_FORMAT(format as i32);
                 }
-                if !fits(texture, &copy.castable, desc.as_mut().map(|d| &mut d.Format), false) {
+                if !fits(&copy, desc.as_mut().map(|d| &mut d.Format), false) {
                     return None;
                 }
                 // SAFETY: a live texture and a slot of our heap.
@@ -3207,7 +3211,7 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
             {
                 desc.Format = DXGI_FORMAT(format as i32);
             }
-            if !fits(texture, &copy.castable, desc.as_mut().map(|d| &mut d.Format), true) {
+            if !fits(&copy, desc.as_mut().map(|d| &mut d.Format), true) {
                 return None;
             }
             // SAFETY: a live texture and a slot of our heap.
