@@ -1784,6 +1784,7 @@ impl<'a> Lower<'a> {
                 .collect(),
             #[cfg(test)]
             cbuffer_rows: self.s.m.written_calls("dx.op.cbufferLoadLegacy.i32"),
+            #[cfg(test)]
             unary_f32: self.s.m.written_unary_f32_flushes(),
             dxil: self.s.finish(),
             user_data,
