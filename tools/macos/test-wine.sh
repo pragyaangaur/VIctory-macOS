@@ -4,6 +4,7 @@
 # WINE names the wine binary. Cargo splits the runner on spaces, so the
 # runner is a wrapper script in a temporary folder without spaces.
 set -e
+wine_base="$PWD"
 cd "$(dirname "$0")/../.."
 ROOT="$PWD"
 # Homebrew's rustup is keg-only, so another cargo, such as Homebrew's rust,
@@ -16,11 +17,16 @@ export PATH="/opt/homebrew/opt/rustup/bin:$PATH"
 # checkout), else a wine on PATH. The link names whichever checkout ran
 # setup last, a fleet task's too, so this checkout's own comes first.
 if [ -z "${WINE:-}" ]; then
+    wine_base="$ROOT"
     for wine in "$ROOT/target/wine-cx/bin/wine" "$HOME/Library/Caches/victory-macos/target/wine-cx/bin/wine"; do
         [ -x "$wine" ] && { WINE="$wine"; break; }
     done
 fi
 WINE="${WINE:-$(command -v wine || true)}"
+case "$WINE" in
+    ''|/*) ;;
+    *) WINE="$wine_base/$WINE" ;;
+esac
 [ -x "$WINE" ] || { echo "set WINE to a wine binary" >&2; exit 1; }
 TARGET=x86_64-pc-windows-gnullvm
 mkdir -p target/macos
@@ -29,7 +35,8 @@ mkdir -p target/macos
 RUNNER_DIR="$(mktemp -d /tmp/victory-wine.XXXXXX)"
 LINK="$RUNNER_DIR/wine"
 trap 'rm -f "$LINK" && rmdir "$RUNNER_DIR" || true' EXIT
-printf '#!/bin/sh\nexec "%s" "$@"\n' "$WINE" > "$LINK"
+export WINE
+printf '#!/bin/sh\nexec "$WINE" "$@"\n' > "$LINK"
 chmod +x "$LINK"
 export WINEPREFIX="${WINEPREFIX:-$ROOT/target/wineprefix}"
 export WINEDEBUG="${WINEDEBUG:--all}"

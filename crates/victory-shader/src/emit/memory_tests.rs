@@ -163,6 +163,7 @@ fn typed_store_program(soffset: u8) -> Result<HostShader, crate::ShaderError> {
         heap: lowered.heap,
         heap_writes: lowered.heap_writes,
         view_marks: lowered.view_marks,
+        half_views: lowered.half_views,
     };
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
         v.validate(&mut shader.dxil.clone())
@@ -327,6 +328,7 @@ fn program() -> HostShader {
         heap: l.heap,
         heap_writes: l.heap_writes,
         view_marks: l.view_marks,
+        half_views: l.half_views,
     };
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
         v.validate(&mut shader.dxil.clone()).expect("DXIL validation failed");
@@ -739,6 +741,7 @@ fn root_views_read_their_copy_and_zeros_past_it() {
         heap: l.heap,
         heap_writes: l.heap_writes,
         view_marks: l.view_marks,
+        half_views: l.half_views,
     };
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
         v.validate(&mut shader.dxil.clone()).expect("DXIL validation failed");
@@ -882,6 +885,7 @@ fn writes_through_views_mark_their_pages() {
         heap: l.heap,
         heap_writes: l.heap_writes,
         view_marks: l.view_marks,
+        half_views: l.half_views,
     };
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
         v.validate(&mut shader.dxil.clone()).expect("DXIL validation failed");
@@ -1141,6 +1145,7 @@ fn heap_direct_texture_reads_mark_their_heap_index() {
         heap: l.heap,
         heap_writes: l.heap_writes,
         view_marks: l.view_marks,
+        half_views: l.half_views,
     };
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
         v.validate(&mut shader.dxil.clone()).expect("DXIL validation failed");
@@ -1255,6 +1260,7 @@ fn straddling_writes_across_256mib_and_4gib_boundaries_mark_exact_pages() {
         heap: l.heap,
         heap_writes: l.heap_writes,
         view_marks: l.view_marks,
+        half_views: l.half_views,
     };
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
         v.validate(&mut shader.dxil.clone())
@@ -1456,6 +1462,7 @@ fn early_depth_stencil_skips_occluded_read_mark_pixel_shaders() {
         heap: vs_lowered.heap,
         heap_writes: vs_lowered.heap_writes,
         view_marks: vs_lowered.view_marks,
+        half_views: vs_lowered.half_views,
     };
 
     let ps_words: [u32; 12] = [
@@ -1533,6 +1540,7 @@ fn early_depth_stencil_skips_occluded_read_mark_pixel_shaders() {
         heap: ps_lowered.heap,
         heap_writes: ps_lowered.heap_writes,
         view_marks: ps_lowered.view_marks,
+        half_views: ps_lowered.half_views,
     };
 
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {

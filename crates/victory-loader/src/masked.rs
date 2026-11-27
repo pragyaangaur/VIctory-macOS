@@ -72,11 +72,14 @@ pub fn masked_stores(info: &ImageInfo, bytes: &[u8]) -> Vec<MaskedStore> {
         let code = &bytes[start..end];
         for at in 0..code.len() {
             if let Some((kind, wide)) = decode(code, at) {
-                found.push(MaskedStore {
-                    rva: s.rva + at as u32,
-                    kind,
-                    wide,
-                });
+                // An offset past 4 GiB has no RVA; skip the store rather
+                // than wrap.
+                if let Some(rva) = u32::try_from(at)
+                    .ok()
+                    .and_then(|off| s.rva.checked_add(off))
+                {
+                    found.push(MaskedStore { rva, kind, wide });
+                }
             }
         }
     }
@@ -113,6 +116,55 @@ pub fn summary(found: &[MaskedStore]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An `ImageInfo` whose one executable section covers `len` bytes of
+    /// file offset 0 at `rva`.
+    fn exec_info(rva: u32, len: u32) -> ImageInfo {
+        ImageInfo {
+            machine: victory_pe::MACHINE_AMD64,
+            characteristics: 0,
+            timestamp: 0,
+            subsystem: 0,
+            dll_characteristics: 0,
+            image_base: 0,
+            size_of_image: 0,
+            entry_rva: 0,
+            stack_reserve: 0,
+            stack_commit: 0,
+            sections: vec![victory_pe::SectionInfo {
+                name: ".text".into(),
+                rva,
+                virtual_size: len,
+                file_offset: 0,
+                file_size: len,
+                characteristics: section_flags::MEM_EXECUTE,
+            }],
+            imports: Vec::new(),
+            delay_imports: Vec::new(),
+            exports: Vec::new(),
+            tls: None,
+            has_relocations: false,
+            has_exception_table: false,
+            has_load_config: false,
+            codeview: None,
+        }
+    }
+
+    #[test]
+    fn stores_whose_rva_would_overflow_are_skipped() {
+        // vpmaskmovd at offset 0 (its RVA fits) and at offset 5 (past the
+        // 4 GiB limit: a panic in debug builds before).
+        let code = [0xc4, 0xe2, 0x45, 0x8e, 0x30, 0xc4, 0xe2, 0x45, 0x8e, 0x30];
+        let info = exec_info(u32::MAX - 2, code.len() as u32);
+        assert_eq!(
+            masked_stores(&info, &code),
+            [MaskedStore {
+                rva: u32::MAX - 2,
+                kind: MaskedKind::Vpmaskmovd,
+                wide: true,
+            }]
+        );
+    }
 
     #[test]
     fn decodes_the_store_seen_in_the_rosetta_hang() {

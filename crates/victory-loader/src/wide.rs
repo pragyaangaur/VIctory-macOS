@@ -188,7 +188,7 @@ fn parse(line: &str) -> Option<(u32, usize, Vec<Piece>, Route)> {
             _ => return None,
         });
     }
-    let sum: usize = pieces
+    let sum: Option<usize> = pieces
         .iter()
         .map(|p| match p {
             Piece::Store(n)
@@ -197,7 +197,8 @@ fn parse(line: &str) -> Option<(u32, usize, Vec<Piece>, Route)> {
             | Piece::Cond(n, ..)
             | Piece::Rip(n, ..) => *n,
         })
-        .sum();
+        .try_fold(0usize, |acc, n| acc.checked_add(n));
+    let sum = sum?;
     (sum == total && (total >= 5 || !route.is_empty() && total >= 2))
         .then_some((rva, total, pieces, route))
 }
@@ -432,6 +433,21 @@ pub fn patch(base: u64, list: &std::path::Path) -> (usize, usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_list_whose_piece_sizes_overflow_is_rejected() {
+        // The declared total is the pieces' wrapped sum, so a sum that wraps
+        // instead of overflowing (a plain `+` in a release build) would make
+        // this line parse: the assertion fails in release builds too, not
+        // only as a panic in debug ones. A total of usize::MAX is not asserted
+        // to parse: patch() would hand it to slice::from_raw_parts, whose
+        // length must stay within isize::MAX.
+        let max = usize::MAX;
+        let line = format!("1000 {} s{max} s6", max.wrapping_add(6));
+        assert!(parse(&line).is_none());
+        // Control: an ordinary line.
+        assert!(parse("1000 10 s6 c4").is_some());
+    }
 
     #[test]
     fn splits_vmovups_rdi() {

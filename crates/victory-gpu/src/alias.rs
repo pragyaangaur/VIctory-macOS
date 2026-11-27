@@ -19,6 +19,7 @@ use windows_sys::Win32::System::Memory::{
     VirtualAlloc, VirtualFree, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE,
 };
 
+use crate::backend::HostMemory;
 use crate::host::host;
 use crate::watch::PAGE;
 
@@ -226,21 +227,49 @@ mod mach {
     }
 }
 
+/// Minimum physical memory (20 GiB) required for aliasing to be enabled by default.
+/// Below this (e.g. 8/16/18 GB Macs), pinned/wired aliased regions can trigger
+/// Metal out-of-memory errors; `VICTORY_ALIAS_BUFFERS=1` still opts in.
+const DEFAULT_MIN_RAM_BYTES: u64 = 20 << 30;
+
+fn total_ram_bytes() -> Option<u64> {
+    use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+    // SAFETY: `MEMORYSTATUSEX` is plain-old-data with `dwLength` initialized.
+    let mut status: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
+    status.dwLength = size_of::<MEMORYSTATUSEX>() as u32;
+    // SAFETY: `status` is valid and `dwLength` is set.
+    if unsafe { GlobalMemoryStatusEx(&mut status) } == 0 || status.ullTotalPhys == 0 {
+        None
+    } else {
+        Some(status.ullTotalPhys)
+    }
+}
+
 /// `asked`: `Some(on)` when `VICTORY_ALIAS_BUFFERS` is set (`0` is off, any
-/// other value on), `None` when it is not: then on.
-fn decide_enabled(asked: Option<bool>, rosetta: bool, warp: bool) -> bool {
-    asked.unwrap_or(true) && rosetta && !warp
+/// other value on), `None` when it is not: then on only with >= 20 GiB RAM.
+fn decide_enabled(asked: Option<bool>, rosetta: bool, warp: bool, total_ram: Option<u64>) -> bool {
+    let default_on = total_ram.is_some_and(|ram| ram >= DEFAULT_MIN_RAM_BYTES);
+    asked.unwrap_or(default_on) && rosetta && !warp
 }
 
 /// Whether title buffers are aliased on this host: Rosetta + D3DMetal,
-/// unless `VICTORY_ALIAS_BUFFERS=0`.
+/// on by default with >= 20 GiB RAM unless `VICTORY_ALIAS_BUFFERS` overrides it.
 pub fn enabled() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| {
+        let rosetta = crate::watch::rosetta();
         let warp = cfg!(feature = "diagnostics") && crate::switch::on("VICTORY_D3D12_WARP");
         let asked = std::env::var_os("VICTORY_ALIAS_BUFFERS")
             .map(|_| crate::switch::on("VICTORY_ALIAS_BUFFERS"));
-        decide_enabled(asked, crate::watch::rosetta(), warp)
+        let ram = total_ram_bytes();
+        let on = decide_enabled(asked, rosetta, warp, ram);
+        if asked.is_none() && rosetta && !warp && !on {
+            tracing::info!(
+                ram_gib = ram.map(|b| b / (1 << 30)),
+                "zero-copy title buffer aliasing off by default below 20 GiB RAM (set VICTORY_ALIAS_BUFFERS=1 to enable)"
+            );
+        }
+        on
     })
 }
 
@@ -531,6 +560,7 @@ mod tests {
 
     struct AliasedAlloc {
         ptr: *mut u8,
+        len: usize,
         aliased: bool,
     }
 
@@ -552,7 +582,7 @@ mod tests {
             }
             let aliased = alias_region(ptr as usize, len, preserve);
             assert!(aliased, "alias_region failed");
-            Self { ptr, aliased }
+            Self { ptr, len, aliased }
         }
     }
 
@@ -561,6 +591,14 @@ mod tests {
             if self.aliased {
                 unalias_region(self.ptr as usize);
             }
+            // As the runtime does when the title unmaps memory: the guards
+            // let go of its pages. A tracker some test or copy still holds
+            // left them in the guard set otherwise, and a test running at
+            // the same time that was given the address had them skipped as
+            // guarded already, so they stayed writable (#31:
+            // `takes_guard_one_view_per_call` after
+            // `aliased_gpu_writes_notify_overlapping_texture_tracker`).
+            crate::watch::title_memory_remapped(self.ptr as usize, self.len);
             // SAFETY: `self.ptr` was allocated by `VirtualAlloc`.
             unsafe { VirtualFree(self.ptr.cast(), 0, MEM_RELEASE) };
         }
@@ -684,17 +722,29 @@ mod tests {
 
     #[test]
     fn switch_respects_rosetta_and_warp() {
-        assert!(!decide_enabled(Some(false), true, false));
-        assert!(!decide_enabled(Some(true), false, false));
-        assert!(!decide_enabled(Some(true), true, true));
-        assert!(decide_enabled(Some(true), true, false));
+        assert!(!decide_enabled(Some(false), true, false, Some(32 << 30)));
+        assert!(!decide_enabled(Some(true), false, false, Some(32 << 30)));
+        assert!(!decide_enabled(Some(true), true, true, Some(32 << 30)));
+        assert!(decide_enabled(Some(true), true, false, Some(32 << 30)));
+        assert!(decide_enabled(Some(true), true, false, Some(16 << 30)));
     }
 
     #[test]
     fn unset_is_on_under_rosetta_only() {
-        assert!(decide_enabled(None, true, false));
-        assert!(!decide_enabled(None, false, false));
-        assert!(!decide_enabled(None, true, true));
+        assert!(decide_enabled(None, true, false, Some(24 << 30)));
+        assert!(!decide_enabled(None, false, false, Some(24 << 30)));
+        assert!(!decide_enabled(None, true, true, Some(24 << 30)));
+    }
+
+    #[test]
+    fn unset_requires_at_least_20_gib_ram() {
+        assert!(!decide_enabled(None, true, false, None));
+        assert!(!decide_enabled(None, true, false, Some(8 << 30)));
+        assert!(!decide_enabled(None, true, false, Some(16 << 30)));
+        assert!(!decide_enabled(None, true, false, Some(18 << 30)));
+        assert!(decide_enabled(None, true, false, Some(20 << 30)));
+        assert!(decide_enabled(None, true, false, Some(32 << 30)));
+        assert!(total_ram_bytes().is_some());
     }
 
     #[test]
@@ -769,7 +819,11 @@ mod tests {
         .cast::<u8>();
         assert!(!ptr.is_null());
         assert!(alias_region(ptr as usize, len, false));
-        let alloc = AliasedAlloc { ptr, aliased: true };
+        let alloc = AliasedAlloc {
+            ptr,
+            len,
+            aliased: true,
+        };
         let shadow = crate::shadow::find(alloc.ptr as u64, len as u64).expect("aliased shadow");
         let base = alloc.ptr as usize;
 

@@ -179,6 +179,7 @@ fn shader(l: lower::Lowered) -> super::HostShader {
         heap: l.heap,
         heap_writes: l.heap_writes,
         view_marks: l.view_marks,
+        half_views: l.half_views,
     }
 }
 
@@ -555,6 +556,49 @@ fn reduction(op: u32, ident: u32, input: u32) -> Vec<u32> {
     w
 }
 
+/// The console's low-half f16 whole-wave64 sum of `v0`: DPP within rows,
+/// `v_permlanex16` across rows, then lanes 31 and 63 (each 32-lane half's
+/// sum) read and added. Its high half is kept from lane 31, as the
+/// compiler's `v_add_f16` lowering does.
+fn half_reduction() -> Vec<u32> {
+    let vop2 = |src0: u16| (0x32u32 << 25) | (1 << 17) | (1 << 9) | u32::from(src0);
+    let dpp16 = |ctrl: u16| (0xFu32 << 28) | (0xFu32 << 24) | (u32::from(ctrl) << 8) | 1;
+    let vop3 = |dst: u8, op: u16, src0: u16, src1: u16, src2: u16| {
+        [
+            0xD400_0000 | u32::from(op) << 16 | u32::from(dst),
+            u32::from(src0) | u32::from(src1) << 9 | u32::from(src2) << 18,
+        ]
+    };
+    let mut w = PROLOGUE.to_vec();
+    w.extend([
+        0x3420_0085, // v_lshlrev_b32 v16, 5, v0
+        0x7E06_0300, // v_mov_b32 v3, v0
+        0xBE8C_25C1, // s_or_saveexec_b64 s[12:13], -1
+        0xD501_0001,
+        0x0032_0680, // v_cndmask_b32 v1, 0, v3, s[12:13]
+        vop2(128),   // v_add_f16 v1, 0, v1
+    ]);
+    for ctrl in [0x00B1, 0x004E, 0x0164, 0x0168] {
+        w.push(vop2(0x00FA));
+        w.push(dpp16(ctrl));
+    }
+    w.extend(vop3(2, 0x378, 257, 128, 128)); // v_permlanex16_b32 v2, v1, 0, 0
+    w.push(vop2(258)); // v_add_f16 v1, v2, v1
+    // Lane 31 holds the sum of lanes 0-31, lane 63 that of lanes 32-63.
+    w.extend(vop3(1, 0x360, 257, 159, 0)); // v_readlane_b32 s1, v1, 31
+    w.extend(vop3(2, 0x360, 257, 191, 0)); // v_readlane_b32 s2, v1, 63
+    w.push(0x7E06_0202); // v_mov_b32 v3, s2
+    w.push((0x32 << 25) | (1 << 17) | (3 << 9) | 1); // v_add_f16 v1, s1, v3
+    w.extend(vop3(1, 0x360, 257, 159, 0)); // v_readlane_b32 s1, v1, 31
+    w.extend([
+        0xBEFE_040C, // s_mov_b64 exec, s[12:13]
+        0x7E02_0201, // v_mov_b32 v1, s1
+    ]);
+    w.extend(store(1, 0));
+    w.push(S_ENDPGM);
+    w
+}
+
 /// What the console gives [`reduction`] of `f` (folding the inputs of a
 /// console wave's lanes) in lane `l` of a group of `threads`.
 fn console_reduction(
@@ -720,6 +764,23 @@ fn reductions_and_prefixes_pass_between_halves() {
                 .expect("DXIL validation failed");
         }
     }
+
+    let half_sum = half_reduction();
+    let p = ir::build(&native(&half_sum, true, 96, 0).code, true, 32).expect("f16 IR");
+    assert!(
+        super::wave::sections(&p, 0).values().any(|section| {
+            section
+                .shapes
+                .values()
+                .any(|shape| matches!(shape, super::wave::Shape::Half(..)))
+        }),
+        "f16 reduction fixture was not recognized"
+    );
+    for threads in [32, 64, 96, 128] {
+        assert_eq!(refusal(&half_sum, threads, 0), "translated");
+    }
+    let halves = lowered(&native(&half_sum, true, 96, 0), true).expect("f16 halves");
+    assert_eq!(halves.wave_size, Some(32));
 }
 
 /// [`reduction`]s and [`exclusive_prefix`] on every hardware adapter give
@@ -777,6 +838,23 @@ fn reductions_and_prefixes_across_halves_match_the_console_on_every_gpu() {
             .map(|l| (console_reduction(threads, l, |a, b| a + b, |t| t) as f32).to_bits())
             .collect();
         failed.extend(differences(&looped, threads, 1, &want));
+    }
+    // Each input lane is a positive f16 subnormal whose bit pattern is its
+    // lane number. These sums are exactly representable, so per-step f16
+    // arithmetic and the translator's f32 accumulation round to the same
+    // result. The 96-thread case also checks a missing upper half.
+    let half_sum = half_reduction();
+    for threads in [32, 64, 96, 128] {
+        let want: Vec<u32> = (0..threads)
+            .map(|l| match (threads, l & !63) {
+                (32, _) => 0x01F0,
+                (_, 0) => 0x07E0,
+                (96, 64) => 0x08F8,
+                (128, 64) => 0x0DF8,
+                _ => unreachable!(),
+            })
+            .collect();
+        failed.extend(differences(&half_sum, threads, 1, &want));
     }
     assert!(failed.is_empty(), "{}", failed.join("\n"));
 }
@@ -841,8 +919,11 @@ fn lane_reads_pass_between_halves() {
     ]
     .concat();
     assert_eq!(refusal(&first_alone, 64, 0), "translated");
-    // Nor does a value the same in every lane: a buffer dword loaded at an
-    // offset the same in every lane, through a scalar descriptor.
+    // A buffer dword loaded at an offset the same in every lane, through a
+    // scalar descriptor, with a store present (`store(5, 0)` below): not
+    // proven the same in every lane, so the first-lane read passes the
+    // value between the halves in the entry block, where every lane of the
+    // group runs it together.
     assert_eq!(
         refusal(&first_lane_of_a_buffer_load(3), 64, 0),
         "translated"

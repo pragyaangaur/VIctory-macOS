@@ -141,6 +141,13 @@ impl<S> Held<S> {
                     let ready = match items.front_mut() {
                         None => false,
                         Some((Item::Segment(_, waits), since, fresh)) => {
+                            // Earlier segments of this queue run before its
+                            // waits are tested: their bottom-of-pipe writes
+                            // can change what the waits read.
+                            if !waits.is_empty() && !piece.is_empty() {
+                                (w.run)(*queue, std::mem::take(&mut piece));
+                                done.pieces += 1;
+                            }
                             let mut ok = true;
                             for wait in waits.iter() {
                                 match wait.holds(w.read) {
@@ -296,6 +303,25 @@ mod tests {
         assert_eq!(w(0, 5).holds(&read), None, "unknown comparison");
         assert_eq!(w(9, 5).holds(&read), None);
         assert_eq!(w(EQUAL, 5).holds(&|_, _| None), None, "unreadable memory");
+    }
+
+    /// A wait is tested after the earlier segments of its own queue ran:
+    /// one that sets the value back holds the next segment's wait.
+    #[test]
+    fn a_wait_reads_what_earlier_segments_of_its_queue_wrote() {
+        let fake = RefCell::new(Fake::default());
+        fake.borrow_mut().memory.insert(0x100, 1);
+        fake.borrow_mut().writes.insert("reset", vec![(0x100, 0)]);
+        let eq = |reference| ValueWait { address: 0x100, bytes: 8, comparison: EQUAL, reference, mask: u64::MAX };
+        let mut held = Held::default();
+        held.push(1, Item::Segment("reset", vec![]));
+        held.push(1, Item::Segment("after", vec![eq(1)]));
+        pump(&mut held, &fake);
+        assert_eq!(fake.borrow().log, ["q1: reset"], "the wait reads the 0 the reset wrote");
+        assert!(held.holds_work(1));
+        fake.borrow_mut().memory.insert(0x100, 1);
+        pump(&mut held, &fake);
+        assert_eq!(fake.borrow().log, ["q1: reset", "q1: after"]);
     }
 
     /// The compute queue's list waits for a value the graphics queue's list

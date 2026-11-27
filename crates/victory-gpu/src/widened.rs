@@ -11,6 +11,7 @@ use std::sync::{Arc, OnceLock};
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::core::{Interface, s};
 
+use crate::backend::HostMemory;
 use crate::compute::{Param, pipeline};
 use crate::host::{HostList, transition, uav_barrier};
 use crate::shadow::{Shadow, Widened};

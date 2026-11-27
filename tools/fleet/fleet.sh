@@ -54,14 +54,16 @@ macos_major() { sw_vers -productVersion | cut -d . -f 1; }
 # Checks out COMMIT in the fleet worktree, with target/ linked to the shared
 # build folder.
 prepare_worktree() { # COMMIT
-    mkdir -p "$TARGET"
-    git -C "$ROOT" fetch --quiet "https://github.com/$REPO.git" "$1"
+    # cmd_work runs cmd_run inside an if, where set -e is suspended for this
+    # whole call stack, so every required step checks its own exit status.
+    mkdir -p "$TARGET" || return 1
+    git -C "$ROOT" fetch --quiet "https://github.com/$REPO.git" "$1" || return 1
     git -C "$ROOT" worktree remove --force "$WORK" > /dev/null 2>&1 || true
-    git -C "$ROOT" worktree prune
-    git -C "$ROOT" worktree add --quiet --detach "$WORK" "$1"
-    [ "$(git -C "$WORK" rev-parse HEAD)" = "$1" ] || die "checkout did not land on $1"
-    rm -rf "$WORK/target"
-    ln -s "$TARGET" "$WORK/target"
+    git -C "$ROOT" worktree prune || return 1
+    git -C "$ROOT" worktree add --quiet --detach "$WORK" "$1" || return 1
+    [ "$(git -C "$WORK" rev-parse HEAD)" = "$1" ] || { say "checkout did not land on $1"; return 1; }
+    rm -rf "$WORK/target" || return 1
+    ln -s "$TARGET" "$WORK/target" || return 1
 }
 
 # Open tasks this Mac can take, best first: highest priority, then oldest.
@@ -274,10 +276,15 @@ cmd_run() {
     load_task "$n"
     require_lease "$n"
     logs="$CACHE/logs/$n"
-    mkdir -p "$logs"
+    mkdir -p "$logs" || return 1
 
     say "checking out ${T_COMMIT:0:12} in $WORK (builds are kept in $TARGET)"
-    prepare_worktree "$T_COMMIT"
+    # cmd_work calls this function inside an if, where set -e does not reach
+    # it: check the checkout explicitly, before the heartbeat or setup start.
+    if ! prepare_worktree "$T_COMMIT"; then
+        say "could not prepare the checkout for ${T_COMMIT:0:12} in $WORK; not running setup"
+        return 1
+    fi
 
     # Keep the lease alive while the suites run.
     (while sleep 1800; do gh issue comment "$n" -R "$REPO" --body "/beat" > /dev/null 2>&1 || true; done) &
@@ -325,7 +332,7 @@ cmd_run() {
           timings: {setup: $ts, native: $tn, wine: $tw}, binaries: $binaries}')
     validate_result "$result" "$T_COMMIT" "$T_CHIP" "$T_MACOS" > "$logs/result-errors.txt" ||
         die "the result does not pass the schema (see $logs/result-errors.txt); please report this"
-    printf '%s\n' "$result" > "$logs/result.json"
+    printf '%s\n' "$result" > "$logs/result.json" || return 1
     jq . <<< "$result"
     say "done. Show this to the person, then: tools/fleet/fleet.sh submit $n"
 }
@@ -382,7 +389,7 @@ nap() {
 # look before it uses the Mac any further.
 cmd_work() {
     accepted || die "the fleet terms are not accepted yet; run tools/fleet/fleet.sh doctor"
-    local chip n held tasks fails=0 done_count=0
+    local chip n held tasks fails=0 done_count=0 last=""
     chip=$(my_chip)
     is_chip "$chip" || die "unknown chip: $(brand)"
     mkdir -p "$CACHE"
@@ -390,8 +397,10 @@ cmd_work() {
     say "working until stopped. To stop after the current task: tools/fleet/fleet.sh stop"
     while [ ! -f "$STOP_FILE" ]; do
         accepted || die "the fleet rules changed; the person must accept them again (fleet.sh rules, then accept)"
+        # The list can still show, for a few seconds, the task whose result
+        # the queue just accepted and closed: skip the one done last.
         held=$(gh issue list -R "$REPO" --state open --assignee @me --label "$(label task)" --label "$(label leased)" \
-            --json number --jq '.[0].number // empty' 2> /dev/null || true)
+            --json number --jq '.[].number' 2> /dev/null | grep -vx "${last:-0}" | head -n 1 || true)
         if [ -n "$held" ]; then
             n=$held
             say "resuming task #$n"
@@ -419,6 +428,7 @@ cmd_work() {
         fi
         if (cmd_run "$n") && (cmd_submit "$n"); then
             fails=0
+            last=$n
             done_count=$((done_count + 1))
             say "task #$n done ($done_count so far)"
             if [ "$(jq -r .setup "$CACHE/logs/$n/result.json" 2> /dev/null)" = failed ]; then

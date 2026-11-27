@@ -382,6 +382,20 @@ pub struct HostShader {
     /// `u`[`VIEW_WRITES`] in [`MEMORY_SPACE`] (module notes, "Write
     /// marks").
     pub view_marks: bool,
+    /// Table descriptors (root parameter, dword offset in the table) whose
+    /// buffer the shader reads or writes sixteen bits a channel
+    /// (`buffer_load_format_d16_*`, `buffer_store_format_d16_*`, or a format
+    /// load whose every use reads one half as f16), in order. On the console
+    /// each channel's 16 bits move as they are through a 16-bit float view
+    /// and through a 16-bit integer one alike. The DXIL moves them as
+    /// unsigned integers, which an unsigned 16-bit view carries unchanged;
+    /// the host shows the shader a 16-bit float or signed buffer view at
+    /// these places as the unsigned format of the same layout.
+    /// shortcut: a view in a normalised 16-bit format, whose values the
+    /// console would convert to halves, is read as its integers; a
+    /// descriptor picked at run time keeps the float path (its slot, and so
+    /// its format, is known only then).
+    pub half_views: Vec<(u8, u32)>,
 }
 
 impl HostShader {
@@ -480,11 +494,9 @@ pub struct MeshOutputs {
 }
 
 impl MeshOutputs {
-    /// The outputs' size as Metal counts it: 4 bytes per declared component
-    /// of each declared vertex and primitive (indices are not counted), not
-    /// 16 per signature row. Measured on an M4 with D3DMetal 4.0 beta 3: the
-    /// largest shape that draws is exactly [`METAL_MESH_OUTPUT_BYTES`], and
-    /// at 128 vertices 17 rows of 59 components draw, 17 of 65 do not.
+    /// The packed size: 4 bytes per declared component of each declared
+    /// vertex and primitive (indices are not counted). Use
+    /// [`metal_mesh_output_bytes`] to account for alignment in emitted DXIL.
     pub fn bytes(&self) -> u32 {
         4 * (self.vertex_components * self.vertices + self.primitive_components * self.primitives)
     }
@@ -547,6 +559,78 @@ pub fn mesh_outputs(dxil: &[u8]) -> Option<MeshOutputs> {
         vertex_components: components(FourCC::OSG1)?,
         primitive_components: components(FourCC::PSG1)?,
     })
+}
+
+/// The larger of the packed and Metal-aligned mesh output sizes.
+/// Some layouts fit when packed but exceed the limit after Metal aligns
+/// their output elements (#172).
+pub fn metal_mesh_output_bytes(dxil: &[u8]) -> Option<u32> {
+    mesh_outputs(dxil)
+        .map(|outputs| outputs.bytes())
+        .max(aligned_mesh_output_bytes(dxil))
+}
+
+/// Output size for a mesh shader that exceeds Metal's limit. The GPU
+/// uses this decision for source retention, linking, and pipeline refusal.
+pub fn over_limit_mesh_output_bytes(dxil: &[u8]) -> Option<u32> {
+    metal_mesh_output_bytes(dxil).filter(|&bytes| bytes > METAL_MESH_OUTPUT_BYTES)
+}
+
+/// Output bytes as Apple's Metal counts them for a translated mesh shader
+/// (measured on D3DMetal): per vertex, clip/cull distances, position, then
+/// remaining outputs in signature order, aligned to own size; same for
+/// primitives; multiplied by declared max counts.
+fn aligned_mesh_output_bytes(dxil: &[u8]) -> Option<u32> {
+    let u32_at = |b: &[u8], at: usize| {
+        b.get(at..at + 4)
+            .map(|v| u32::from_le_bytes(v.try_into().expect("4 bytes")) as usize)
+    };
+    let part = |name: &[u8; 4]| {
+        (0..u32_at(dxil, 28)?).find_map(|i| {
+            let at = u32_at(dxil, 32 + 4 * i)?;
+            (dxil.get(at..at + 4)? == name)
+                .then(|| dxil.get(at + 8..at + 8 + u32_at(dxil, at + 4)?))
+                .flatten()
+        })
+    };
+    let elements = |name: &[u8; 4]| -> Option<Vec<(usize, u32)>> {
+        let Some(data) = part(name) else {
+            return Some(Vec::new());
+        };
+        (0..u32_at(data, 0)?)
+            .map(|i| {
+                let at = 8 + 32 * i;
+                let mask = *data.get(at + 24)?;
+                Some((u32_at(data, at + 12)?, mask.count_ones()))
+            })
+            .collect()
+    };
+    const POSITION: usize = 1;
+    const DISTANCES: [usize; 2] = [2, 3];
+    let layout = |sizes: &mut dyn Iterator<Item = u32>| {
+        sizes
+            .filter(|&size| size > 0)
+            .fold(0, |end: u32, size| end.next_multiple_of(size) + size)
+    };
+    let vertex = elements(b"OSG1")?;
+    let distances = vertex
+        .iter()
+        .filter(|(kind, _)| DISTANCES.contains(kind))
+        .map(|&(_, n)| n)
+        .sum::<u32>();
+    let vertex_bytes = layout(
+        &mut std::iter::repeat_n(4, distances as usize)
+            .chain([16])
+            .chain(vertex.iter().filter(|e| e.0 != POSITION).map(|e| 4 * e.1)),
+    );
+    let primitive_bytes = layout(&mut elements(b"PSG1")?.iter().map(|e| 4 * e.1));
+    let info = part(b"PSV0")?.get(4..)?;
+    let maximum = |at: usize| {
+        Some(u32::from(u16::from_le_bytes(
+            info.get(at..at + 2)?.try_into().ok()?,
+        )))
+    };
+    Some(maximum(12)? * vertex_bytes + maximum(14)? * primitive_bytes)
 }
 
 struct Prepared<'a> {
@@ -880,6 +964,7 @@ fn emit_pruned(
         heap: l.heap,
         heap_writes: l.heap_writes,
         view_marks: l.view_marks,
+        half_views: l.half_views,
     })
 }
 
@@ -1531,6 +1616,7 @@ mod tests {
             heap: false,
             heap_writes: false,
             view_marks: false,
+            half_views: Vec::new(),
         };
         let file = |var: &str, stage| {
             std::env::var(var).ok().map(|p| super::HostShader {
@@ -1549,6 +1635,7 @@ mod tests {
                 heap: false,
                 heap_writes: false,
                 view_marks: false,
+                half_views: Vec::new(),
             })
         };
         let ps = file("VICTORY_REF_PS", crate::HwStage::Ps).unwrap_or(ps);
@@ -2141,6 +2228,21 @@ mod tests {
         assert_eq!(mesh_outputs(&constant_color()), None);
     }
 
+    #[test]
+    fn mesh_output_budget_counts_alignment() {
+        let fits = shaped_mesh(128, 128, &HALF_FILLED, 0).unwrap();
+        let mut overflow = HALF_FILLED;
+        overflow[0] = &[3, 1];
+        let over = shaped_mesh(128, 128, &overflow, 0).unwrap();
+        assert_eq!(mesh_bytes(&fits.dxil), Some(30_208));
+        assert_eq!(mesh_bytes(&over.dxil), Some(30_208));
+        assert_eq!(metal_mesh_output_bytes(&fits.dxil), Some(32_768));
+        assert_eq!(metal_mesh_output_bytes(&over.dxil), Some(34_816));
+        assert_eq!(over_limit_mesh_output_bytes(&fits.dxil), None);
+        assert_eq!(over_limit_mesh_output_bytes(&over.dxil), Some(34_816));
+        eprintln!("generated mesh: 30,208 packed, 32,768 aligned control, 34,816 aligned overflow");
+    }
+
     /// Mesh shaders whose outputs fill Metal's limit exactly still draw on
     /// the hardware device, as do rows only partly filled whose components
     /// fit (one row or component more, D3DMetal marks the pipeline a no-op
@@ -2713,13 +2815,14 @@ mod tests {
         let _ = super::emit(&c, &native, &p, &st, &io, &res);
     }
 
-    /// Builds a synthetic mesh shader declaring `SV_Position` plus 16 `float4`
-    /// `TEXCOORD` outputs (68 components total). At 128 vertices that is
-    /// 34,816 bytes (> 32 KiB DXIL budget).
+    /// Builds a synthetic mesh shader with `SV_Position` and 16 `TEXCOORD` rows.
+    /// The first row contains the first two pixel channels and the last row
+    /// contains the other two.
     fn wide_mesh_parts(
         threads: u32,
         max_vertices: u32,
         max_primitives: u32,
+        widths: [u8; 16],
     ) -> (Vec<u8>, NativeProgram) {
         let mut words = vec![
             0xD765_0001u32, // v_mbcnt_lo_u32_b32 v1, -1, 0
@@ -2740,14 +2843,15 @@ mod tests {
             TRIANGLE,
             0x7E14_0280, // v_mov_b32 v10, 0.0
         ];
-        // param0 = (1.0, 0.5, 0.0, 0.0)
-        words.extend([0xF800_000F | (32 << 4), 0x0A0A_0607]);
-        // param1..14 = (0.0, 0.0, 0.0, 0.0)
-        for k in 1..15u32 {
-            words.extend([0xF800_000F | ((32 + k) << 4), 0x0A0A_0A0A]);
+        for (row, width) in widths.iter().enumerate() {
+            let registers = match row {
+                0 => 0x0A0A_0607,  // (1.0, 0.5, 0.0, 0.0)
+                15 => 0x0708_0A0A, // (0.0, 0.0, 0.25, 1.0)
+                _ => 0x0A0A_0A0A,
+            };
+            let mask = (1u32 << width) - 1;
+            words.extend([0xF800_0000 | ((32 + row as u32) << 4) | mask, registers]);
         }
-        // param15 = (0.0, 0.0, 0.25, 1.0)
-        words.extend([0xF800_000F | ((32 + 15) << 4), 0x0708_0A0A]);
         words.extend([
             0xF800_0941, // exp prim v9, off, off, off done
             0x0000_0009,
@@ -2793,17 +2897,18 @@ mod tests {
             usage: 0xF,
             half: false,
         }];
-        for k in 0..16u32 {
+        for (row, width) in widths.into_iter().enumerate() {
+            let row = row as u32;
             sig.push(SigElement {
                 name: "TEXCOORD".into(),
-                index: k,
+                index: row,
                 kind: 0,
                 comp: 9,
                 interp: 0,
-                row: Some(k + 1),
+                row: Some(row + 1),
                 col: 0,
-                cols: 4,
-                usage: 0xF,
+                cols: width,
+                usage: (1 << width) - 1,
                 half: false,
             });
         }
@@ -2818,7 +2923,7 @@ mod tests {
     /// passing DXIL validation standalone.
     #[test]
     fn mesh_exceeding_32k_tightens_counts_to_group_threads() {
-        let (bytes, native) = wide_mesh_parts(64, 128, 128);
+        let (bytes, native) = wide_mesh_parts(64, 128, 128, [4; 16]);
         let c = Container::parse(&bytes).unwrap();
         let p = ir::build(&native.patched_code(), native.wave64, native.vgprs).unwrap();
         let st = structure::structure(&p).unwrap();
@@ -2842,7 +2947,17 @@ mod tests {
     /// pixel output on hardware and WARP.
     #[test]
     fn linked_mesh_and_pixel_prune_unused_outputs_under_32k_and_draw() {
-        let (ms_bytes, ms_native) = wide_mesh_parts(128, 128, 128);
+        check_linked_mesh([4; 16], 34_816, 34_816);
+    }
+
+    #[test]
+    fn linked_mesh_with_aligned_only_overflow_draws() {
+        let widths = std::array::from_fn(|row| if row % 2 == 0 { 3 } else { 4 });
+        check_linked_mesh(widths, 30_720, 51_200);
+    }
+
+    fn check_linked_mesh(widths: [u8; 16], packed: u32, aligned: u32) {
+        let (ms_bytes, ms_native) = wide_mesh_parts(128, 128, 128, widths);
         let mc = Container::parse(&ms_bytes).unwrap();
         let mp = ir::build(&ms_native.patched_code(), ms_native.wave64, ms_native.vgprs).unwrap();
         let mst = structure::structure(&mp).unwrap();
@@ -2856,10 +2971,22 @@ mod tests {
             io: &mio,
             res: &mres,
         };
-        // Standalone emission stays over 32 KiB (68 * 4 * 128 = 34,816 B).
         let standalone = emit_pruned(&ms_in, Options::default(), None).unwrap();
-        assert_eq!(mesh_bytes(&standalone.dxil), Some(34_816));
-        assert!(mesh_bytes(&standalone.dxil).unwrap() > METAL_MESH_OUTPUT_BYTES);
+        assert_eq!(mesh_bytes(&standalone.dxil), Some(packed));
+        assert_eq!(metal_mesh_output_bytes(&standalone.dxil), Some(aligned));
+        assert!(aligned > METAL_MESH_OUTPUT_BYTES);
+
+        // If the next stage needs every component, pruning cannot make it safe.
+        let all_reads = widths
+            .into_iter()
+            .enumerate()
+            .map(|(row, width)| (("TEXCOORD".into(), row as u32), (1 << width) - 1))
+            .collect();
+        let still_over = emit_pruned(&ms_in, Options::default(), Some(&all_reads)).unwrap();
+        assert_eq!(
+            over_limit_mesh_output_bytes(&still_over.dxil),
+            Some(aligned)
+        );
 
         // Depth-only linking (no pixel shader) drops all arbitrary outputs.
         let empty = lower::KeptOutputs::new();
@@ -2964,8 +3091,11 @@ mod tests {
         let linked_ms = emit_pruned(&ms_in, Options::default(), Some(&reads)).unwrap();
         let linked_ps = emit_pruned(&ps_in, Options::default(), Some(&reads)).unwrap();
         // SV_Position (4) + TEXCOORD0.xy (2) + TEXCOORD15.zw (2) = 8 components.
-        assert_eq!(mesh_bytes(&linked_ms.dxil), Some(8 * 4 * 128));
+        assert_eq!(mesh_bytes(&linked_ms.dxil), Some(4_096));
+        assert_eq!(metal_mesh_output_bytes(&linked_ms.dxil), Some(4_096));
+        assert_eq!(over_limit_mesh_output_bytes(&linked_ms.dxil), None);
         assert!(!linked_ps.dxil.is_empty());
+        eprintln!("mesh bytes: packed {packed}, aligned {aligned}, linked 4096");
 
         #[cfg(windows)]
         {
@@ -3037,6 +3167,7 @@ mod tests {
                     "{label}: unexpected pixel {:?}",
                     texels.first()
                 );
+                eprintln!("{label}: linked mesh exact readback matched");
             }
         }
     }

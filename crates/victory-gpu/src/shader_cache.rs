@@ -73,7 +73,7 @@ fn build() -> &'static [u8; 32] {
 /// (made here if it is not yet: the cache belongs to the GPU it was filled
 /// on, as the pipeline library does); none without one.
 fn host_wave32() -> bool {
-    crate::host::host().is_some_and(crate::host::Host::wave32)
+    crate::host::host().is_some_and(crate::backend::HostGpu::wave32)
 }
 
 /// This file, whose `encode` and `decode` define the entries.
@@ -326,7 +326,7 @@ fn cached(
     )
 }
 
-const MAGIC: &[u8; 4] = b"VSH2";
+const MAGIC: &[u8; 4] = b"VSH3";
 /// A container that does not translate: the reason follows.
 const REFUSED: &[u8; 4] = b"VSHE";
 const STAGES: [HwStage; 8] = [
@@ -389,6 +389,7 @@ fn encode(translation: &Result<HostShader, String>) -> Vec<u8> {
         heap,
         heap_writes,
         view_marks,
+        half_views,
     } = s;
     let mut out = MAGIC.to_vec();
     let word = |out: &mut Vec<u8>, v: u32| out.extend(v.to_le_bytes());
@@ -445,6 +446,11 @@ fn encode(translation: &Result<HostShader, String>) -> Vec<u8> {
             | u32::from(*heap_writes) << 4
             | u32::from(*view_marks) << 5,
     );
+    word(&mut out, half_views.len() as u32);
+    for &(slot, dword) in half_views {
+        word(&mut out, u32::from(slot));
+        word(&mut out, dword);
+    }
     out
 }
 
@@ -511,6 +517,11 @@ fn decode(bytes: &[u8]) -> Option<Result<HostShader, String>> {
         root_srv_bytes.push((u8::try_from(r.word()?).ok()?, r.word()?));
     }
     let memory = r.word()?;
+    let n = r.word()? as usize;
+    let mut half_views = Vec::with_capacity(n.min(256));
+    for _ in 0..n {
+        half_views.push((u8::try_from(r.word()?).ok()?, r.word()?));
+    }
     r.0.is_empty().then_some(Ok(HostShader {
         stage,
         dxil,
@@ -527,6 +538,7 @@ fn decode(bytes: &[u8]) -> Option<Result<HostShader, String>> {
         heap: memory & 8 != 0,
         heap_writes: memory & 16 != 0,
         view_marks: memory & 32 != 0,
+        half_views,
     }))
 }
 
@@ -572,6 +584,7 @@ mod tests {
             heap: true,
             heap_writes: true,
             view_marks: true,
+            half_views: vec![(0, 8), (4, 0)],
         }
     }
 

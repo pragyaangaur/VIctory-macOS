@@ -326,6 +326,7 @@ setup_status=$2
 validation_status=$3
 stub_native_status=$4
 stub_wine_status=$5
+git_fail=${6:-none}
 set -- help
 . "$0" > /dev/null
 CACHE="$case_dir/cache"
@@ -340,7 +341,12 @@ chmod +x "$WORK/tools/macos/test-wine.sh"
 accepted() { return 0; }
 load_task() { T_COMMIT=0123456789abcdef0123456789abcdef01234567; T_CHIP=m3; T_MACOS=""; }
 require_lease() { return 0; }
-git() { if [ "${3:-}" = rev-parse ]; then echo "$T_COMMIT"; fi; return 0; }
+git() {
+    if [ "$git_fail" = fetch ] && [ "${3:-}" = fetch ]; then return 1; fi
+    if [ "$git_fail" = worktree-add ] && [ "${3:-}" = worktree ] && [ "${4:-}" = add ]; then return 1; fi
+    if [ "${3:-}" = rev-parse ]; then echo "$T_COMMIT"; fi
+    return 0
+}
 gh() { echo 'unexpected GitHub call' >&2; exit 99; }
 # Replace the heartbeat subshell itself with sleep, so tests leave no sleep child.
 sleep() { exec /bin/sleep 30; }
@@ -354,12 +360,22 @@ say() {
     case "$*" in "running setup.sh"*) jobs -p > "$case_dir/heartbeat-pid" ;; esac
 }
 if [ "$validation_status" != 0 ]; then validate_result() { return 1; }; fi
-cmd_run 1
+# Run cmd_run the way cmd_work does, inside an if condition, where set -e
+# does not reach cmd_run's call stack.
+cmd_submit() { echo submitted > "$case_dir/submitted"; }
+run_rc=0
+if cmd_run 1; then
+    cmd_submit 1
+else
+    run_rc=$?
+fi
+printf '%s\n' "$run_rc" > "$case_dir/run-rc"
+exit "$run_rc"
 EOF
 worker_case() {
     local dir="$tmp/worker-$1" status=0
     mkdir -p "$dir"
-    bash -c '. "$1" "$2" "$3" "$4" "$5" "$6"' "$FLEET_DIR/fleet.sh" "$tmp/worker-cleanup.sh" "$dir" "$2" "$3" "${6:-0}" "${7:-0}" > "$dir/output" 2>&1 || status=$?
+    bash -c '. "$1" "$2" "$3" "$4" "$5" "$6" "$7"' "$FLEET_DIR/fleet.sh" "$tmp/worker-cleanup.sh" "$dir" "$2" "$3" "${6:-0}" "${7:-0}" "${8:-none}" > "$dir/output" 2>&1 || status=$?
     eq "worker $1 exit status" "$4" "$status"
     no "worker $1 has no unbound variable" grep -q 'unbound variable' "$dir/output"
     ok "worker $1 ran heartbeat cleanup" test -s "$dir/killed-pid"
@@ -398,6 +414,42 @@ suite_exit_case native-error 101 0 null "$passed_counts"
 suite_exit_case wine-error 0 101 "$passed_counts" null
 suite_exit_case both-error 101 101 null null
 suite_exit_case wine-aborted 0 137 "$passed_counts" null
+
+# A failed checkout must stop cmd_run even when it runs inside an if
+# condition (as in cmd_work), where set -e does not reach it: no heartbeat,
+# no setup, no result, no submission, and cmd_run returns non-zero.
+checkout_case() { # NAME GIT_FAIL
+    local dir="$tmp/worker-$1" status=0
+    mkdir -p "$dir"
+    bash -c '. "$1" "$2" "$3" "$4" "$5" "$6" "$7"' "$FLEET_DIR/fleet.sh" "$tmp/worker-cleanup.sh" \
+        "$dir" 0 0 0 0 "$2" > "$dir/output" 2>&1 || status=$?
+    eq "worker $1 exit status" 1 "$status"
+    eq "worker $1 cmd_run return status" 1 "$(cat "$dir/run-rc" 2> /dev/null || echo missing)"
+    no "worker $1 never started the heartbeat" test -e "$dir/heartbeat-pid"
+    no "worker $1 never ran heartbeat cleanup" test -e "$dir/killed-pid"
+    no "worker $1 never ran setup" test -e "$dir/cache/logs/1/setup.log"
+    no "worker $1 never wrote a result" test -e "$dir/cache/logs/1/result.json"
+    no "worker $1 never submitted" test -e "$dir/submitted"
+    no "worker $1 has no unbound variable" grep -q 'unbound variable' "$dir/output"
+}
+checkout_case fetch-fails fetch
+checkout_case worktree-add-fails worktree-add
+
+# An unwritable result.json must fail cmd_run instead of letting cmd_work
+# submit a stale result from an earlier run.
+{
+    dir="$tmp/worker-unwritable-result" status=0
+    mkdir -p "$dir/cache/logs/1"
+    printf '{"stale":true}\n' > "$dir/cache/logs/1/result.json"
+    chmod 444 "$dir/cache/logs/1/result.json"
+    bash -c '. "$1" "$2" "$3" "$4" "$5" "$6" "$7"' "$FLEET_DIR/fleet.sh" "$tmp/worker-cleanup.sh" \
+        "$dir" 0 0 101 0 none > "$dir/output" 2>&1 || status=$?
+    chmod 644 "$dir/cache/logs/1/result.json"
+    eq "worker unwritable-result exit status" 1 "$status"
+    eq "worker unwritable-result cmd_run return status" 1 "$(cat "$dir/run-rc" 2> /dev/null || echo missing)"
+    no "worker unwritable-result never submitted stale result" test -e "$dir/submitted"
+    ok "worker unwritable-result ran heartbeat cleanup" test -s "$dir/killed-pid"
+}
 
 # --- claim polling (GitHub updates the assignee and labels separately)
 cat > "$tmp/worker-claim.sh" <<'EOF'

@@ -18,24 +18,35 @@
 //! guess; a pass the title runs only once and whose pipeline takes longer
 //! is lost.
 
-use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use super::Shader;
 use super::host::{GraphicsState, HostPipeline};
+use super::schedule::{
+    COMPUTE_BUDGET, Lane, PriorityQueue, WaitBudgets, lane_for, sync_compute_enabled,
+};
 
 /// What a host pipeline is made from, and the host pipeline once made.
 pub(crate) struct Pending {
     shaders: Vec<Arc<Shader>>,
     pub(crate) graphics: Option<Box<GraphicsState>>,
+    /// Compute pipeline eligible for priority queueing and bounded cold wait.
+    compute: bool,
+    /// When a worker began compiling this pipeline.
+    making_since: OnceLock<Instant>,
+    /// One-shot diagnostic latches for compute wait timeouts.
+    compute_dropped: AtomicBool,
+    compute_given_up: AtomicBool,
     queued: AtomicBool,
-    /// Whether it went into the queue of pipelines a draw waits for, and
-    /// whether a worker took it (it may be in both queues).
+    /// Whether it went into a requested-work queue ahead of early pre-warms,
+    /// and whether a worker took it (it may be in both queues).
     now: AtomicBool,
     taken: AtomicBool,
     made: OnceLock<Option<HostPipeline>>,
+    #[cfg(feature = "diagnostics")]
+    refusal: OnceLock<(&'static str, Option<i32>)>,
     #[cfg(feature = "diagnostics")]
     pub(super) skipped_shader: Option<String>,
     /// What identifies it across runs (shader containers and state), and
@@ -70,14 +81,23 @@ impl Pending {
         if skipped_shader.is_some() {
             let _ = made.set(None);
         }
+        let compute = graphics.is_none()
+            && shaders.first().is_some_and(|s| s.stage == "compute")
+            && sync_compute_enabled();
         Pending {
             key,
             shaders,
             graphics,
+            compute,
+            making_since: OnceLock::new(),
+            compute_dropped: AtomicBool::new(false),
+            compute_given_up: AtomicBool::new(false),
             queued: AtomicBool::new(false),
             now: AtomicBool::new(false),
             taken: AtomicBool::new(false),
             made,
+            #[cfg(feature = "diagnostics")]
+            refusal: OnceLock::new(),
             #[cfg(feature = "diagnostics")]
             skipped_shader,
             used: AtomicBool::new(false),
@@ -85,9 +105,13 @@ impl Pending {
     }
 
     fn make(&self) {
+        self.making_since.get_or_init(Instant::now);
         self.made.get_or_init(|| {
             let (started, cpu) = (Instant::now(), super::thread_cpu());
-            let made = HostPipeline::new(&self.shaders, self.graphics.as_deref());
+            let made = HostPipeline::new(&self.shaders, self.graphics.as_deref(), |_reason, _code| {
+                #[cfg(feature = "diagnostics")]
+                let _ = self.refusal.set((_reason, _code));
+            });
             #[cfg(feature = "diagnostics")]
             log_built(&self.key);
             let (user, kernel) = super::thread_cpu_since(cpu);
@@ -118,14 +142,25 @@ pub(crate) fn key(shaders: &[Arc<Shader>], graphics: Option<&GraphicsState>) -> 
     key.finalize().to_hex()[..32].to_owned()
 }
 
-/// Why a pipeline has no host pipeline (diagnostics): its shaders that do
-/// not translate, else "refused" or "being made"; `None` if it has one.
+/// Why a draw lacks a host pipeline (diagnostics): skipped shader, still
+/// building, a recorded refusal (with optional HRESULT and shader list), or
+/// the shaders that failed to translate. `None` if it has one.
 #[cfg(feature = "diagnostics")]
 pub(crate) fn missing(p: &Pending) -> Option<String> {
+    if let Some(hash) = p.skipped_shader.as_deref() {
+        return Some(format!("skipped shader {hash}"));
+    }
     match p.made.get() {
         Some(Some(_)) => None,
         None => Some("being made".into()),
         Some(None) => {
+            if let Some(&(reason, code)) = p.refusal.get() {
+                return Some(match code {
+                    Some(code) => format!("{reason} ({code:#010x}) {:?}", p.shaders),
+                    None if p.shaders.is_empty() => reason.to_owned(),
+                    None => format!("{reason} {:?}", p.shaders),
+                });
+            }
             let failed: Vec<String> = p
                 .shaders
                 .iter()
@@ -177,8 +212,8 @@ fn log(what: &str, key: &str, rest: impl FnOnce() -> String) {
 /// Signalled whenever a worker has made a pipeline.
 static DONE: (Mutex<()>, Condvar) = (Mutex::new(()), Condvar::new());
 
-/// Waiting allowed per title frame, over all threads.
-const BUDGET: Duration = Duration::from_millis(500);
+/// Per-frame graphics and compute wait budgets.
+static BUDGETS: WaitBudgets = WaitBudgets::new();
 
 /// Pipelines queued and not made yet.
 static WAITING: AtomicU64 = AtomicU64::new(0);
@@ -206,21 +241,21 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
 }
 
 /// Queues `p` for the workers: once, and once more ahead of the early
-/// starts if a draw waits for it (`now`) while it is still queued.
+/// starts if a draw or dispatch waits for it (`now`) while it is still queued.
 fn start(p: &Arc<Pending>, now: bool) {
-    if let Some(now) = enqueue(p, now) {
-        queue(p.clone(), now);
+    if let Some(lane) = enqueue(p, now) {
+        queue(p.clone(), lane);
     }
 }
 
-/// Which queue `p` goes into now (true: the one draws wait for), if any.
-fn enqueue(p: &Pending, now: bool) -> Option<bool> {
+/// Which lane `p` goes into now, if any.
+fn enqueue(p: &Pending, now: bool) -> Option<Lane> {
     let first = !p.queued.swap(true, Ordering::Relaxed);
     if first {
         PEAK.fetch_max(WAITING.fetch_add(1, Ordering::Relaxed) + 1, Ordering::Relaxed);
     }
     let ahead = now && !p.now.swap(true, Ordering::Relaxed);
-    (first || ahead && !p.taken.load(Ordering::Relaxed)).then_some(ahead)
+    (first || ahead && !p.taken.load(Ordering::Relaxed)).then(|| lane_for(ahead, p.compute))
 }
 
 /// At the title's creation of a pipeline: starts it at once if an earlier
@@ -233,38 +268,44 @@ pub(crate) fn early(p: &Arc<Pending>) {
     }
 }
 
-/// Waits for `p` while frame `frame` has budget left.
+/// Waits for `p` while frame `frame` has budget left. Compute pipelines with
+/// `VICTORY_SYNC_COMPUTE_PSO` enabled wait against a dedicated bounded
+/// wall-clock window so cold one-time dispatches are not dropped behind
+/// graphics compilation.
 fn wait(p: &Pending, frame: u64) {
-    static FRAME: AtomicU64 = AtomicU64::new(u64::MAX);
-    static WAITED_US: AtomicU64 = AtomicU64::new(0);
-    if FRAME.swap(frame, Ordering::Relaxed) != frame {
-        WAITED_US.store(0, Ordering::Relaxed);
+    let outcome = BUDGETS.wait_for(
+        frame,
+        p.compute,
+        || p.making_since.get().map_or(Duration::ZERO, Instant::elapsed),
+        || p.made.get().is_some(),
+        &DONE,
+    );
+    if outcome.compute_timed_out && !p.compute_dropped.swap(true, Ordering::Relaxed) {
+        tracing::info!(
+            shaders = ?p.shaders,
+            frame,
+            waited_ms = outcome.waited.as_millis() as u64,
+            budget_secs = COMPUTE_BUDGET.as_secs(),
+            "compute dispatch dropped: pipeline was not ready within the frame compute wait budget"
+        );
     }
-    let left = BUDGET.saturating_sub(Duration::from_micros(WAITED_US.load(Ordering::Relaxed)));
-    let started = Instant::now();
-    let (lock, done) = &DONE;
-    let mut held = lock.lock().unwrap_or_else(|e| e.into_inner());
-    while p.made.get().is_none() {
-        let rest = left.saturating_sub(started.elapsed());
-        if rest.is_zero() {
-            break;
-        }
-        held = done
-            .wait_timeout(held, rest)
-            .unwrap_or_else(|e| e.into_inner())
-            .0;
+    if outcome.pipeline_timed_out && !p.compute_given_up.swap(true, Ordering::Relaxed) {
+        tracing::warn!(
+            shaders = ?p.shaders,
+            budget_secs = COMPUTE_BUDGET.as_secs(),
+            "compute pipeline exceeded per-pipeline wait budget; falling back to the normal frame budget"
+        );
     }
-    WAITED_US.fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
 }
 
-/// Pipelines for the workers: those draws wait for, then those started
-/// early.
-static QUEUES: (Mutex<[VecDeque<Arc<Pending>>; 2]>, Condvar) =
-    (Mutex::new([VecDeque::new(), VecDeque::new()]), Condvar::new());
+/// Pipelines for the workers: requested compute first, then requested
+/// graphics, then early pre-warms.
+static QUEUES: (Mutex<PriorityQueue<Arc<Pending>>>, Condvar) =
+    (Mutex::new(PriorityQueue::new()), Condvar::new());
 
 /// Hands `p` to the workers (half the logical processors, 2 to 8), started
 /// on first use.
-fn queue(p: Arc<Pending>, now: bool) {
+fn queue(p: Arc<Pending>, lane: Lane) {
     static WORKERS: OnceLock<usize> = OnceLock::new();
     let workers = *WORKERS.get_or_init(|| {
         let n = std::thread::available_parallelism().map_or(2, |n| (n.get() / 2).clamp(2, 8));
@@ -289,7 +330,7 @@ fn queue(p: Arc<Pending>, now: bool) {
         return;
     }
     let (lock, work) = &QUEUES;
-    lock.lock().unwrap_or_else(|e| e.into_inner())[usize::from(!now)].push_back(p);
+    lock.lock().unwrap_or_else(|e| e.into_inner()).push(lane, p);
     work.notify_one();
 }
 
@@ -307,7 +348,7 @@ fn work() {
         let p = {
             let mut queues = lock.lock().unwrap_or_else(|e| e.into_inner());
             loop {
-                if let Some(p) = queues.iter_mut().find_map(VecDeque::pop_front) {
+                if let Some(p) = queues.pop() {
                     break p;
                 }
                 let (held, waited) = work
@@ -355,8 +396,8 @@ fn drained() {
 mod tests {
     use super::*;
 
-    /// An early start is queued once; a draw waiting for it puts it ahead,
-    /// once, unless a worker has taken it.
+    /// An early start is queued once; a draw or compute dispatch waiting for
+    /// it puts it ahead in its lane, once, unless a worker has taken it.
     #[test]
     fn draws_go_ahead_of_early_starts() {
         let p = Pending::new(
@@ -365,9 +406,9 @@ mod tests {
             #[cfg(feature = "diagnostics")]
             &[],
         );
-        assert_eq!(enqueue(&p, false), Some(false));
+        assert_eq!(enqueue(&p, false), Some(Lane::Early));
         assert_eq!(enqueue(&p, false), None);
-        assert_eq!(enqueue(&p, true), Some(true));
+        assert_eq!(enqueue(&p, true), Some(Lane::Graphics));
         assert_eq!(enqueue(&p, true), None);
         let q = Pending::new(
             Vec::new(),
@@ -375,7 +416,7 @@ mod tests {
             #[cfg(feature = "diagnostics")]
             &[],
         );
-        assert_eq!(enqueue(&q, false), Some(false));
+        assert_eq!(enqueue(&q, false), Some(Lane::Early));
         q.taken.store(true, Ordering::Relaxed);
         assert_eq!(enqueue(&q, true), None);
         let r = Pending::new(
@@ -384,10 +425,20 @@ mod tests {
             #[cfg(feature = "diagnostics")]
             &[],
         );
-        assert_eq!(enqueue(&r, true), Some(true));
+        assert_eq!(enqueue(&r, true), Some(Lane::Graphics));
         assert_eq!(enqueue(&r, false), None);
+        let mut cs = Pending::new(
+            Vec::new(),
+            None,
+            #[cfg(feature = "diagnostics")]
+            &[],
+        );
+        cs.compute = true;
+        assert_eq!(enqueue(&cs, false), Some(Lane::Early));
+        assert_eq!(enqueue(&cs, true), Some(Lane::Compute));
+        assert_eq!(enqueue(&cs, true), None);
         // Counted as waiting by `enqueue`, never handed to a worker.
-        WAITING.fetch_sub(3, Ordering::Relaxed);
+        WAITING.fetch_sub(4, Ordering::Relaxed);
     }
 
     /// A first use queues the pipeline and, within the budget, gets the
@@ -407,6 +458,66 @@ mod tests {
             std::thread::yield_now();
         }
         assert!(matches!(p.made.get(), Some(None)));
+        #[cfg(feature = "diagnostics")]
+        assert_eq!(missing(&p).as_deref(), Some("no vertex or mesh shader"));
+    }
+
+    #[cfg(feature = "diagnostics")]
+    #[test]
+    fn missing_formats_static_refusal_driver_hresult_and_skipped_shader() {
+        let shader = Arc::new(Shader {
+            stage: "compute",
+            hash: "abcdef0123456789".into(),
+            full_hash: [0; 32],
+            size: 4,
+            container: std::sync::Mutex::new(vec![1, 2, 3, 4]),
+            translated: OnceLock::new(),
+            spilled: OnceLock::new(),
+        });
+
+        // 1. Driver refusal keeps HRESULT (hex) and shader identity.
+        let driver = Pending::new(vec![shader.clone()], None, &[]);
+        driver
+            .refusal
+            .set(("compute pipeline refused", Some(0x80070057u32 as i32)))
+            .unwrap();
+        assert_eq!(missing(&driver).as_deref(), Some("being made"));
+        assert!(driver.made.set(None).is_ok());
+        assert_eq!(
+            missing(&driver).as_deref(),
+            Some("compute pipeline refused (0x80070057) [compute abcdef0123456789]")
+        );
+
+        // 2. Static refusal with shaders includes reason and shader list; without shaders keeps bare reason.
+        let static_with = Pending::new(vec![shader.clone()], None, &[]);
+        static_with
+            .refusal
+            .set(("the host GPU has no 64-bit atomics on typed heap resources", None))
+            .unwrap();
+        assert!(static_with.made.set(None).is_ok());
+        assert_eq!(
+            missing(&static_with).as_deref(),
+            Some("the host GPU has no 64-bit atomics on typed heap resources [compute abcdef0123456789]")
+        );
+
+        let static_empty = Pending::new(Vec::new(), None, &[]);
+        static_empty
+            .refusal
+            .set(("no vertex or mesh shader", None))
+            .unwrap();
+        assert!(static_empty.made.set(None).is_ok());
+        assert_eq!(
+            missing(&static_empty).as_deref(),
+            Some("no vertex or mesh shader")
+        );
+
+        // 3. Skipped shader keeps its dedicated label.
+        let hashes = crate::pipeline::parse_skip_hashes("ABCDEF0123456789");
+        let skipped = Pending::new(vec![shader], None, &hashes);
+        assert_eq!(
+            missing(&skipped).as_deref(),
+            Some("skipped shader abcdef0123456789")
+        );
     }
 
     #[cfg(feature = "diagnostics")]

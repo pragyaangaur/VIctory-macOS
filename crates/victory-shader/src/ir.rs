@@ -208,7 +208,7 @@ pub fn build_bounded(
             };
         }
         let m0 = m0_max.get(&machine.offset).copied();
-        if let Some((reads, writes)) = effects(&machine, &fields, name, lanes, vgprs, m0)? {
+        if let Some((reads, writes)) = effects(&machine, &fields, name, lanes, vgprs, m0, true)? {
             blocks[b].insts.push(Inst {
                 machine,
                 fields,
@@ -742,6 +742,24 @@ const DROPPED: &[&str] = &[
 /// SSA pass fills in.
 type Effects = (Vec<(Reg, Value)>, Vec<(Reg, Value)>);
 
+/// Registers `inst` reads as operands (excluding implicit keep-old reads
+/// of written registers added for lanes disabled in EXEC).
+pub(crate) fn operand_reads(p: &Program, vgprs: u16, inst: &Inst) -> Vec<Reg> {
+    let lanes = 1 + u8::from(p.wave64);
+    effects(
+        &inst.machine,
+        &inst.fields,
+        inst.name(),
+        lanes,
+        vgprs,
+        None,
+        false,
+    )
+    .ok()
+    .flatten()
+    .map_or_else(Vec::new, |e| e.0.into_iter().map(|(reg, _)| reg).collect())
+}
+
 /// Registers an instruction reads and writes, one per dword, or `None` if
 /// the IR drops it.
 fn effects(
@@ -751,6 +769,7 @@ fn effects(
     lanes: u8,
     vgprs: u16,
     m0_max: Option<u8>,
+    keep_old: bool,
 ) -> Result<Option<Effects>, ShaderError> {
     if DROPPED.contains(&name) {
         return Ok(None);
@@ -1013,8 +1032,10 @@ fn effects(
     }
     if vector {
         r.extend(mask(EXEC));
-        // Lanes disabled in EXEC keep the old value.
-        r.extend(w.iter().filter(|(w, _)| matches!(w, Reg::V(_))).cloned());
+        if keep_old {
+            // Lanes disabled in EXEC keep the old value.
+            r.extend(w.iter().filter(|(w, _)| matches!(w, Reg::V(_))).cloned());
+        }
     }
     let mut seen: RegSet = [0; REGS.div_ceil(64)];
     r.retain(|&(reg, _)| {

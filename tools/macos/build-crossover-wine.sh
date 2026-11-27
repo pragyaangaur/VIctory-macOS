@@ -10,6 +10,9 @@
 # is already installed gets only its server and ntdll rebuilt (see below), and
 #   tools/macos/build-crossover-wine.sh --stamp
 # prints the stamp of the patches that setup.sh compares with the install's.
+# The stamp of the patches baked into the cached source tree is kept inside
+# the tree, and the tree is recreated from the cached tarball when the two
+# differ, so a patch that was removed or edited cannot stay in the cache.
 set -eu
 VERSION="${CROSSOVER_VERSION:-26.3.0}"
 ROOT="${0:A:h:h:h}"
@@ -19,13 +22,21 @@ if [[ ${1-} == --stamp ]]; then stamp; exit 0; fi
 DEPS_REAL="${DEPS:?set DEPS to an x86_64 prefix with FreeType and GnuTLS}"
 # Wine's build splits flags at spaces, and both the project and the deps
 # can live under folders with spaces in their names. Space-free links to
-# them keep every path in the build free of spaces.
+# them keep every path in the build free of spaces. The build's own link is
+# keyed by a short hash of the checkout's path: the plain target link is
+# shared (setup.sh points it at whichever checkout ran setup last, and
+# native-build-tools.sh keeps its wrappers behind it), so a build folder
+# reached through it could belong to another checkout and this script's
+# rm -rf must not go through it.
 ALIAS="$HOME/Library/Caches/victory-macos"
 mkdir -p "$ALIAS" "$ROOT/target"
 ln -sfn "$ROOT/target" "$ALIAS/target"
+BUILD="$(printf '%s' "$ROOT" | shasum -a 256 | cut -c1-12)"
+ln -sfn "$ROOT/target" "$ALIAS/target-$BUILD"
+BUILD="$ALIAS/target-$BUILD"
 # The deps are copied, and each library's recorded path is pointed at the
 # copy, because a prefix built elsewhere may record a folder that is gone.
-DEPS="$ALIAS/target/deps"
+DEPS="$BUILD/deps"
 if [[ ! -f $DEPS/.relinked ]]; then
   rm -rf "$DEPS"
   ditto "$DEPS_REAL" "$DEPS"
@@ -40,9 +51,9 @@ if [[ ! -f $DEPS/.relinked ]]; then
   done
   touch "$DEPS/.relinked"
 fi
-WORK="$ALIAS/target/crossover"
+WORK="$BUILD/crossover"
 OBJ="$WORK/build"
-PREFIX="$ALIAS/target/wine-cx"
+PREFIX="$BUILD/wine-cx"
 BREW="${BREW:-/opt/homebrew}"
 . "${0:A:h}/native-build-tools.sh"
 x86() { arch -x86_64 /usr/bin/env PATH="$NATIVE_TOOLS:$BREW/opt/bison/bin:$BREW/opt/flex/bin:$BREW/bin:/usr/bin:/bin:/usr/sbin:/sbin" "$@"; }
@@ -53,7 +64,7 @@ verify_source_tar() {
   [[ $VERSION != 26.3.0 ]] ||
     printf '%s  %s\n' ac99c8ca4b3848f3e81784135f023df266b61c2345726ea55a50b3e030dd6872 "$1" | shasum -a 256 -c --quiet
 }
-if [[ ! -d $WORK/sources/wine ]]; then
+fetch_source_tar() {
   if [[ ! -f $TAR ]] || ! verify_source_tar "$TAR"; then
     (
       partial="$(mktemp "$TAR.part.XXXXXX")"
@@ -63,9 +74,27 @@ if [[ ! -d $WORK/sources/wine ]]; then
       mv "$partial" "$TAR"
     )
   fi
-  tar -xzf "$TAR" -C "$WORK"
-fi
+}
 SRC="$WORK/sources/wine"
+# The stamp of the patches baked into the source tree lives inside the tree.
+# When it is missing or differs from this checkout's patches (a patch was
+# removed, edited or renamed), the tarball is fetched and verified first,
+# then the source and the build folder are both dropped and the tree is
+# recreated from the tarball, so nothing built from the old patches
+# survives -- also when the source tree itself is gone and only a stale
+# build folder is left behind.
+SRC_STAMP="$SRC/.victory-patches"
+if [[ -d $SRC && -f $SRC_STAMP && "$(< "$SRC_STAMP")" == "$(stamp)" ]]; then
+  :
+else
+  if [[ -d $SRC ]]; then
+    echo "the patches changed: recreating the CrossOver source from the cached tarball"
+  fi
+  fetch_source_tar
+  rm -rf "$OBJ" "$WORK/sources"
+  tar -xzf "$TAR" -C "$WORK"
+  mkdir -p "$OBJ"
+fi
 
 # CrossOver's win32u names libvulkan even when Wine is built without
 # Vulkan. A fallback name lets it compile, and loading it then fails
@@ -76,15 +105,27 @@ if ! grep -q 'victory-macos fallback' "$VK"; then
   mv "$VK.new" "$VK"
 fi
 
+# The sorted paths the patches touch.
+patch_paths() { grep -h '^+++ ' "$@" /dev/null | awk '{sub(/^b\//, "", $2); print $2}' | sort -u; }
+
 # An installed Wine has D3DMetal's DLLs copied over Wine's own, and make
 # install would put Wine's back. So it gets only its server and ntdll's Unix
-# library rebuilt, which D3DMetal does not replace. That is enough while the
-# patches change nothing but those.
+# library rebuilt, which D3DMetal does not replace. That is enough only
+# while neither the patches baked into the installed Wine nor the current
+# ones change anything but those: the sorted paths of the applied patches
+# are recorded next to the install stamp, and a path outside server/ and
+# dlls/ntdll/unix/ on either side forces a full reinstall.
 installed=0
-if [[ -x $PREFIX/bin/wine ]]; then
+PATCH_PATHS="$PREFIX/.victory-patch-paths"
+if [[ -x $PREFIX/bin/wine && -f $PREFIX/.victory-patches && -f $PATCH_PATHS ]]; then
   installed=1
-  outside=($(grep -h '^+++ ' "${PATCHES[@]}" /dev/null | awk '{sub(/^b\//, "", $2); print $2}' | grep -v -e '^server/' -e '^dlls/ntdll/unix/' || true))
-  (( ${#outside} == 0 )) || { echo "the patches change ${outside[*]}: remove $PREFIX and build Wine again" >&2; exit 1; }
+  outside=($( { patch_paths "${PATCHES[@]}"; cat "$PATCH_PATHS"; } | grep -v -e '^server/' -e '^dlls/ntdll/unix/' -e '^$' | sort -u || true))
+  if (( ${#outside} > 0 )); then
+    echo "the patches change ${outside[*]}: reinstalling Wine fully"
+    installed=0
+  fi
+elif [[ -x $PREFIX/bin/wine ]]; then
+  echo "the installed Wine metadata is incomplete: reinstalling it fully"
 fi
 
 # Each patch goes in once: one that already reverses cleanly is in. A patch
@@ -96,6 +137,7 @@ for p in $PATCHES; do
   echo "applying ${p:t}"
   patch -d "$SRC" -p1 -f -s < "$p"
 done
+stamp > "$SRC_STAMP"
 
 cd "$OBJ"
 if [[ ! -f Makefile ]]; then
@@ -122,13 +164,20 @@ fi
 if (( installed )); then
   echo "rebuilding the server and ntdll of the installed CrossOver Wine"
   x86 make -j"$(sysctl -n hw.ncpu)" server/wineserver dlls/ntdll/ntdll.so > make.log 2>&1 || { grep -E 'error:|\*\*\*' make.log | grep -v Wno-error | head -5; exit 1; }
+  rm -f "$PREFIX/.victory-patches" "$PATCH_PATHS"
   install -m 755 server/wineserver "$PREFIX/bin/wineserver"
   install -m 755 dlls/ntdll/ntdll.so "$PREFIX/lib/wine/x86_64-unix/ntdll.so"
 else
   echo "building CrossOver Wine"
   x86 make -j"$(sysctl -n hw.ncpu)" > make.log 2>&1 || { grep -E 'error:|\*\*\*' make.log | grep -v Wno-error | head -5; exit 1; }
+  # Mark the prefix incomplete before modifying it, and invalidate any
+  # D3DMetal overlay so setup.sh reapplies it after make install overwrites
+  # Wine's own DLLs.
+  rm -f "$PREFIX/.victory-patches" "$PATCH_PATHS"
+  rm -rf "$PREFIX/lib/external/D3DMetal.framework"
   x86 make install > install.log 2>&1
   cp -f "$DEPS"/lib/lib{gmp.10,nettle.8,hogweed.6,gnutls.30,freetype.6}.dylib "$PREFIX/lib/"
 fi
+patch_paths "${PATCHES[@]}" > "$PATCH_PATHS"
 stamp > "$PREFIX/.victory-patches"
 echo "installed in $PREFIX"

@@ -13,6 +13,8 @@ mod shader;
 mod translate;
 
 use std::num::NonZeroUsize;
+#[cfg(any(windows, test))]
+use std::path::Path;
 use std::path::PathBuf;
 
 use anyhow::Result;
@@ -319,11 +321,22 @@ pub(crate) fn default_paths(paths: Vec<PathBuf>) -> Result<Vec<PathBuf>> {
     Ok(all)
 }
 
+/// Writes a game-derived report (the `VICTORY_PREBUILD_KEYS` listing) to
+/// `path`. Rule #1: the destination is checked first, so nothing is written
+/// inside any VIctory source tree. Compiled where it is used (Windows) or
+/// tested (any host).
+#[cfg(any(windows, test))]
+pub(crate) fn write_prebuild_keys(path: &Path, text: &str) -> Result<()> {
+    victory_core::ensure_outside_repo(path)?;
+    std::fs::write(path, text)?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
 
-    use super::check_policy;
+    use super::{check_policy, write_prebuild_keys};
 
     fn outside() -> PathBuf {
         std::env::temp_dir().join("victory-config-test")
@@ -349,5 +362,34 @@ mod tests {
         };
         let err = check_policy(&cfg).unwrap_err();
         assert!(err.to_string().contains("1 configured path"), "{err}");
+    }
+
+    /// The `VICTORY_PREBUILD_KEYS` listing is game-derived (rule #1): a
+    /// destination inside a source tree (marked with `.victory-root`) is
+    /// refused and an existing file there is left byte for byte unchanged.
+    #[test]
+    fn prebuild_keys_refuse_repo_destinations() {
+        let report = "0123456789abcdef\tGraphics(0)\tvertex, pixel\n";
+        // A stand-in checkout: a temporary directory carrying the root marker,
+        // with a sentinel file the refused write must not touch.
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::write(repo.path().join(victory_core::policy::ROOT_MARKER), "").unwrap();
+        let sentinel = repo.path().join("keys.txt");
+        let original = b"sentinel bytes, unchanged";
+        std::fs::write(&sentinel, original).unwrap();
+        let err = write_prebuild_keys(&sentinel, report).unwrap_err();
+        assert!(
+            matches!(
+                err.downcast_ref(),
+                Some(victory_core::PolicyError::InsideRepo { .. })
+            ),
+            "{err}"
+        );
+        assert_eq!(std::fs::read(&sentinel).unwrap(), original);
+        // An unmarked directory is written as asked.
+        let out = tempfile::tempdir().unwrap();
+        let dest = out.path().join("keys.txt");
+        write_prebuild_keys(&dest, report).unwrap();
+        assert_eq!(std::fs::read_to_string(&dest).unwrap(), report);
     }
 }

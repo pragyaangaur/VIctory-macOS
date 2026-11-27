@@ -1,4 +1,5 @@
 use super::{PIPELINE_IIDS, Shader, Translated, hand_out, host_pipeline};
+use crate::backend::HostGpu;
 use crate::object::{S_OK, This, guid, slot};
 use std::sync::{Arc, OnceLock};
 use victory_shader::native::{ComputeIo, StageIo};

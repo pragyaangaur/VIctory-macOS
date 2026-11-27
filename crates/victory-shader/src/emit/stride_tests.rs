@@ -272,6 +272,7 @@ fn build(
         heap: lowered.heap,
         heap_writes: lowered.heap_writes,
         view_marks: lowered.view_marks,
+        half_views: lowered.half_views,
     };
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
         v.validate(&mut shader.dxil.clone())
@@ -834,7 +835,29 @@ const D16_X_LOAD_WAVE32: &[u32] = &[
 /// hardware and WARP with `views` and the view-stride table `strides`;
 /// each adapter's UAV contents.
 fn run_tables(shader: &HostShader, views: &[View], strides: Vec<u32>) -> Vec<(&'static str, Vec<Vec<u32>>)> {
-    assert_eq!(shader.root_srvs, [VIEW_STRIDES]);
+    // 16-bit float views at places in `shader.half_views` are shown as their
+    // unsigned twins, matching `victory_gpu::descriptor::host::half_view`.
+    let twins: Vec<View> = views
+        .iter()
+        .map(|&v| {
+            if shader.half_views.is_empty() {
+                return v;
+            }
+            match v {
+                View::TypedUav(DXGI_FORMAT_R16G16B16A16_FLOAT, e, bytes) => {
+                    View::TypedUav(DXGI_FORMAT_R16G16B16A16_UINT, e, bytes)
+                }
+                View::Buffer {
+                    data,
+                    stride: Stride::Format(DXGI_FORMAT_R16_FLOAT, bytes),
+                } => View::Buffer {
+                    data,
+                    stride: Stride::Format(DXGI_FORMAT_R16_UINT, bytes),
+                },
+                other => other,
+            }
+        })
+        .collect();
     let _one = super::valu_tests::ONE_AT_A_TIME
         .lock()
         .unwrap_or_else(|e| e.into_inner());
@@ -852,13 +875,17 @@ fn run_tables(shader: &HostShader, views: &[View], strides: Vec<u32>) -> Vec<(&'
             // Table k is the view at heap index k (32 bytes a view).
             ud[u.index as usize] = 32 * u32::from(u.slot);
         }
+        let mut roots = vec![(0, Root::Constants(ud))];
+        if shader.root_srvs.contains(&VIEW_STRIDES) {
+            roots.push((1, Root::View { srv: true, data: strides.clone() }));
+        }
         let words = host
             .dispatch(
                 &root,
                 &pso,
                 &Dispatch {
-                    roots: vec![(0, Root::Constants(ud)), (1, Root::View { srv: true, data: strides.clone() })],
-                    views,
+                    roots,
+                    views: &twins,
                     samplers: &[],
                     groups: [1, 1, 1],
                 },

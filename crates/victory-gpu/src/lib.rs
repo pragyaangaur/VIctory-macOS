@@ -18,6 +18,9 @@
 
 #[cfg(windows)]
 mod alias;
+pub mod bench;
+#[cfg(windows)]
+mod backend;
 #[cfg(windows)]
 mod bindless;
 #[cfg(all(windows, feature = "diagnostics"))]
@@ -40,6 +43,8 @@ pub mod dxgi;
 pub mod external;
 pub mod fence;
 pub mod frame;
+#[cfg(any(windows, test))]
+mod hdr_probe;
 mod hold;
 #[cfg(windows)]
 mod host;
@@ -99,7 +104,7 @@ pub use host::{MeshSupport, host_mesh_support, on_failure};
 #[cfg(windows)]
 pub use watch::{
     Writing as KernelWrite, fault_tracking, rosetta, stores_need_patching, title_memory_aliased,
-    title_memory_remapped, writing as kernel_will_write,
+    title_memory_remapped, title_memory_unmapping, writing as kernel_will_write,
 };
 
 /// [`shader_cache::under_wine`], asked once: it looks `wine_get_version` up

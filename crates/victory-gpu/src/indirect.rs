@@ -344,6 +344,8 @@ pub(crate) fn done(list: &HostList, arguments: &ID3D12Resource) {
 
 #[cfg(test)]
 mod tests {
+    use crate::backend::{HostGpu, HostMemory};
+
     /// The clamp compiles with the system's compiler and the host takes it.
     #[test]
     fn argument_clamp_builds() {

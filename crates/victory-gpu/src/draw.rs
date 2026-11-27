@@ -78,9 +78,10 @@ pub(crate) struct State {
     /// Tables made afresh in this list: (table, what it holds) → first
     /// dynamic slot.
     fresh_tables: std::collections::HashMap<(u64, u64), u32>,
-    /// The dynamic slots the list holds: title heap, first, count; given
-    /// back when the list is reset or released.
-    dynamic: Vec<(usize, u32, u32)>,
+    /// The dynamic slots the list holds: title heap, host heap identity
+    /// (`HostHeap::id`), first, count; given back when the list is reset or
+    /// released.
+    dynamic: Vec<(usize, u64, u32, u32)>,
     /// A fresh table of the stage being bound could not be made.
     table_failed: bool,
     /// The title-memory page table made for this list (`crate::memory`)
@@ -96,6 +97,12 @@ pub(crate) struct State {
     /// What was set straight onto the host list, for the next segment of
     /// the list ([`State::cut`]).
     fixed: Fixed,
+    /// Pending RTVs drawn while `VICTORY_HDR_PROBE` is active, flushed on
+    /// target switch or list close: `(resources, last_pipeline_name)`.
+    hdr_rtvs: Option<(Vec<usize>, String)>,
+    /// Last `(pipeline_ptr, uav_resource)` probed by a compute dispatch on
+    /// this list, collapsing consecutive tile/mip dispatches of the same pass.
+    hdr_last_compute: (usize, usize),
 }
 
 /// Fixed-function state the title set, as it set it.
@@ -112,10 +119,10 @@ struct Fixed {
 
 impl Drop for State {
     fn drop(&mut self) {
-        for &(heap, first, n) in &self.dynamic {
+        for &(heap, id, first, n) in &self.dynamic {
             match (heap, crate::memory::heap()) {
-                (MEMORY_HEAP, Some(ours)) => ours.release(first, n),
-                _ => crate::descriptor::release_dynamic(heap, first, n),
+                (MEMORY_HEAP, Some(ours)) => ours.release(id, first, n),
+                _ => crate::descriptor::release_dynamic(heap, id, first, n),
             }
         }
     }
@@ -450,6 +457,13 @@ impl State {
             rtv_keys.push((texture.as_raw() as usize, record.key()));
             rtv_views.push((texture, record.desc()));
         }
+        if self
+            .hdr_rtvs
+            .as_ref()
+            .is_some_and(|(prev, _)| prev != &self.targets)
+        {
+            self.flush_hdr_probe(list);
+        }
         self.depth = 0;
         let mut dsv_view = None;
         let mut dsv_key = None;
@@ -753,7 +767,7 @@ impl State {
                     .host()
                     .and_then(|h| h.view_addresses());
             }
-            let made = self.tables(list, &t.used, compute);
+            let made = self.tables(list, &t.used, &t.host.half_views, compute);
             // A depth copy of ours made readable a texture the tables hold
             // (`crate::twin`), with a compute pipeline: this one's again
             // (root arguments are set below).
@@ -1035,7 +1049,7 @@ impl State {
                 not_run("no dynamic slots for root views");
                 return None;
             };
-            self.dynamic.push((key, first, ROOT_VIEW_RUN));
+            self.dynamic.push((key, host.id(), first, ROOT_VIEW_RUN));
             self.root_run = (key, first, first + ROOT_VIEW_RUN);
         }
         let index = self.root_run.1;
@@ -1126,7 +1140,7 @@ impl State {
             return;
         };
         self.dynamic
-            .push((std::ptr::from_ref(heap) as usize, slot, 1));
+            .push((std::ptr::from_ref(heap) as usize, visible.id(), slot, 1));
         visible.make_at(slot, &view);
         let at = host.cpu_view();
         let Some(resource) = crate::descriptor::host::make_view(&view, at) else {
@@ -1194,9 +1208,73 @@ impl State {
         self.probe_small(list, true);
         // SAFETY: an open list with everything set.
         unsafe { list.list.Dispatch(x, y, z) };
+        self.probe_hdr_compute(list);
         #[cfg(feature = "diagnostics")]
         self.probe_written(list);
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Flushes any pending RTV probes recorded during `VICTORY_HDR_PROBE`.
+    pub(crate) fn flush_hdr_probe(&mut self, list: &HostList) {
+        let Some((targets, shaders)) = self.hdr_rtvs.take() else {
+            return;
+        };
+        if !crate::hdr_probe::active() {
+            return;
+        }
+        const RENDER_TARGET: u32 = 0x4;
+        for resource in targets {
+            crate::hdr_probe::probe_texture(list, resource as This, RENDER_TARGET, "rtv", &shaders);
+        }
+    }
+
+    /// Marks the currently bound RTVs dirty for `VICTORY_HDR_PROBE`; zero cost
+    /// outside the single targeted world frame.
+    fn note_hdr_draw(&mut self) {
+        if !crate::hdr_probe::active() || self.targets.is_empty() {
+            return;
+        }
+        let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
+            return;
+        };
+        self.hdr_rtvs = Some((self.targets.clone(), p.name.clone()));
+    }
+
+    /// Probes HDR/color UAV textures written by the just-recorded compute
+    /// dispatch when `VICTORY_HDR_PROBE` is active.
+    fn probe_hdr_compute(&mut self, list: &HostList) {
+        if !crate::hdr_probe::active() {
+            return;
+        }
+        let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
+            return;
+        };
+        const UNORDERED: u32 = 0x8;
+        for stage in &p.stages {
+            for u in stage.translated().used.iter().filter(|u| u.kind == ResourceType::Uav) {
+                let (RootType::Table, Some(Root::Table(table))) =
+                    (u.root, self.compute.get(usize::from(u.slot)))
+                else {
+                    continue;
+                };
+                let Some(view) =
+                    crate::descriptor::view(table + u64::from(u.table_offset_dwords) * 4)
+                else {
+                    continue;
+                };
+                let placed = crate::descriptor::host::placed_texture(&view);
+                let view = placed.as_ref().unwrap_or(&view);
+                let View::Unordered(r, ..) = view else {
+                    continue;
+                };
+                let key = (self.pipeline, *r);
+                if self.hdr_last_compute == key {
+                    continue;
+                }
+                self.hdr_last_compute = key;
+                crate::hdr_probe::probe_texture(list, *r as This, UNORDERED, "uav", &p.name);
+            }
+        }
     }
 
     /// What a draw or dispatch runs, for the device-removed report
@@ -1276,6 +1354,7 @@ impl State {
                     list.note_op(|| self.op_text(format!("mesh {x}"), false));
                     // SAFETY: an open list with everything set.
                     unsafe { l6.DispatchMesh(x, 1, 1) };
+                    self.note_hdr_draw();
                     DRAWN.fetch_add(1, Ordering::Relaxed);
                     true
                 }
@@ -1324,9 +1403,53 @@ impl State {
     ///
     /// Within a list, the same table holding the same descriptors is made
     /// once.
-    fn tables(&mut self, list: &HostList, used: &[UsedResource], compute: bool) -> Vec<(u8, u32)> {
+    ///
+    /// `half`: the table descriptors the shader moves sixteen bits a channel
+    /// as unsigned integers (`HostShader::half_views`). A table with a 16-bit
+    /// float or signed buffer view at one of them is made afresh as well,
+    /// with that view in the unsigned format of the same layout
+    /// (`descriptor::host::half_view`): the title's own slot keeps the
+    /// title's format for shaders that read it as floats.
+    pub(crate) fn tables(
+        &mut self,
+        list: &HostList,
+        used: &[UsedResource],
+        half: &[(u8, u32)],
+        compute: bool,
+    ) -> Vec<(u8, u32)> {
         let tables = |u: &&UsedResource| u.root == RootType::Table;
         let mut fresh: Vec<u8> = Vec::new();
+        // The view shown in place of the title's at dword `at` of the table
+        // in root parameter `slot`, if the shader moves halves there and the
+        // title's view is a 16-bit float or signed buffer view.
+        let halved = |state: &Self, slot: u8, at: u32| -> Option<View> {
+            if !half.contains(&(slot, at)) {
+                return None;
+            }
+            let Some(&Root::Table(table)) = state.roots_ref(compute).get(usize::from(slot)) else {
+                return None;
+            };
+            let view = crate::descriptor::view(table + u64::from(at) * 4)?;
+            crate::descriptor::host::half_view(&view)
+        };
+        for &(slot, at) in half {
+            let Some(&Root::Table(table)) = self.roots_ref(compute).get(usize::from(slot)) else {
+                continue;
+            };
+            let Some(view) = crate::descriptor::view(table + u64::from(at) * 4) else {
+                continue;
+            };
+            if crate::descriptor::host::half_view(&view).is_some() {
+                if !fresh.contains(&slot) {
+                    fresh.push(slot);
+                }
+            } else if let Some(format) = crate::descriptor::host::half_inexact(&view) {
+                once!(
+                    format,
+                    "a shader moves a buffer's 16-bit channels as integers through a view whose values the console converts: they are read and written unconverted"
+                );
+            }
+        }
         // Tables reaching past a host heap smaller than the title's (the
         // host's limit, 1,000,000 views on NVIDIA) are made afresh too: the
         // title's slots there have no host slot of their own.
@@ -1371,19 +1494,31 @@ impl State {
             let Some(host) = heap.host() else {
                 continue;
             };
+            // The descriptors the shader moves halves through are made too,
+            // and the table reaches them: they may lie past the range starts
+            // the entries give (a range of several views names only its first).
             let n = entries
                 .iter()
                 .map(|u| u.table_offset_dwords / 8 + 1)
+                .chain(
+                    half.iter()
+                        .filter(|&&(s, _)| s == slot)
+                        .map(|&(_, at)| at / 8 + 1),
+                )
                 .max()
                 .unwrap_or(1);
             // The table and what its entries hold (record words).
             let key = {
                 use std::hash::{Hash, Hasher};
                 let mut h = std::collections::hash_map::DefaultHasher::new();
+                n.hash(&mut h);
                 for k in 0..n {
                     let at = table + u64::from(k) * 32;
                     // SAFETY: a descriptor slot in title memory.
                     unsafe { (at as *const [u32; 3]).read_unaligned() }.hash(&mut h);
+                    // Another table than the same slots made for a shader
+                    // that reads them in the title's formats.
+                    half.contains(&(slot, k * 8)).hash(&mut h);
                 }
                 (table, h.finish())
             };
@@ -1408,7 +1543,7 @@ impl State {
             };
             self.fresh_tables.insert(key, first);
             self.dynamic
-                .push((std::ptr::from_ref(heap) as usize, first, n));
+                .push((std::ptr::from_ref(heap) as usize, host.id(), first, n));
             // The whole range: a shader may index past the entries its
             // used-resource list names (descriptor arrays).
             for k in 0..n {
@@ -1417,7 +1552,10 @@ impl State {
                 let view = crate::descriptor::view(table + u64::from(k) * 32);
                 match view.as_deref() {
                     Some(view) => {
-                        host.make_at(index, view);
+                        match halved(self, slot, k * 8) {
+                            Some(twin) => host.make_at(index, &twin),
+                            None => host.make_at(index, view),
+                        }
                         if let Some(u) = used {
                             readable(list, u, view, true);
                         }
@@ -1655,6 +1793,7 @@ impl State {
                 list.list
                     .DrawInstanced(count, instances, from, first_instance)
             };
+            self.note_hdr_draw();
             DRAWN.fetch_add(1, Ordering::Relaxed);
         }
         if !ran {
@@ -1749,6 +1888,7 @@ impl State {
                 list.list
                     .DrawIndexedInstanced(indices, instances, first, base, first_instance)
             };
+            self.note_hdr_draw();
             DRAWN.fetch_add(1, Ordering::Relaxed);
         }
         if !ran {
@@ -1905,8 +2045,10 @@ impl State {
         }
         crate::indirect::done(list, &clamped);
         if kind == DISPATCH {
+            self.probe_hdr_compute(list);
             DISPATCHED.fetch_add(1, Ordering::Relaxed);
         } else {
+            self.note_hdr_draw();
             DRAWN.fetch_add(1, Ordering::Relaxed);
         }
         true
@@ -1996,7 +2138,7 @@ fn readable(list: &HostList, u: &UsedResource, view: &View, marked: bool) {
             // A view of memory the GPU writes through another title texture
             // whose host copy this one could not share reads that copy.
             if let Some(a) = crate::resource::alias_source(*resource as This) {
-                crate::texture::alias_copy(list, a, *resource as This);
+                crate::texture::alias_copy(list, a.get(), *resource as This);
             }
             if let Some(t) = crate::resource::host_copy(*resource as This)
                 && t.title_written()
@@ -2114,6 +2256,7 @@ const QUAD_STRIP: u32 = 20;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::backend::{HostGpu, HostMemory};
 
     /// A root signature that indexes the heaps directly needs one of each
     /// kind bound before it is set: our sampler heap stands in for a title
@@ -2384,6 +2527,215 @@ void main() {
             assert_eq!(((p + 0x100) as *const u32).read_volatile(), 0x1122_3344);
         }
         crate::shadow::unregister(buf as usize, p as u64);
+    }
+
+    /// Live GPU regression test covering write-watched (`MEM_WRITE_WATCH`)
+    /// pages (unarmed marked UAV + declared UAV) AND a mixed tracked +
+    /// untracked (`PAGE_READWRITE`) shadow: when a compute shader writes
+    /// `[0..4)` and the CPU writes `[16..20)` right before copy-back, the
+    /// CPU's bytes must never be clobbered and untracked plain memory must
+    /// stay `PAGE_READWRITE`.
+    #[test]
+    fn writewatch_and_untracked_uav_copy_back_preserve_cpu_writes() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, MEMORY_BASIC_INFORMATION, PAGE_READWRITE, VirtualAlloc,
+            VirtualFree, VirtualQuery,
+        };
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        // Single-thread marked UAV shader using SM 5.0 `RWByteAddressBuffer::Store`
+        // so Wine's `vkd3d-shader` compiles and runs it live on D3DMetal.
+        const LIVE_MARKED_WRITE: &str = r#"
+RWByteAddressBuffer dst : register(u0);
+RWByteAddressBuffer writes : register(u1);
+cbuffer c : register(b0) { uint byte_offset; uint value; uint mark_word_bytes; uint mark_mask; }
+[numthreads(1, 1, 1)]
+void main() {
+    dst.Store(byte_offset, value);
+    if (mark_mask != 0) {
+        writes.Store(mark_word_bytes, mark_mask);
+    }
+}
+"#;
+        const LIVE_PARAMS: &[Param] = &[
+            Param::Table(&[uav(0, 1)]),
+            Param::Uav { register: 1 },
+            Param::Constants { register: 0, count: 4 },
+        ];
+        let (root, pso) = compile_cs(LIVE_MARKED_WRITE, LIVE_PARAMS);
+        let dispatch = |list: &HostList,
+                        heap_host: &crate::descriptor::host::HostHeap,
+                        table_slot: u32,
+                        byte_offset: u32,
+                        value: u32,
+                        mark_bit: Option<u32>| {
+            let writes = crate::shadow::view_writes(false).expect("view_writes bitmap");
+            let (mark_word_bytes, mark_mask) = match mark_bit {
+                Some(bit) => ((bit >> 5) * 4, 1u32 << (bit & 31)),
+                None => (0, 0),
+            };
+            let constants = [byte_offset, value, mark_word_bytes, mark_mask];
+            // SAFETY: an open list and live objects.
+            unsafe {
+                list.list.SetDescriptorHeaps(&[Some(heap_host.heap.clone())]);
+                list.list.SetComputeRootSignature(&root);
+                list.list.SetComputeRootDescriptorTable(0, heap_host.gpu(table_slot));
+                list.list.SetComputeRootUnorderedAccessView(1, writes);
+                list.list.SetComputeRoot32BitConstants(2, 4, constants.as_ptr().cast(), 0);
+                list.list.SetPipelineState(&pso);
+                list.list.Dispatch(1, 1, 1);
+            }
+        };
+        let (_, title_heap, heap_host) = view_heap(8);
+        let _ = host.log_messages();
+
+        // Case 1: Write-watched pool page + unarmed marked UAV (bindless/heap
+        // path where `gpu_writes` was NOT declared): CPU write to `[16..20)`
+        // before copy-back must NOT be clobbered by `copy_back_marks`.
+        let p = crate::watch::tests::pool(1);
+        // SAFETY: committed write-watched page of 64 KiB.
+        unsafe {
+            (p as *mut u32).write_volatile(0x1111_1111);
+            ((p + 16) as *mut u32).write_volatile(0x2222_2222);
+        }
+        let buf_pool = buffer_at_address(p as u64, crate::watch::PAGE as u64);
+        let shadow_pool = crate::shadow::find(p as u64, crate::watch::PAGE as u64).expect("pool shadow");
+        let pool_mark = shadow_pool.mark_entry(p as u64).map(|(bit, _)| bit);
+        assert!(pool_mark.is_some(), "write-watched pool shadow must be marked");
+        let uav_at_0: [u32; 10] = [39, 1, 0, 0, 64, 0, 0, 0, 1, 0];
+        let slot0 = title_heap.start;
+        crate::descriptor::create_uav(std::ptr::null(), buf_pool, std::ptr::null(), &uav_at_0, slot0);
+        let view0 = crate::descriptor::view(slot0).expect("pool uav view");
+        let _ = heap_host.mirror(0, slot0, true);
+
+        let cpu_val = 0xCAFE_BABEu32.to_le_bytes();
+        let list = host.new_list().unwrap();
+        // Refresh as read-only (no `gpu_writes` arming), then title writes
+        // `[16..20)` before the GPU shader writes `[0..4)` and marks the page.
+        readable(&list, &used(ResourceType::Srv), &view0, false);
+        list.defer_copy((p + 16) as *mut u8, cpu_val.as_ptr(), cpu_val.len());
+        dispatch(&list, heap_host, 0, 0, 0xDEAD_BEEF, pool_mark);
+        list.close();
+        host.execute(&[&list]);
+        assert_eq!(host.log_messages(), None);
+        // SAFETY: bytes inside our page.
+        let cpu_after = unsafe { ((p + 16) as *const u32).read_volatile() };
+        assert_eq!(
+            cpu_after,
+            0xCAFE_BABE,
+            "unarmed marked copy-back must keep CPU write on write-watched page"
+        );
+
+        // Case 2: Write-watched pool page + armed marked UAV: 3-way merge
+        // preserves BOTH GPU `[0..4)` and CPU `[16..20)`.
+        // SAFETY: committed write-watched page of 64 KiB.
+        unsafe {
+            (p as *mut u32).write_volatile(0x1111_1111);
+            ((p + 16) as *mut u32).write_volatile(0x2222_2222);
+        }
+        let list_armed = host.new_list().unwrap();
+        readable(&list_armed, &used(ResourceType::Uav), &view0, true);
+        list_armed.defer_copy((p + 16) as *mut u8, cpu_val.as_ptr(), cpu_val.len());
+        dispatch(&list_armed, heap_host, 0, 0, 0xDEAD_BEEF, pool_mark);
+        list_armed.close();
+        host.execute(&[&list_armed]);
+        assert_eq!(host.log_messages(), None);
+        // SAFETY: bytes inside our page.
+        unsafe {
+            assert_eq!((p as *const u32).read_volatile(), 0xDEAD_BEEF, "armed GPU write copied back");
+            assert_eq!(((p + 16) as *const u32).read_volatile(), 0xCAFE_BABE, "armed copy-back preserved CPU write");
+        }
+
+        // Case 3: Write-watched pool page + declared `gpu_writes(..., false)`
+        // (snapshot 3-way merge): both GPU `[0..4)` and CPU `[16..20)` survive.
+        // SAFETY: committed write-watched page of 64 KiB.
+        unsafe {
+            (p as *mut u32).write_volatile(0x1111_1111);
+            ((p + 16) as *mut u32).write_volatile(0x2222_2222);
+        }
+        let list2 = host.new_list().unwrap();
+        shadow_pool.refresh(&list2, p as u64, crate::watch::PAGE as u64);
+        shadow_pool.gpu_writes(&list2, p as u64, crate::watch::PAGE as u64, false);
+        list2.defer_copy((p + 16) as *mut u8, cpu_val.as_ptr(), cpu_val.len());
+        dispatch(&list2, heap_host, 0, 0, 0xDEAD_BEEF, None);
+        list2.close();
+        host.execute(&[&list2]);
+        assert_eq!(host.log_messages(), None);
+        // SAFETY: bytes inside our page.
+        unsafe {
+            assert_eq!((p as *const u32).read_volatile(), 0xDEAD_BEEF, "declared GPU write copied back");
+            assert_eq!(((p + 16) as *const u32).read_volatile(), 0xCAFE_BABE, "declared copy-back preserved CPU write");
+        }
+        crate::shadow::unregister(buf_pool as usize, p as u64);
+
+        // Case 4: Mixed tracked (`MEM_WRITE_WATCH`) + untracked plain
+        // (`PAGE_READWRITE`) shadow: UAV targets the untracked plain page,
+        // GPU writes `[0..4)`, CPU writes `[16..20)` right before copy-back.
+        let page = crate::watch::PAGE;
+        let (pool, plain) = (0..8)
+            .find_map(|_| {
+                // SAFETY: fresh reservation released immediately, then two adjacent pages.
+                unsafe {
+                    let base = VirtualAlloc(std::ptr::null(), 2 * page, MEM_RESERVE, PAGE_READWRITE) as usize;
+                    VirtualFree(base as *mut _, 0, MEM_RELEASE);
+                    let at = |q: usize, kind: u32| {
+                        VirtualAlloc(q as *const _, page, MEM_RESERVE | MEM_COMMIT | kind, PAGE_READWRITE) as usize
+                    };
+                    let (a, b) = (at(base, crate::watch::tests::MEM_WRITE_WATCH), at(base + page, 0));
+                    if base != 0 && a == base && b == base + page {
+                        return Some((a, b));
+                    }
+                    [a, b].into_iter().filter(|&q| q != 0).for_each(crate::watch::tests::free);
+                    None
+                }
+            })
+            .expect("two adjacent pages");
+        // SAFETY: bytes inside our plain page.
+        unsafe {
+            (plain as *mut u32).write_volatile(0x1111_1111);
+            ((plain + 16) as *mut u32).write_volatile(0x2222_2222);
+        }
+        let buf_mixed = buffer_at_address(pool as u64, (2 * page) as u64);
+        let shadow_mixed = crate::shadow::find(pool as u64, (2 * page) as u64).expect("mixed shadow");
+        let plain_mark = shadow_mixed.mark_entry(plain as u64).map(|(bit, _)| bit);
+        // Raw UAV starting at `plain` (offset `page` = 16384 dwords).
+        let uav_plain: [u32; 10] = [39, 1, (page / 4) as u32, 0, 64, 0, 0, 0, 1, 0];
+        let slot1 = title_heap.start + 32;
+        crate::descriptor::create_uav(std::ptr::null(), buf_mixed, std::ptr::null(), &uav_plain, slot1);
+        let view1 = crate::descriptor::view(slot1).expect("mixed plain uav view");
+        let _ = heap_host.mirror(1, slot1, true);
+
+        let list3 = host.new_list().unwrap();
+        readable(&list3, &used(ResourceType::Uav), &view1, true);
+        list3.defer_copy((plain + 16) as *mut u8, cpu_val.as_ptr(), cpu_val.len());
+        dispatch(&list3, heap_host, 1, 0, 0xDEAD_BEEF, plain_mark);
+        list3.close();
+        host.execute(&[&list3]);
+        assert_eq!(host.log_messages(), None);
+
+        // SAFETY: bytes inside our plain page.
+        unsafe {
+            assert_eq!(
+                (plain as *const u32).read_volatile(),
+                0xDEAD_BEEF,
+                "GPU write on untracked page of mixed shadow must copy back"
+            );
+            assert_eq!(
+                ((plain + 16) as *const u32).read_volatile(),
+                0xCAFE_BABE,
+                "CPU write on untracked page of mixed shadow must not be clobbered"
+            );
+        }
+        // SAFETY: plain data filled in by the query.
+        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: valid out pointer.
+        unsafe { VirtualQuery(plain as *const _, &mut info, size_of_val(&info)) };
+        assert_eq!(
+            info.Protect, PAGE_READWRITE,
+            "untracked plain page must remain PAGE_READWRITE after copy-back"
+        );
+        crate::shadow::unregister(buf_mixed as usize, pool as u64);
     }
 
     /// Unaligned and `< 64 KiB` / cross-page `Shadow`s clamp `page_range`
@@ -3353,7 +3705,7 @@ void main() { dst.Store4(0, asuint(src[0])); }
         state.set_table(true, 0, title_heap.start);
         assert!(
             state
-                .tables(&list, &[used(ResourceType::Srv)], true)
+                .tables(&list, &[used(ResourceType::Srv)], &[], true)
                 .is_empty(),
             "an in-place table"
         );
@@ -3769,7 +4121,7 @@ void main(uint3 id : SV_DispatchThreadID) {
         }
 
         slots.make_null(dynamic);
-        slots.release(dynamic, 1);
+        slots.release(slots.id(), dynamic, 1);
         drop(list);
         assert_eq!(
             crate::object::slot::<extern "system" fn(crate::object::This) -> u32>(heap, 0x10)(heap),
@@ -4176,7 +4528,7 @@ void main(uint3 id : SV_DispatchThreadID) {
                 used: used_entries,
             },
         );
-        let hp = HostPipeline::new(&[shader], None).expect("compute host pipeline");
+        let hp = HostPipeline::new(&[shader], None, |_, _| {}).expect("compute host pipeline");
         assert!(hp.marks.is_some());
 
         // 16-bit console depth-stencil texture (`format = 118`) whose twin

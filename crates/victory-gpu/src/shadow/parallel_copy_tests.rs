@@ -1,4 +1,5 @@
 use super::*;
+use crate::backend::HostGpu;
 
 const COPY_LEN: usize = 2 * PAGE;
 const INITIAL: u8 = 0x19;

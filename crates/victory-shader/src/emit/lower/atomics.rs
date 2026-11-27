@@ -219,6 +219,24 @@ impl<'a> Lower<'a> {
         match finished {
             Some((is, yes)) => {
                 let open = self.s.m.bin(c, Bin::Xor, is, yes);
+                // A ballot where every lane has left the rounds, so a lane
+                // still in a round's held block (its lock not yet freed)
+                // reconverges before its wave-mates' turns: without it, on
+                // M1 and M2 GPUs the turns spun to the bound on a lock their
+                // own wave held (cocobailey, #240). `open & any` is `open`.
+                // All four words, so lanes past 31 count on wider waves;
+                // `waveAnyTrue` in its place hung the rounds on an M1 Max.
+                let four = self.s.m.named_struct("dx.types.fouri32", vec![i32t; 4]);
+                let ballot = self
+                    .s
+                    .op(c, "waveActiveBallot", Attr::NoUnwind, four, 116, &[open]);
+                let mut w = self.s.m.extract(c, ballot, 0);
+                for i in 1..4 {
+                    let wi = self.s.m.extract(c, ballot, i);
+                    w = self.s.m.bin(c, Bin::Or, w, wi);
+                }
+                let any = self.s.m.cmp(c, pred::NE, w, zero);
+                let open = self.s.m.bin(c, Bin::And, open, any);
                 self.s.m.terminate(c, Term::CondBr(open, head, done));
             }
             None => self.s.m.terminate(c, Term::Br(head)),

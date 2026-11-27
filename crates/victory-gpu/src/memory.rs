@@ -38,6 +38,7 @@ use std::sync::{Arc, Mutex};
 use victory_formats::pagetable::{self, BLOCK, CAPACITY, LEVEL1};
 use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
 
+use crate::backend::HostMemory;
 use crate::descriptor::host::HostHeap;
 use crate::host::HostList;
 use crate::shadow::Shadow;
@@ -218,6 +219,12 @@ static SHARED: Mutex<Vec<(usize, Shared)>> = Mutex::new(Vec::new());
 
 fn shared() -> std::sync::MutexGuard<'static, Vec<(usize, Shared)>> {
     SHARED.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// How many page tables there are: each one's layout holds every copy it
+/// names ([`crate::shadow::release_idle`] counts on it).
+pub(crate) fn tables() -> usize {
+    shared().len()
 }
 
 /// View heap `key` was released: its page table goes with it (lists that
@@ -649,6 +656,7 @@ pub(crate) fn bind(list: &HostList, key: usize) -> Option<Map> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::backend::HostGpu;
     use victory_formats::pagetable::table;
 
     #[test]

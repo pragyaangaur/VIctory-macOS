@@ -168,7 +168,8 @@ The on/off switches below (`...=1`) are off when unset or set to `0`.
 | `VICTORY_STACKS=20,60` | every thread's stack at those seconds |
 | `VICTORY_WATCH=<rva>,...` | logs a title u32 when it changes |
 | `VICTORY_POKE=<rva>:<byte>,...` | writes a title byte twice a second (a hang watchdog's tick, say) |
-| `VICTORY_KEYS=30:Enter,35:X` | presses keys at those seconds, focus or not |
+| `VICTORY_KEYS=30:Enter,35:X,2-120/1:Down` | presses keys at those seconds, focus or not: `<from>-<to>:<key>` holds the key that whole time, `/<every>[+<hold>]:<key>` presses it again every `<every>` seconds (each press `<hold>` long, 0.2 s by default, bounds in front, e.g. `2-200/3+2.5:Enter`); times are seconds, scientific notation included (`1e-3:Enter`) |
+| `VICTORY_KEYS_FILE=<path>` | one key name per line, each pressed 0.2 s once its line is newline-terminated, in order (`Add-Content <path> Enter`) |
 | `VICTORY_FRAME_HZ=60` | tests a 60 Hz frame interval for the runtime's flip events |
 | `VICTORY_CRASH_BREAKPOINTS=1` | appends first-chance breakpoints to `crashes.log`, including ones a handler may recover from |
 | `VICTORY_CRASH_SAVE=<rva>:<len>,...` | saves title memory to the cache folder on a crash |
@@ -189,6 +190,8 @@ The on/off switches below (`...=1`) are off when unset or set to `0`.
 | `VICTORY_SHADER_LOOP_LIMIT=<n>` | translated shader loops stop after `n` iterations per lane instead of 2^20 (own shader cache entries); if a lower `n` makes world frames much faster, loops hitting the limit are what makes them slow |
 | `VICTORY_AUDIO_CAPTURE=<file.wav>` | records what the title plays (our process only) |
 | `VICTORY_XMA_DUMP=<dir>` | saves the first 32 XMA voices' context and input |
+
+`VICTORY_KEYS` and `VICTORY_KEYS_FILE` work in ordinary Windows builds, no diagnostics needed: they press keys on the keyboard device and, through it, on the keyboard's stand-in pad. Injecting them into a connected XInput pad instead requires a diagnostics build.
 
 ## Where things are
 

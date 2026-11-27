@@ -29,10 +29,13 @@ pub const DATA_DIRECTORY_SIZE: usize = 8;
 
 /// `IMAGE_TLS_DIRECTORY64::AddressOfCallBacks` (u64 VA).
 pub const TLS64_ADDRESS_OF_CALLBACKS: usize = 24;
+/// Size of an `IMAGE_TLS_DIRECTORY64`.
+pub const TLS64_SIZE: usize = 40;
 
 /// Data directory indices.
 pub mod dir {
     pub const IMPORT: usize = 1;
+    pub const TLS: usize = 9;
     pub const EXCEPTION: usize = 3;
     pub const BASERELOC: usize = 5;
     pub const LOAD_CONFIG: usize = 10;
@@ -269,9 +272,11 @@ mod tests {
         assert_eq!(OPT_DATA_DIRECTORY, OPT_NUMBER_OF_RVA_AND_SIZES + 4);
         assert_eq!(DATA_DIRECTORY_SIZE, 8);
         assert_eq!(TLS64_ADDRESS_OF_CALLBACKS, 24);
+        assert_eq!(TLS64_SIZE, 40);
 
         // Data directory indices, which `prepare` patches by number.
         assert_eq!(dir::IMPORT, 1);
+        assert_eq!(dir::TLS, 9);
         assert_eq!(dir::EXCEPTION, 3);
         assert_eq!(dir::BASERELOC, 5);
         assert_eq!(dir::LOAD_CONFIG, 10);

@@ -23,9 +23,13 @@ use crate::structure::{Atom, Bool, LaneExit, Map, Set, Structured};
 mod barriers;
 mod atomics;
 mod bvh;
+/// Format loads that move 16-bit halves without the d16 form, a child
+/// module so it shares the emitter's state.
+#[path = "half_views.rs"]
+mod half_views;
 mod halves;
 mod mesh;
-use barriers::{in_step, split_wave_barriers};
+use barriers::{split_wave_barriers, step_and_cap};
 pub(crate) use mesh::KeptOutputs;
 use mesh::prune_signature;
 
@@ -57,6 +61,8 @@ pub(crate) struct Shape {
     pub atomics: Vec<usize>,
     /// `rawBufferLoad` calls.
     pub loads: usize,
+    /// `dx.op.barrier` calls (a cross-half exchange has two).
+    pub barriers: usize,
 }
 
 pub(crate) struct Lowered {
@@ -67,6 +73,8 @@ pub(crate) struct Lowered {
     pub root_srvs: Vec<u8>,
     pub root_uavs: Vec<u8>,
     pub root_srv_bytes: Vec<(u8, u32)>,
+    /// See [`super::HostShader::half_views`].
+    pub half_views: Vec<(u8, u32)>,
     /// Reads title memory at computed addresses (the page table).
     pub memory: bool,
     /// Writes there (the written-pages bitmap).
@@ -104,6 +112,10 @@ pub(crate) struct Lowered {
     /// Barriers added for narrow host waves ([`split_wave_barriers`]).
     #[cfg(test)]
     pub split_barriers: usize,
+    /// Group barriers written (`dx.op.barrier`), for structural tests of
+    /// the exchanges between 32-lane halves.
+    #[cfg(test)]
+    pub barriers: usize,
     /// The `WaveSize` the program declares.
     #[cfg(test)]
     pub wave_size: Option<u32>,
@@ -127,6 +139,10 @@ pub(crate) struct Lowered {
     /// Written constant buffer row loads (`cbufferLoadLegacy`).
     #[cfg(test)]
     pub cbuffer_rows: usize,
+    /// The written `dx.op.unary.f32` calls: their DXIL opcodes, and whether
+    /// the operand was denormal-flushed first. For structural tests.
+    #[cfg(test)]
+    pub unary_f32: Vec<(u32, bool)>,
 }
 
 pub(crate) struct Parts<'a> {
@@ -198,6 +214,7 @@ const TWO_PI: f32 = std::f32::consts::TAU;
 /// byte 1. UINT and SINT views both use the signless `.i32` DXIL overload.
 const TYPED_F32_PROPS: u32 = 9 | 4 << 8;
 const TYPED_I32_PROPS: u32 = 4 | 4 << 8;
+const TYPED_U32_PROPS: u32 = 5 | 4 << 8;
 /// `s_sendmsg` id of a mesh or NGG stage's output allocation request.
 const GS_ALLOC_REQ: u16 = 9;
 
@@ -294,6 +311,11 @@ struct Lower<'a> {
     params: Map<Value, (usize, u32)>,
     user_data: Option<V>,
     user_reads: BTreeMap<u32, UserData>,
+    /// Table descriptors read or written sixteen bits a channel
+    /// ([`super::HostShader::half_views`]): root parameter, dword offset.
+    half_views: BTreeSet<(u8, u32)>,
+    /// [`Self::places_read_as_halves`], found before the code is lowered.
+    halves_only: BTreeSet<(u8, u32)>,
     /// Handles of root SRVs and UAVs read as bounded views, by user-data
     /// dword ([`Lower::root_view`]).
     root_views: Map<u32, V>,
@@ -347,8 +369,13 @@ struct Lower<'a> {
     /// [`Lower::relabelled_flat`], once made.
     relabelled: Option<V>,
     /// In halves: per IR block, whether every lane of the group runs it
-    /// together ([`in_step`]), where values can pass between the halves.
+    /// together ([`step_and_cap`]), where values can pass between the halves.
     step: Vec<bool>,
+    /// Per IR block, whether a lane may have left the program early at a
+    /// capped back edge's iteration limit before reaching it
+    /// ([`step_and_cap`]): an explicit `s_barrier` there would wait for
+    /// lanes that are gone.
+    cap_escaped: Vec<bool>,
     /// In halves: the group-shared dwords values pass between the halves
     /// through, once made ([`Lower::exchange_halves`]).
     half_words: Option<V>,
@@ -838,6 +865,7 @@ impl<'a> Lower<'a> {
                 }
             }
         }
+        let (step, cap_escaped) = step_and_cap(p, x.st, halves);
         Lower {
             s,
             x,
@@ -858,6 +886,8 @@ impl<'a> Lower<'a> {
             params: x.res.params.iter().map(|&(v, p, d)| (v, (p, d))).collect(),
             user_data: None,
             user_reads: BTreeMap::new(),
+            half_views: BTreeSet::new(),
+            halves_only: BTreeSet::new(),
             root_views: Map::default(),
             root_srv_reads: BTreeMap::new(),
             samplers: Vec::new(),
@@ -889,7 +919,8 @@ impl<'a> Lower<'a> {
             halves,
             halves_refused,
             relabelled: None,
-            step: if halves { in_step(p, x.st) } else { Vec::new() },
+            step: if halves { step } else { Vec::new() },
+            cap_escaped,
             half_words: None,
             level: 0,
             alike: if halves {
@@ -1360,11 +1391,14 @@ impl<'a> Lower<'a> {
             Shape::Prefix(op, src, mask, ident, inclusive) => {
                 (op, src, mask, ident, Some(inclusive))
             }
-            Shape::Half(..) if self.halves => return Err(ACROSS),
             Shape::Half(_, src, mask, ident, hi) => {
                 // The high half is a console lane's: compute only.
                 if self.mask_data != MaskData::Console {
                     return Err("a 16-bit wave reduction outside compute");
+                }
+                let across = self.halves && !self.one_host_wave();
+                if across && !self.across_here() {
+                    return Err(ACROSS);
                 }
                 let c = self.cur;
                 let &m = self
@@ -1392,22 +1426,40 @@ impl<'a> Lower<'a> {
                     119,
                     &[f, sum, signed],
                 );
+                // In halves, each host wave reduced its own 32 lanes. Pass
+                // those f32 totals between the halves before rounding once.
+                let r = if across {
+                    self.reduce_across(Op::AddH, r, r, false, ident)?
+                } else {
+                    r
+                };
                 let r = self.f32_to_f16(c, r);
                 let r = self.s.m.bin(c, Bin::And, r, low);
                 // Lane `hi` runs the section on the console even where it is
                 // elsewhere on the host; there it holds the identity.
                 let i32t = self.s.t.i32;
-                let four = self.s.m.named_struct("dx.types.fouri32", vec![i32t; 4]);
-                let b = self
-                    .s
-                    .op(c, "waveActiveBallot", Attr::NoUnwind, four, 116, &[on]);
-                let word = self.s.m.extract(c, b, hi / 32);
+                let word = if across {
+                    // Lane `hi` may be in the other host wave: both halves'
+                    // ballots, as its value is read across them below.
+                    let (lo, up) = self.ballot_across_halves(on, c)?;
+                    if hi < 32 { lo } else { up }
+                } else {
+                    let four = self.s.m.named_struct("dx.types.fouri32", vec![i32t; 4]);
+                    let b = self
+                        .s
+                        .op(c, "waveActiveBallot", Attr::NoUnwind, four, 116, &[on]);
+                    self.s.m.extract(c, b, hi / 32)
+                };
                 let (sh, one, z) = (self.s.m.i32(hi % 32), self.s.m.i32(1), self.s.m.i32(0));
                 let bit = self.s.m.bin(c, Bin::LShr, word, sh);
                 let bit = self.s.m.bin(c, Bin::And, bit, one);
                 let there = self.s.m.cmp(c, pred::NE, bit, z);
                 let lane = self.s.m.i32(hi);
-                let at = self.read_lane(x, lane);
+                let at = if across {
+                    self.read_lane_across(x, lane)?
+                } else {
+                    self.read_lane(x, lane)
+                };
                 let top = self.s.m.select(c, there, at, id);
                 let high = self.s.m.i32(0xFFFF_0000);
                 let top = self.s.m.bin(c, Bin::And, top, high);
@@ -1523,6 +1575,7 @@ impl<'a> Lower<'a> {
 
     fn run(mut self) -> Result<Lowered, Stop> {
         let p = self.x.p;
+        self.halves_only = self.places_read_as_halves();
         let order = crate::ir::reverse_postorder(&p.blocks);
         for (n, &b) in order.iter().enumerate() {
             self.rpo[b] = n;
@@ -1633,6 +1686,7 @@ impl<'a> Lower<'a> {
             .into_iter()
             .filter_map(|(slot, end)| end.map(|end| (slot, end)))
             .collect();
+        let half_views = std::mem::take(&mut self.half_views).into_iter().collect();
         let memory = self.s.memory.is_some();
         let memory_writes = self.s.memory_dirty.is_some();
         let view_addresses = self.s.view_addresses.is_some();
@@ -1668,6 +1722,7 @@ impl<'a> Lower<'a> {
             root_srvs,
             root_uavs,
             root_srv_bytes,
+            half_views,
             memory,
             memory_writes,
             view_addresses,
@@ -1702,10 +1757,13 @@ impl<'a> Lower<'a> {
                     branches,
                     atomics: self.s.m.written_call_blocks("dx.op.atomicBinOp.i32"),
                     loads: self.s.m.written_calls("dx.op.rawBufferLoad.f32"),
+                    barriers: self.s.m.written_calls("dx.op.barrier"),
                 }
             },
             #[cfg(test)]
             split_barriers: self.split_barriers.len(),
+            #[cfg(test)]
+            barriers: self.s.m.written_calls("dx.op.barrier"),
             #[cfg(test)]
             wave_size: self.s.wave_size,
             #[cfg(test)]
@@ -1726,6 +1784,7 @@ impl<'a> Lower<'a> {
                 .collect(),
             #[cfg(test)]
             cbuffer_rows: self.s.m.written_calls("dx.op.cbufferLoadLegacy.i32"),
+            unary_f32: self.s.m.written_unary_f32_flushes(),
             dxil: self.s.finish(),
             user_data,
             samplers: self.samplers,
@@ -3974,8 +4033,15 @@ impl<'a> Lower<'a> {
             Fields::Sop { .. } => self.sop(inst),
             Fields::Sopp { .. } if name == "s_barrier" && self.no_barrier.contains(&b) => Ok(()),
             Fields::Sopp { .. } if name == "s_barrier" => {
-                self.group_barrier();
-                Ok(())
+                // A lane may have left the program early at a capped back
+                // edge's iteration limit before this block; a group barrier
+                // here would wait for lanes that are gone.
+                if self.cap_escaped.get(b).copied().unwrap_or(false) {
+                    Err("an s_barrier where a lane may have left the program early at a loop's iteration limit")
+                } else {
+                    self.group_barrier();
+                    Ok(())
+                }
             }
             Fields::Sopp { .. } => Ok(()),
             Fields::Smem { .. } => self.smem(inst, (b, i)),
@@ -4756,7 +4822,15 @@ impl<'a> Lower<'a> {
                 let props = if un.starts_with("buffer_load_format")
                     || un.starts_with("buffer_store_format")
                 {
-                    (10 | u, 0x409)
+                    // (Unsigned integers where the access moves halves.)
+                    let halves = self
+                        .table_place(&Source::Loaded { load: site, first })
+                        .is_some_and(|p| {
+                            self.halves_only.contains(&p)
+                                && (un.contains("_format_d16_")
+                                    || self.format_load_read_as_halves(ui))
+                        });
+                    (10 | u, if halves { TYPED_U32_PROPS } else { TYPED_F32_PROPS })
                 } else if *idxen && format.is_none() && stride >= 4 && stride.is_multiple_of(4) {
                     (12 | u, stride)
                 } else {
@@ -5122,102 +5196,6 @@ impl<'a> Lower<'a> {
         self.atomic_bin_op(self.cur, &[bitmap, k2, last_word, iu, iu, last_bit]);
         self.end_guarded(inner, &[]);
         self.end_guarded(outer, &[]);
-    }
-
-    /// The byte stride of the buffer view at heap index `index`, from the
-    /// view-stride table (`t`[`VIEW_STRIDES`]).
-    fn stride_at(&mut self, index: V) -> V {
-        let word = self.view_word(index);
-        let bits = self.s.m.i32(VIEW_STRIDE_BITS);
-        self.s.m.bin(self.cur, Bin::And, word, bits)
-    }
-
-    /// Dword `index` of the view-stride table: the stride and the format
-    /// kind bits ([`VIEW_INTEGER`], [`VIEW_SIGNED`]).
-    fn view_word(&mut self, index: V) -> V {
-        let c = self.cur;
-        let four = self.s.m.i32(4);
-        let at = self.s.m.bin(c, Bin::Mul, index, four);
-        let table = self.s.root_srv_handle(VIEW_STRIDES);
-        self.raw_dword(table, at)
-    }
-
-    /// Whether the typed buffer view a handle names has an integer format,
-    /// and whether a signed one, from the view-stride table; `None` if the
-    /// handle's heap index is not known.
-    fn integer_view(&mut self, h: V) -> Option<(V, V)> {
-        let index = *self.s.view_index.get(&h)?;
-        let word = self.view_word(index);
-        let c = self.cur;
-        let zero = self.s.m.i32(0);
-        let [int, signed] = [VIEW_INTEGER, VIEW_SIGNED].map(|bit| {
-            let bit = self.s.m.i32(bit);
-            let x = self.s.m.bin(c, Bin::And, word, bit);
-            self.s.m.cmp(c, pred::NE, x, zero)
-        });
-        Some((int, signed))
-    }
-
-    /// A 32-bit typed load through independently annotated float and integer
-    /// handles. The view's format is dynamic, so the overloads must be in
-    /// mutually exclusive branches: executing `bufferLoad.i32` on a float view
-    /// (or the reverse) is not a bitcast. Each result channel is an `i32` phi;
-    /// the float path bitcasts only after the float load has taken place.
-    fn typed_buffer_load(
-        &mut self,
-        float_h: V,
-        integer_h: V,
-        index: V,
-        integer: V,
-        count: u32,
-    ) -> Vec<V> {
-        let head = self.cur;
-        let (integer_block, float_block, join) = (
-            self.s.m.new_block(),
-            self.s.m.new_block(),
-            self.s.m.new_block(),
-        );
-        self.s.m.terminate(head, Term::CondBr(integer, integer_block, float_block));
-        let iu = self.s.m.undef(self.s.t.i32);
-        let mut integer_values = Vec::new();
-        self.cur = integer_block;
-        let r = self.s.op(
-            integer_block,
-            "bufferLoad.i32",
-            Attr::ReadOnly,
-            self.s.t.res_ret_i32,
-            68,
-            &[integer_h, index, iu],
-        );
-        for ch in 0..count {
-            integer_values.push(self.s.m.extract(integer_block, r, ch));
-        }
-        self.s.m.terminate(integer_block, Term::Br(join));
-        let mut float_values = Vec::new();
-        self.cur = float_block;
-        let r = self.s.op(
-            float_block,
-            "bufferLoad.f32",
-            Attr::ReadOnly,
-            self.s.t.res_ret,
-            68,
-            &[float_h, index, iu],
-        );
-        for ch in 0..count {
-            let x = self.s.m.extract(float_block, r, ch);
-            float_values.push(self.as_int(x));
-        }
-        self.s.m.terminate(float_block, Term::Br(join));
-        self.cur = join;
-        integer_values
-            .into_iter()
-            .zip(float_values)
-            .map(|(integer, float)| {
-                let phi = self.s.m.phi(join, self.s.t.i32);
-                self.s.m.set_phi(phi, vec![(integer, integer_block), (float, float_block)]);
-                phi
-            })
-            .collect()
     }
 
     /// Title memory at a raw GPU address (decision 0005: the unified-memory
@@ -7058,7 +7036,20 @@ impl<'a> Lower<'a> {
                 };
                 let r = match op {
                     12 | 13 => self.trig_turns(a, op == 12),
-                    22 => self.fract(a, 1.0, f32::from_bits(0x3F7F_FFFF)),
+                    // The console reads f32 denormals as zeros of their sign.
+                    // DXIL floor/ceil/fract need not do that (vkd3d on NVIDIA
+                    // keeps them: no FP32 denorm flush capability), so flush
+                    // on the bits first, as for max/min and the floor
+                    // conversions. trunc and rndne already round subnormals
+                    // to signed zero.
+                    22 => {
+                        let flushed = self.ftz(a);
+                        self.fract(flushed, 1.0, f32::from_bits(0x3F7F_FFFF))
+                    }
+                    27 | 28 => {
+                        let flushed = self.ftz(a);
+                        self.unary(op, flushed)
+                    }
                     _ => self.unary(op, a),
                 };
                 float(self, r)
@@ -10389,6 +10380,22 @@ impl<'a> Lower<'a> {
             .copied()
             .ok_or("an untracked buffer")?;
         let used = self.used_kind(src);
+        // Sixteen bits a channel through a view of a table: the bits go as
+        // they are, as unsigned integers, and the host is told, which shows
+        // the shader a 16-bit float or signed view there as its unsigned twin
+        // ([`super::HostShader::half_views`]).
+        // A format load of whole dwords whose every use reads one half of a
+        // result as a half float moves 16-bit integers too, where every
+        // access through its view does ([`Self::places_read_as_halves`]).
+        // A d16 access too only where every access does: a whole float
+        // read through the same place would see the unsigned twin.
+        let place = typed.then(|| self.table_place(src)).flatten().filter(|p| {
+            self.halves_only.contains(p) && (d16 || self.format_load_read_as_halves(inst))
+        });
+        let halves = place.is_some();
+        if let Some(place) = place {
+            self.half_views.insert(place);
+        }
         let (base, extra) = self.built_offset(src)?;
         if base != 0 {
             let b = self.s.m.i32(base);
@@ -10551,122 +10558,26 @@ impl<'a> Lower<'a> {
             let mut vals =
                 self.vgprs(inst, data.as_ref().ok_or("buffer store data")?, regs as u8)?;
             let typed_h = if typed {
-                Some(self.handle(site, src, false, (10 | u, TYPED_F32_PROPS))?)
+                let component = if halves {
+                    TYPED_U32_PROPS
+                } else {
+                    TYPED_F32_PROPS
+                };
+                Some(self.handle(site, src, false, (10 | u, component))?)
             } else {
                 None
             };
             if d16 {
-                // d16 data is f16 for float and normalized formats, widened
-                // for the 32-bit float store; for integer formats (the view's
-                // kind, from the view-stride table) the 16-bit integer, zero-
-                // or sign-extended (stored through the float-typed handle as
-                // loads read: see there).
-                let integer = typed_h.and_then(|h| self.integer_view(h));
-                let c = self.cur;
-                let mut wide = Vec::new();
-                for k in 0..count {
-                    let mut x = vals[(k / 2) as usize];
-                    if k % 2 == 1 {
-                        let k16 = self.s.m.i32(16);
-                        x = self.s.m.bin(c, Bin::LShr, x, k16);
-                    }
-                    let f = self.f16_to_f32(c, x);
-                    let mut w = self.as_int(f);
-                    if let Some((int, signed)) = integer {
-                        let (k16, low) = (self.s.m.i32(16), self.s.m.i32(0xFFFF));
-                        let zero_ext = self.s.m.bin(c, Bin::And, x, low);
-                        let up = self.s.m.bin(c, Bin::Shl, x, k16);
-                        let sign_ext = self.s.m.bin(c, Bin::AShr, up, k16);
-                        let n = self.s.m.select(c, signed, sign_ext, zero_ext);
-                        w = self.s.m.select(c, int, n, w);
-                    }
-                    wide.push(w);
-                }
-                vals = wide;
+                vals = self.d16_store_values(&vals, count, halves, typed_h);
             }
             if typed && !d16 {
-                // As for loads, a dynamic integer view gets a separately
-                // annotated handle and a mutually exclusive integer store.
                 if count != 4 {
                     return Err("a typed buffer store of some channels or at an offset");
                 }
                 if *offen || *offset != 0 || matches!(off, V::Inst(_)) {
                     return Err("a typed buffer store at an offset");
                 }
-                let h = typed_h.ok_or("a typed buffer store")?;
-                let element = index.unwrap_or(self.s.m.i32(0));
-                let (byte, bytes) = if self.x.view_marks {
-                    let at = self
-                        .s
-                        .view_index
-                        .get(&h)
-                        .copied()
-                        .ok_or("a typed buffer store")?;
-                    let stride = self.stride_at(at);
-                    (self.s.m.bin(self.cur, Bin::Mul, element, stride), stride)
-                } else {
-                    (element, self.s.m.i32(0))
-                };
-                let integer = self.integer_view(h).map(|(integer, _)| integer);
-                let integer_h = if integer.is_some() {
-                    Some(self.handle(site, src, false, (10 | u, TYPED_I32_PROPS))?)
-                } else {
-                    None
-                };
-                let outer = self.begin_guarded(guard);
-                self.mark_view_write(h, byte, bytes, None);
-                if let (Some(integer), Some(integer_h)) = (integer, integer_h) {
-                    let head = self.cur;
-                    let (integer_block, float_block, join) = (
-                        self.s.m.new_block(),
-                        self.s.m.new_block(),
-                        self.s.m.new_block(),
-                    );
-                    self.s.m.terminate(head, Term::CondBr(integer, integer_block, float_block));
-                    let iu = self.s.m.undef(self.s.t.i32);
-                    let mask = self.s.m.i8(0xF);
-                    self.cur = integer_block;
-                    let mut args = vec![integer_h, element, iu];
-                    args.extend_from_slice(&vals);
-                    args.push(mask);
-                    self.s.op(
-                        integer_block,
-                        "bufferStore.i32",
-                        Attr::NoUnwind,
-                        self.s.t.void,
-                        69,
-                        &args,
-                    );
-                    self.s.m.terminate(integer_block, Term::Br(join));
-                    self.cur = float_block;
-                    let mut args = vec![h, element, iu];
-                    args.extend(vals.iter().map(|&x| self.as_float(x)));
-                    args.push(mask);
-                    self.s.op(
-                        float_block,
-                        "bufferStore.f32",
-                        Attr::NoUnwind,
-                        self.s.t.void,
-                        69,
-                        &args,
-                    );
-                    self.s.m.terminate(float_block, Term::Br(join));
-                    self.cur = join;
-                } else {
-                    let mut args = vec![h, element, iu];
-                    args.extend(vals.iter().map(|&x| self.as_float(x)));
-                    args.push(self.s.m.i8(0xF));
-                    self.s.op(
-                        self.cur,
-                        "bufferStore.f32",
-                        Attr::NoUnwind,
-                        self.s.t.void,
-                        69,
-                        &args,
-                    );
-                }
-                self.end_guarded(outer, &[]);
-                return Ok(());
+                return self.typed_buffer_store_32(site, src, u, typed_h, index, &vals, guard);
             }
             let mut args = Vec::new();
             // Where the write starts in the view, and how many bytes it may
@@ -10686,7 +10597,7 @@ impl<'a> Lower<'a> {
                 args.push(h);
                 args.extend([element, iu]);
                 for x in vals {
-                    args.push(self.as_float(x));
+                    args.push(if halves { x } else { self.as_float(x) });
                 }
                 // The element's size is the view's stride, not always 16. It
                 // is needed at run time only for the write marks.
@@ -10702,7 +10613,14 @@ impl<'a> Lower<'a> {
                 } else {
                     (element, self.s.m.i32(0))
                 };
-                (69, "bufferStore.f32")
+                (
+                    69,
+                    if halves {
+                        "bufferStore.i32"
+                    } else {
+                        "bufferStore.f32"
+                    },
+                )
             } else {
                 match index {
                     Some(index) => {
@@ -10791,27 +10709,7 @@ impl<'a> Lower<'a> {
             if uav {
                 self.s.flags |= flags::TYPED_UAV_LOADS;
             }
-            let h = self.handle(site, src, false, (10 | u, TYPED_F32_PROPS))?;
-            let index = index.unwrap_or(self.s.m.i32(0));
-            let xs = if let Some((integer, _)) = self.integer_view(h) {
-                let integer_h = self.handle(site, src, false, (10 | u, TYPED_I32_PROPS))?;
-                self.typed_buffer_load(h, integer_h, index, integer, count)
-            } else {
-                let r = self.s.op(
-                    self.cur,
-                    "bufferLoad.f32",
-                    Attr::ReadOnly,
-                    self.s.t.res_ret,
-                    68,
-                    &[h, index, iu],
-                );
-                (0..count)
-                    .map(|ch| {
-                        let x = self.s.m.extract(self.cur, r, ch);
-                        self.as_int(x)
-                    })
-                    .collect()
-            };
+            let xs = self.typed_buffer_load_32(site, src, u, index, count, halves)?;
             let Some(Operand::Vector { reg, .. }) = *data else {
                 return Err("a buffer result");
             };
@@ -10828,17 +10726,9 @@ impl<'a> Lower<'a> {
             if uav {
                 self.s.flags |= flags::TYPED_UAV_LOADS;
             }
-            let h = self.handle(site, src, false, (10 | u, TYPED_F32_PROPS))?;
-            typed_h = Some(h);
-            let index = index.unwrap_or(self.s.m.i32(0));
-            self.s.op(
-                c,
-                "bufferLoad.f32",
-                Attr::ReadOnly,
-                self.s.t.res_ret,
-                68,
-                &[h, index, iu],
-            )
+            let (r, h) = self.typed_buffer_load_d16(site, src, u, index, halves)?;
+            typed_h = h;
+            r
         } else {
             let mask = self.s.m.i8((1u8 << count) - 1);
             let align = self.s.m.i32(4);
@@ -10861,38 +10751,7 @@ impl<'a> Lower<'a> {
             return Err("a buffer result");
         };
         if d16 {
-            // Two 16-bit channels per VGPR (an odd last high half 0): f16 for
-            // float and normalized formats; for integer formats (the view's
-            // kind, from the view-stride table) the integer's low 16 bits.
-            // Unlike the 32-bit accesses above, `_d16` keeps the established
-            // widened-float path for narrow formats: an integer view is read
-            // and written through the float-typed handle, so its channels' bits
-            // travel as the driver passes a mismatched component type
-            // (unchanged on the RX 6700 XT and WARP, `stride_tests`).
-            let integer = typed_h.and_then(|h| self.integer_view(h));
-            let c = self.cur;
-            let k16 = self.s.m.i32(16);
-            for k in 0..count.div_ceil(2) {
-                let mut x = None;
-                for ch in (2 * k..(2 * k + 2).min(count)).rev() {
-                    let f = self.s.m.extract(c, r, ch);
-                    let mut h = self.f32_to_f16(c, f);
-                    if let Some((int, _)) = integer {
-                        let bits = self.as_int(f);
-                        let low = self.s.m.i32(0xFFFF);
-                        let low = self.s.m.bin(c, Bin::And, bits, low);
-                        h = self.s.m.select(c, int, low, h);
-                    }
-                    x = Some(match x {
-                        Some(hi) => {
-                            let hi = self.s.m.bin(c, Bin::Shl, hi, k16);
-                            self.s.m.bin(c, Bin::Or, h, hi)
-                        }
-                        None => h,
-                    });
-                }
-                self.write(inst, Reg::V(reg + k as u8), x.expect("a channel"), guard);
-            }
+            self.write_d16_channels(inst, reg, r, count, halves, typed_h, guard);
             return Ok(());
         }
         for k in 0..count {

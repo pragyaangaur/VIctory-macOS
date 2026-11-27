@@ -20,6 +20,7 @@ pub mod fidelityfx;
 #[cfg(windows)]
 pub mod files;
 pub mod gameinput;
+pub mod gameinput_script;
 pub mod kernel;
 #[cfg(windows)]
 pub mod lifecycle;
@@ -79,6 +80,8 @@ pub(crate) fn all() -> Vec<HleModule> {
     all.push(rpcrt4::module());
     #[cfg(windows)]
     all.push(xmem::module());
+    #[cfg(windows)]
+    all.push(xmem::virtual_free_module());
     #[cfg(windows)]
     all.push(xsystem::module());
     #[cfg(windows)]

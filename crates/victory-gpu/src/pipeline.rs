@@ -22,6 +22,8 @@ use std::mem::offset_of;
 #[cfg(windows)]
 use std::sync::OnceLock;
 use std::sync::{Arc, Mutex};
+#[cfg(windows)]
+use victory_shader::emit::{metal_mesh_output_bytes, over_limit_mesh_output_bytes};
 
 use crate::object::{self, E_INVALIDARG, HRESULT, Iid, Object, PIPELINE, Table, This, guid};
 use crate::resource::PAGEABLE_IIDS;
@@ -216,10 +218,7 @@ impl Shader {
                     let keep = link_mesh_outputs() && done.0.as_ref().is_ok_and(|t| {
                         self.stage == "pixel"
                             || (self.stage == "mesh"
-                                && victory_shader::emit::mesh_outputs(&t.host.dxil)
-                                    .is_some_and(|o| {
-                                        o.bytes() > victory_shader::emit::METAL_MESH_OUTPUT_BYTES
-                                    }))
+                                && over_limit_mesh_output_bytes(&t.host.dxil).is_some())
                     });
                     if !keep {
                         *container = Vec::new();
@@ -419,7 +418,7 @@ pub(crate) fn translate_linked(
         options,
     ) {
         Ok((ms_host, ps_host)) => {
-            let ms_bytes = victory_shader::emit::mesh_outputs(&ms_host.dxil).map(|o| o.bytes());
+            let ms_bytes = metal_mesh_output_bytes(&ms_host.dxil);
             let ms_used = ms.translated()?.used.clone();
             let mesh = ms.with_translation(Translated {
                 host: ms_host,
@@ -436,7 +435,7 @@ pub(crate) fn translate_linked(
                 mesh = %ms.hash,
                 pixel = ps.map_or("none", |p| p.hash.as_str()),
                 bytes = ms_bytes,
-                "mesh and pixel linked under 32 KiB output budget"
+                "mesh and pixel outputs linked"
             );
             Some(LinkedPair { mesh, pixel })
         }
@@ -845,6 +844,9 @@ pub(crate) mod host;
 mod library;
 #[cfg(windows)]
 mod make;
+// Also built for tests, which run where `host` cannot.
+#[cfg(any(windows, test))]
+mod schedule;
 #[cfg(all(test, windows, feature = "diagnostics"))]
 mod placed_uav_tests;
 
@@ -930,7 +932,7 @@ impl Prebuild {
         // thousands of them would bury the pre-build's own report.
         let quiet = tracing::Dispatch::none();
         let made = tracing::dispatcher::with_default(&quiet, || {
-            host::HostPipeline::new(&self.shaders, self.graphics.as_deref())
+            host::HostPipeline::new(&self.shaders, self.graphics.as_deref(), |_, _| {})
         });
         #[cfg(feature = "diagnostics")]
         make::log_built(&key);

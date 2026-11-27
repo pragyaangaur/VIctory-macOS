@@ -242,6 +242,75 @@ pub(crate) fn pc_format(format: u32) -> u32 {
     }
 }
 
+/// R8G8B8A8_UNORM, which stands in for a packed 16-bit render target the
+/// host cannot make (see [`target_format`]).
+const RGBA8_UNORM: u32 = 28;
+
+/// The console's packed 16-bit colour formats a title renders to:
+/// B5G5R5A1_UNORM (86) and B4G4R4A4_UNORM (115).
+const PACKED_16: [u32; 2] = [86, 115];
+
+/// Whether the host GPU lacks render-target or typed unordered-access
+/// support for `format` (asked once per format). NVIDIA has neither for
+/// B4G4R4A4 and no typed UAV for B5G5R5A1, which Grand Theft Auto VI's
+/// 2560x1440 UI targets need; AMD has both.
+#[cfg(windows)]
+fn host_lacks_target(format: u32) -> bool {
+    use std::sync::OnceLock;
+    use windows::Win32::Graphics::Direct3D12::*;
+    use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT;
+    static LACKS: [OnceLock<bool>; 2] = [OnceLock::new(), OnceLock::new()];
+    let Some(i) = PACKED_16.iter().position(|&f| f == format) else {
+        return false;
+    };
+    *LACKS[i].get_or_init(|| {
+        let Some(host) = crate::host::host() else {
+            return false;
+        };
+        let mut support = D3D12_FEATURE_DATA_FORMAT_SUPPORT {
+            Format: DXGI_FORMAT(format as i32),
+            ..Default::default()
+        };
+        // SAFETY: the structure the feature names, ours.
+        let asked = unsafe {
+            host.device.CheckFeatureSupport(
+                D3D12_FEATURE_FORMAT_SUPPORT,
+                (&raw mut support).cast(),
+                size_of::<D3D12_FEATURE_DATA_FORMAT_SUPPORT>() as u32,
+            )
+        };
+        let needed = D3D12_FORMAT_SUPPORT1_RENDER_TARGET.0
+            | D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW.0;
+        let lacks = asked.is_err() || support.Support1.0 & needed != needed;
+        if lacks {
+            tracing::info!(
+                format,
+                "packed 16-bit render targets are R8G8B8A8_UNORM on this GPU"
+            );
+        }
+        lacks
+    })
+}
+
+#[cfg(not(windows))]
+fn host_lacks_target(_: u32) -> bool {
+    false
+}
+
+/// The format a render target or unordered-access texture of `format` is
+/// made in on the host, and that render target views and pipelines name:
+/// R8G8B8A8_UNORM for a packed 16-bit format the GPU cannot render to or
+/// write typed (each channel keeps its value, with more precision); else
+/// the format as the host has it. Textures only sampled keep theirs.
+pub(crate) fn target_format(format: u32) -> u32 {
+    let format = pc_format(format);
+    if PACKED_16.contains(&format) && host_lacks_target(format) {
+        RGBA8_UNORM
+    } else {
+        format
+    }
+}
+
 /// The typeless format of a format's family (itself if it has none).
 pub(crate) fn family(format: u32) -> u32 {
     const FAMILIES: [(u32, u32); 22] = [
@@ -344,11 +413,16 @@ impl PlacedFootprint {
     }
 
     /// The bytes it spans in a buffer: every row pitched but the last.
+    /// `None` when the dimensions overflow u64.
     pub(crate) fn bytes(&self) -> Option<u64> {
         let (element, block) = element(self.format)?;
-        let lines = u64::from(self.height).div_ceil(block) * u64::from(self.depth);
-        let last = u64::from(self.width).div_ceil(block) * element;
-        Some(u64::from(self.row_pitch) * lines.saturating_sub(1) + last)
+        let lines = u64::from(self.height)
+            .div_ceil(block)
+            .checked_mul(u64::from(self.depth))?;
+        let last = u64::from(self.width).div_ceil(block).checked_mul(element)?;
+        u64::from(self.row_pitch)
+            .checked_mul(lines.saturating_sub(1))?
+            .checked_add(last)
     }
 
     /// The byte ranges (from the footprint's start) that a `size` texel
@@ -415,23 +489,27 @@ fn subresource(desc: &ResourceDesc, index: u32) -> Option<(PlacedFootprint, u32,
         _ => return None,
     };
     let (element, block) = element(format)?;
-    let width = (desc.width >> mip).max(1).next_multiple_of(block);
-    let height = (u64::from(desc.height) >> mip)
+    // Checked: extreme dimensions and mip indices must not wrap or panic,
+    // they give the same unknown-size values as an unreadable description.
+    let width = (desc.width.checked_shr(mip)?)
         .max(1)
-        .next_multiple_of(block);
+        .checked_next_multiple_of(block)?;
+    let height = (u64::from(desc.height).checked_shr(mip)?)
+        .max(1)
+        .checked_next_multiple_of(block)?;
     let depth = if desc.dimension == TEXTURE_3D {
-        (u32::from(desc.depth_or_array_size) >> mip).max(1)
+        u32::from(desc.depth_or_array_size).checked_shr(mip)?.max(1)
     } else {
         1
     };
-    let row_size = width / block * element;
+    let row_size = (width / block).checked_mul(element)?;
     let footprint = PlacedFootprint {
         offset: 0,
         format,
         width: u32::try_from(width).ok()?,
         height: u32::try_from(height).ok()?,
         depth,
-        row_pitch: u32::try_from(row_size.next_multiple_of(pitch_alignment)).ok()?,
+        row_pitch: u32::try_from(row_size.checked_next_multiple_of(pitch_alignment)?).ok()?,
     };
     Some((footprint, u32::try_from(height / block).ok()?, row_size))
 }
@@ -456,14 +534,30 @@ pub(crate) extern "system" fn copyable_footprints(
     let mut end = base;
     let mut known = desc.is_some();
     for i in 0..count {
-        let one = desc.and_then(|d| subresource(d, first + i));
+        let one =
+            desc.and_then(|d| first.checked_add(i).and_then(|index| subresource(d, index)));
         let (layout, row_count, row_size) = match one {
             Some((mut footprint, row_count, row_size)) => {
-                footprint.offset = end.next_multiple_of(PLACEMENT);
-                let pitch = u64::from(footprint.row_pitch);
-                let lines = u64::from(row_count) * u64::from(footprint.depth);
-                end = footprint.offset + pitch * lines.saturating_sub(1) + row_size;
-                (footprint, row_count, row_size)
+                // Checked: extreme dimensions must not wrap or panic, they
+                // give the same unknown-size values as an unreadable one.
+                let placed = end.checked_next_multiple_of(PLACEMENT).and_then(|offset| {
+                    let lines = u64::from(row_count).checked_mul(u64::from(footprint.depth))?;
+                    let span = u64::from(footprint.row_pitch)
+                        .checked_mul(lines.saturating_sub(1))?
+                        .checked_add(row_size)?;
+                    Some((offset, offset.checked_add(span)?))
+                });
+                match placed {
+                    Some((offset, next)) => {
+                        footprint.offset = offset;
+                        end = next;
+                        (footprint, row_count, row_size)
+                    }
+                    None => {
+                        known = false;
+                        (NO_FOOTPRINT, u32::MAX, u64::MAX)
+                    }
+                }
             }
             None => {
                 known = false;
@@ -488,8 +582,9 @@ pub(crate) extern "system" fn copyable_footprints(
         tracing::warn!(?desc, "no footprint for this resource");
     }
     if !total.is_null() {
+        let size = if known { end.checked_sub(base) } else { None };
         // SAFETY: checked non-null.
-        unsafe { total.write(if known { end - base } else { u64::MAX }) };
+        unsafe { total.write(size.unwrap_or(u64::MAX)) };
     }
 }
 
@@ -1176,7 +1271,12 @@ fn host_desc(desc: &ResourceDesc) -> Option<ResourceDesc> {
     if d.flags & DEPTH != 0 {
         d.flags &= !UNORDERED;
     }
-    d.format = pc_format(d.format);
+    const RENDER_TARGET: u32 = 1;
+    d.format = if d.flags & (RENDER_TARGET | UNORDERED) != 0 {
+        target_format(d.format)
+    } else {
+        pc_format(d.format)
+    };
     const DENY_SHADER_RESOURCE: u32 = 8;
     if d.flags & DENY_SHADER_RESOURCE == 0
         && let Some(&(_, typeless)) = DEPTH_FORMATS.iter().find(|&&(f, _)| f == d.format)
@@ -1370,7 +1470,13 @@ fn make_texture(d: &ResourceDesc, state: u32, clear: *const c_void) -> Option<Ho
     let clear_value = (!clear.is_null()).then(|| {
         // SAFETY: the title passes a whole clear value.
         let mut value = unsafe { clear.cast::<[u32; 5]>().read_unaligned() };
-        value[0] = pc_format(value[0]);
+        // The host's flag for a render target (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET).
+        const RENDER_TARGET: u32 = 1;
+        value[0] = if d.flags & (RENDER_TARGET | UNORDERED) != 0 {
+            target_format(value[0])
+        } else {
+            pc_format(value[0])
+        };
         value
     });
     let clear_value = clear_value.as_ref().map(|v| std::ptr::from_ref(v).cast::<D3D12_CLEAR_VALUE>());
@@ -1691,7 +1797,11 @@ pub(crate) fn evict_unused() {
         let used = used - crate::placement::free_bytes() as f64 / 1e6;
         if used > BUDGET_HIGH * budget { ((used - BUDGET_LOW * budget) * 1e6) as u64 } else { 0 }
     });
-    evict(frame, now_ms(), over.max(ram_over()));
+    let ram = ram_over();
+    evict(frame, now_ms(), over.max(ram));
+    // Host copies of title memory take the same memory and textures give
+    // back only part of it: the idle ones go too.
+    crate::shadow::release_idle(frame, ram);
 }
 
 /// Where the card's memory is the computer's own (unified: Apple silicon
@@ -1723,19 +1833,77 @@ fn ram_over() -> u64 {
     if unsafe { GlobalMemoryStatusEx(&mut m) } == 0 {
         return 0;
     }
-    ram_excess(m.ullAvailPhys, m.ullTotalPhys)
+    ram_excess(m.ullAvailPhys, m.ullTotalPhys, ram_marks())
 }
 
 /// With `available` of `total` bytes free: what to give up so that
-/// [`RAM_FREE`] is, once less than [`RAM_LOW`] is.
+/// `marks.free` of the memory is, once less than `marks.low` is.
 #[cfg(windows)]
-fn ram_excess(available: u64, total: u64) -> u64 {
+fn ram_excess(available: u64, total: u64, marks: RamMarks) -> u64 {
     let total = total as f64;
-    if (available as f64) < RAM_LOW * total {
-        (RAM_FREE * total) as u64 - available
+    if (available as f64) < marks.low * total {
+        ((marks.free * total) as u64).saturating_sub(available)
     } else {
         0
     }
+}
+
+/// The shares of the computer's memory that [`ram_excess`] works to:
+/// below `low` free it gives up, until `free` would be.
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct RamMarks {
+    low: f64,
+    free: f64,
+}
+
+/// The largest share `VICTORY_RAM_LOW` or `VICTORY_RAM_FREE` may name:
+/// above it there would be no room for the title itself.
+#[cfg(windows)]
+const RAM_MARK_MOST: f64 = 0.5;
+
+/// [`RAM_LOW`] and [`RAM_FREE`], or what `VICTORY_RAM_LOW` and
+/// `VICTORY_RAM_FREE` put in their place, read once and logged when they
+/// differ. A tenth is late on a Mac whose memory the title fills: with
+/// 24 GB, macOS was compressing and decompressing about 800 MB a second
+/// in the world while 14 % still counted as free, so nothing was given up
+/// (#454).
+#[cfg(windows)]
+fn ram_marks() -> RamMarks {
+    static MARKS: std::sync::OnceLock<RamMarks> = std::sync::OnceLock::new();
+    *MARKS.get_or_init(|| {
+        let var = |name: &str| std::env::var(name).ok();
+        let marks = ram_marks_from(
+            var("VICTORY_RAM_LOW").as_deref(),
+            var("VICTORY_RAM_FREE").as_deref(),
+        );
+        if marks != ram_marks_from(None, None) {
+            tracing::info!(
+                low = marks.low,
+                free = marks.free,
+                "host textures are given up below `low` of the computer's memory free, until `free` is"
+            );
+        }
+        marks
+    })
+}
+
+/// The marks for the values of `VICTORY_RAM_LOW` and `VICTORY_RAM_FREE`,
+/// each a share of the computer's memory from 0 to [`RAM_MARK_MOST`]. A
+/// value that is not one is left out. `free` without a value of its own
+/// keeps its default distance above `low`, and is never under `low`.
+#[cfg(windows)]
+fn ram_marks_from(low: Option<&str>, free: Option<&str>) -> RamMarks {
+    let share = |value: Option<&str>| {
+        value
+            .and_then(|v| v.trim().parse::<f64>().ok())
+            .filter(|v| (0.0..=RAM_MARK_MOST).contains(v))
+    };
+    let low = share(low).unwrap_or(RAM_LOW);
+    let free = share(free)
+        .unwrap_or((low + (RAM_FREE - RAM_LOW)).min(RAM_MARK_MOST))
+        .max(low);
+    RamMarks { low, free }
 }
 
 /// Whether the host card's memory is the computer's own, logged once: its
@@ -2002,6 +2170,25 @@ fn hand_out_resource(
 static TEXTURES_AT: std::sync::Mutex<std::collections::BTreeMap<u64, Vec<usize>>> =
     std::sync::Mutex::new(std::collections::BTreeMap::new());
 
+/// A live reference to a title resource, taken under the lookup table's lock
+/// so the title cannot free it while the caller uses it.
+#[cfg(windows)]
+pub(crate) struct Held(This);
+
+#[cfg(windows)]
+impl Held {
+    pub(crate) fn get(&self) -> This {
+        self.0
+    }
+}
+
+#[cfg(windows)]
+impl Drop for Held {
+    fn drop(&mut self) {
+        crate::object::release_ref(self.0);
+    }
+}
+
 /// For a texture made for a placed view (`texture_at`): a title texture
 /// the GPU writes (render target, depth or unordered access) at the same
 /// memory, in the same layout and with the same bytes per row and rows
@@ -2011,7 +2198,7 @@ static TEXTURES_AT: std::sync::Mutex<std::collections::BTreeMap<u64, Vec<usize>>
 /// shortcut: same start only; overlapping ranges, other mips or slices of
 /// one memory, and views of buffers are not matched.
 #[cfg(windows)]
-pub(crate) fn alias_source(placed: This) -> Option<This> {
+pub(crate) fn alias_source(placed: This) -> Option<Held> {
     const WRITTEN: u32 = 0x7; // render target, depth, unordered access
     // A shader view of no resource (a null view) has no memory.
     if placed.is_null() {
@@ -2035,11 +2222,17 @@ pub(crate) fn alias_source(placed: This) -> Option<This> {
         .peekable();
     written.peek()?;
     let want = bytes(&b.desc)?;
-    written.find(|&r| {
-        let a = resource(r);
-        bytes(&a.desc) == Some(want)
-            && matches!((made(a), made(b)), (Some(x), Some(y)) if !std::sync::Arc::ptr_eq(&x, &y))
-    })
+    // Take a reference under `TEXTURES_AT`'s lock: `Resource::drop` removes
+    // itself under the same lock before freeing the `Resource`, so `try_add_ref`
+    // succeeds only while live and keeps it alive until `Held` drops.
+    written
+        .find(|&r| {
+            let a = resource(r);
+            bytes(&a.desc) == Some(want)
+                && matches!((made(a), made(b)), (Some(x), Some(y)) if !std::sync::Arc::ptr_eq(&x, &y))
+                && crate::object::try_add_ref(r)
+        })
+        .map(Held)
 }
 
 #[cfg(windows)]
@@ -2515,14 +2708,103 @@ pub(crate) fn test_buffer(width: u64) -> This {
     out
 }
 
+#[cfg(all(test, windows))]
+pub(crate) fn test_texture_2d(width: u32, height: u32, format: u32, flags: u32) -> This {
+    let heap = HeapProperties {
+        kind: 1,
+        cpu_pages: 0,
+        pool: 0,
+        creation_nodes: 0,
+        visible_nodes: 0,
+    };
+    let desc = ResourceDesc {
+        dimension: 3, // D3D12_RESOURCE_DIMENSION_TEXTURE2D
+        alignment: 0,
+        width: u64::from(width),
+        height,
+        depth_or_array_size: 1,
+        mip_levels: 1,
+        format,
+        sample_count: 1,
+        sample_quality: 0,
+        layout: 0,
+        flags,
+    };
+    let mut out = std::ptr::null();
+    let hr = create_committed(
+        std::ptr::null(),
+        &heap,
+        0,
+        &desc,
+        0,
+        std::ptr::null(),
+        &RESOURCE_IIDS[0],
+        &mut out,
+    );
+    assert_eq!(hr, S_OK);
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(windows)]
+    use crate::backend::HostGpu;
 
     #[cfg(windows)]
     #[test]
     fn a_null_view_has_no_alias_source() {
-        assert_eq!(alias_source(std::ptr::null()), None);
+        assert!(alias_source(std::ptr::null()).is_none());
+    }
+
+    /// An alias source returned by [`alias_source`] holds a reference so the
+    /// title releasing its texture cannot free it before the caller copies
+    /// from it, and dropping the handle releases it cleanly.
+    #[cfg(windows)]
+    #[test]
+    fn an_alias_source_is_held_after_the_title_releases_it() {
+        if crate::host::host().is_none() {
+            return; // no host GPU here
+        }
+        let null = std::ptr::null();
+        let h = heap(1 << 20);
+        let place = |desc: &ResourceDesc| {
+            let mut out = null;
+            assert_eq!(create_placed(null, h, 0, desc, 0, null.cast(), &RESOURCE_IIDS[0], &mut out), S_OK);
+            out
+        };
+        // Uncompressed 16x16 R32G32B32A32_UINT UAV (format 3, 16 bytes/texel)
+        // and block-compressed 64x64 BC7_UNORM SRV (format 98, 16 bytes/4x4
+        // block) at the same address share row_bytes/rows/swizzle but have
+        // distinct host textures, so `view` resolves `source` as its alias.
+        let source = place(&ResourceDesc { flags: UNORDERED, ..texture(16, 16, 3, 1) });
+        let view = place(&texture(64, 64, 98, 1));
+        let source_host = host_copy(source).expect("source host texture");
+        let view_host = host_copy(view).expect("view host texture");
+        assert!(!std::sync::Arc::ptr_eq(&source_host, &view_host), "distinct host copies");
+        drop((source_host, view_host));
+
+        let held = alias_source(view).expect("an alias source");
+        assert_eq!(held.get(), source);
+
+        // The title releases its reference: `held` still keeps `source` alive.
+        assert_eq!(slot::<Release>(source, 0x10)(source), 1);
+        assert!(host_resource(held.get()).is_some(), "source still live while held");
+        let at = resource(source).data() as u64;
+        assert!(
+            TEXTURES_AT.lock().unwrap().get(&at).is_some_and(|list| list.contains(&(source as usize))),
+            "source still registered while held"
+        );
+
+        // Dropping `held` releases the final reference and unregisters `source`.
+        drop(held);
+        assert!(
+            !TEXTURES_AT.lock().unwrap().get(&at).is_some_and(|list| list.contains(&(source as usize))),
+            "source unregistered after handle drops"
+        );
+
+        assert_eq!(slot::<Release>(view, 0x10)(view), 0);
+        assert_eq!(slot::<Release>(h, 0x10)(h), 0);
     }
 
     #[test]
@@ -2726,17 +3008,91 @@ mod tests {
     #[test]
     fn free_memory_below_its_share_gives_up_up_to_the_higher_share() {
         let gb = 1u64 << 30;
-        assert_eq!(ram_excess(4 * gb, 16 * gb), 0);
+        let marks = ram_marks_from(None, None);
+        assert_eq!(ram_excess(4 * gb, 16 * gb, marks), 0);
         assert_eq!(
-            ram_excess(16 * gb / 10 + 1, 16 * gb),
+            ram_excess(16 * gb / 10 + 1, 16 * gb, marks),
             0,
             "just above the line"
         );
         assert_eq!(
-            ram_excess(gb, 16 * gb),
+            ram_excess(gb, 16 * gb, marks),
             (0.15 * (16 * gb) as f64) as u64 - gb
         );
-        assert_eq!(ram_excess(0, 8 * gb), (0.15 * (8 * gb) as f64) as u64);
+        assert_eq!(
+            ram_excess(0, 8 * gb, marks),
+            (0.15 * (8 * gb) as f64) as u64
+        );
+    }
+
+    /// `VICTORY_RAM_LOW` and `VICTORY_RAM_FREE` move the two shares, and
+    /// with them where giving up starts and how far it goes.
+    #[cfg(windows)]
+    #[test]
+    fn the_memory_marks_can_be_set() {
+        let gb = 1u64 << 30;
+        let marks = ram_marks_from(Some("0.20"), Some("0.26"));
+        assert_eq!(
+            marks,
+            RamMarks {
+                low: 0.20,
+                free: 0.26
+            }
+        );
+        assert_eq!(
+            ram_excess(5 * gb, 24 * gb, marks),
+            0,
+            "above a fifth of 24 GB"
+        );
+        assert_eq!(
+            ram_excess(4 * gb, 24 * gb, marks),
+            (0.26 * (24 * gb) as f64) as u64 - 4 * gb
+        );
+        assert_eq!(
+            ram_excess(4 * gb, 24 * gb, ram_marks_from(None, None)),
+            0,
+            "the default marks give nothing up there"
+        );
+    }
+
+    /// Unset, the marks are the constants. `free` follows a `low` set
+    /// alone and is never under it, and a value that is no share of the
+    /// memory changes nothing.
+    #[cfg(windows)]
+    #[test]
+    fn the_memory_marks_keep_their_order_and_ignore_bad_values() {
+        let default = RamMarks {
+            low: RAM_LOW,
+            free: RAM_FREE,
+        };
+        assert_eq!(ram_marks_from(None, None), default);
+        let alone = ram_marks_from(Some(" 0.2 "), None);
+        assert_eq!(alone.low, 0.2);
+        assert!((alone.free - 0.25).abs() < 1e-9, "{alone:?}");
+        assert_eq!(
+            ram_marks_from(Some("0.3"), Some("0.2")),
+            RamMarks {
+                low: 0.3,
+                free: 0.3
+            },
+            "free is never under low"
+        );
+        assert_eq!(
+            ram_marks_from(Some("0.5"), None),
+            RamMarks {
+                low: 0.5,
+                free: 0.5
+            },
+            "free stays within the largest share"
+        );
+        for bad in ["", "20", "-0.1", "0.51", "nan", "inf", "a fifth"] {
+            assert_eq!(ram_marks_from(Some(bad), Some(bad)), default, "{bad:?}");
+        }
+        assert_eq!(
+            ram_excess(0, 16 * (1u64 << 30), ram_marks_from(Some("0"), Some("0"))),
+            0,
+            "zero turns giving up for free memory off"
+        );
     }
 
     /// Textures idle for the idle time and frames are given up; past the
@@ -2995,6 +3351,160 @@ mod tests {
         assert_eq!((r[0], s[0]), (16, 128));
         let (_, _, _, t) = footprints(&texture(64, 64, 71, 1), 1, 1);
         assert_eq!(t, u64::MAX, "no second subresource");
+    }
+
+    #[test]
+    fn footprint_bytes_do_not_overflow() {
+        // Ordinary footprints still add up: 100x60 RGBA8, 512-byte pitch.
+        assert_eq!(
+            PlacedFootprint::new(0, 28, 100, 60, 512).bytes(),
+            Some(512 * 59 + 400)
+        );
+        // Extreme type-valid dimensions overflow u64: `None`, no panic.
+        let huge = PlacedFootprint {
+            offset: 0,
+            format: 28,
+            width: u32::MAX,
+            height: u32::MAX,
+            depth: u32::MAX,
+            row_pitch: u32::MAX,
+        };
+        assert_eq!(huge.bytes(), None);
+    }
+
+    #[test]
+    fn copyable_footprints_do_not_overflow() {
+        let null = std::ptr::null();
+        const POISON: PlacedFootprint = PlacedFootprint {
+            offset: 0xDEAD_BEEF,
+            format: 0xDEAD_BEEF,
+            width: 0xDEAD_BEEF,
+            height: 0xDEAD_BEEF,
+            depth: 0xDEAD_BEEF,
+            row_pitch: 0xDEAD_BEEF,
+        };
+        let footprints = |desc: &ResourceDesc, base: u64| {
+            let mut layouts = [POISON; 1];
+            let (mut rows, mut sizes, mut total) = ([123; 1], [456; 1], 789);
+            copyable_footprints(
+                null,
+                desc,
+                0,
+                1,
+                base,
+                layouts.as_mut_ptr(),
+                rows.as_mut_ptr(),
+                sizes.as_mut_ptr(),
+                &mut total,
+            );
+            (layouts[0], rows[0], sizes[0], total)
+        };
+        // RGBA8 3D texture with extreme type-valid dimensions: the pitched
+        // rows alone exceed u64, so the unknown-size values come back.
+        let desc = ResourceDesc {
+            dimension: TEXTURE_3D,
+            depth_or_array_size: u16::MAX,
+            ..texture(1 << 28, u32::MAX, 28, 1)
+        };
+        assert_eq!(
+            footprints(&desc, 0),
+            (NO_FOOTPRINT, u32::MAX, u64::MAX, u64::MAX)
+        );
+        // A base near u64::MAX: 512-byte alignment overflows (it must not
+        // wrap the offset to 0) and an aligned offset plus the span does too.
+        let small = texture(4, 4, 28, 1);
+        for base in [u64::MAX, u64::MAX - 512, u64::MAX - 511] {
+            assert_eq!(
+                footprints(&small, base),
+                (NO_FOOTPRINT, u32::MAX, u64::MAX, u64::MAX),
+                "base {base}"
+            );
+        }
+    }
+
+    #[test]
+    fn copyable_footprints_survive_extreme_subresources() {
+        let null = std::ptr::null();
+        // Poisoned outputs: every slot must be written, so seed them with
+        // values no result can be confused with.
+        const POISON: PlacedFootprint = PlacedFootprint {
+            offset: 0xDEAD_BEEF,
+            format: 0xDEAD_BEEF,
+            width: 0xDEAD_BEEF,
+            height: 0xDEAD_BEEF,
+            depth: 0xDEAD_BEEF,
+            row_pitch: 0xDEAD_BEEF,
+        };
+        let run = |desc: &ResourceDesc, first: u32, count: u32| {
+            let mut layouts = [POISON; 2];
+            let mut rows = [0xAAAA_AAAA; 2];
+            let mut sizes = [0xAAAA_AAAA_AAAA_AAAA; 2];
+            let mut total = 0xAAAA_AAAA_AAAA_AAAA;
+            copyable_footprints(
+                null,
+                desc,
+                first,
+                count,
+                0,
+                layouts.as_mut_ptr(),
+                rows.as_mut_ptr(),
+                sizes.as_mut_ptr(),
+                &mut total,
+            );
+            (layouts, rows, sizes, total)
+        };
+        let sentinel = (NO_FOOTPRINT, u32::MAX, u64::MAX, u64::MAX);
+        // BC1 with width u64::MAX: the block alignment overflows u64.
+        let (l, r, s, t) = run(&texture(u64::MAX, 1, 71, 1), 0, 1);
+        assert_eq!((l[0], r[0], s[0], t), sentinel);
+        // RGBA8 with width 1 << 62: the row size (width * 4) overflows u64.
+        let (l, r, s, t) = run(&texture(1 << 62, 1, 28, 1), 0, 1);
+        assert_eq!((l[0], r[0], s[0], t), sentinel);
+        // A mip index too big to shift the width by (64)...
+        let (l, r, s, t) = run(&texture(64, 64, 28, 65), 64, 1);
+        assert_eq!((l[0], r[0], s[0], t), sentinel);
+        // ...or a 3D depth by (32).
+        let depth3d = ResourceDesc {
+            dimension: TEXTURE_3D,
+            depth_or_array_size: 8,
+            ..texture(64, 64, 28, 33)
+        };
+        let (l, r, s, t) = run(&depth3d, 32, 1);
+        assert_eq!((l[0], r[0], s[0], t), sentinel);
+        // first = u32::MAX with count = 2: first + 1 overflows u32.
+        let (l, r, s, t) = run(&texture(64, 64, 28, 1), u32::MAX, 2);
+        assert_eq!(
+            (l, r, s, t),
+            ([NO_FOOTPRINT; 2], [u32::MAX; 2], [u64::MAX; 2], u64::MAX)
+        );
+        // Multi-subresource: an overflowing mip followed by a valid one.
+        let array2 =
+            ResourceDesc { depth_or_array_size: 2, ..texture(64, 64, 28, 65) };
+        let (l, r, s, t) = run(&array2, 64, 2);
+        let full = PlacedFootprint {
+            offset: 0,
+            format: 28,
+            width: 64,
+            height: 64,
+            depth: 1,
+            row_pitch: 256,
+        };
+        assert_eq!((l[0], r[0], s[0]), (NO_FOOTPRINT, u32::MAX, u64::MAX));
+        assert_eq!((l[1], r[1], s[1]), (full, 64, 256));
+        assert_eq!(t, u64::MAX);
+        // A valid mip followed by an overflowing one.
+        let (l, r, s, t) = run(&texture(64, 64, 28, 65), 63, 2);
+        let tiny = PlacedFootprint {
+            offset: 0,
+            format: 28,
+            width: 1,
+            height: 1,
+            depth: 1,
+            row_pitch: 256,
+        };
+        assert_eq!((l[0], r[0], s[0]), (tiny, 1, 4));
+        assert_eq!((l[1], r[1], s[1]), (NO_FOOTPRINT, u32::MAX, u64::MAX));
+        assert_eq!(t, u64::MAX);
     }
 
     #[test]

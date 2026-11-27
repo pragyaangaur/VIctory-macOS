@@ -81,7 +81,9 @@ void main(uint lane : SV_GroupIndex) {
         costs[lane] = cost;
         GroupMemoryBarrierWithGroupSync();
         if (lane == 0 && tile * 64 < walked) {
-            for (uint i = 0; i < 64; i++) {
+            // The tile's walked records only: the slots past them cost nothing.
+            uint own = min(64u, walked - tile * 64);
+            for (uint i = 0; i < own; i++) {
                 if (costs[i] > left) {
                     // The first record that does not fit takes what is
                     // left, so those after it run empty too.

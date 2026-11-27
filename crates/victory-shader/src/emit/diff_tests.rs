@@ -1479,6 +1479,16 @@ fn translated_compute_matches_pc() {
             }
             Err(e) => panic!("{name}: {e}"),
         };
+        // A buffer of halves the translated program moves as unsigned
+        // integers is shown to it as its unsigned twin, as the host does
+        // (`HostShader::half_views`); the PC program keeps the float view.
+        let twins: Vec<View> = views
+            .iter()
+            .map(|&v| match v {
+                View::HalfUav(n) if !cs_c.half_views.is_empty() => View::HalfUintUav(n),
+                v => v,
+            })
+            .collect();
         // Our root views follow the user data in root parameter order: the
         // case's own, then the host's view-stride table (16-bit typed
         // accesses read their view's format kind there).
@@ -1488,14 +1498,21 @@ fn translated_compute_matches_pc() {
         root_views.sort_unstable();
         for (n, (slot, srv)) in root_views.into_iter().enumerate() {
             let data = if srv && slot == super::VIEW_STRIDES {
-                super::host::view_strides(&views)
+                super::host::view_strides(&twins)
             } else {
                 assert_eq!(slot, 4 + u8::from(srv), "{name}: root view");
                 if srv { root_srv.clone() } else { root_cbv.clone() }
             };
             roots.push((1 + n as u32, Root::View { srv, data }));
         }
-        let ours = host.dispatch(&root_t, &pso_t, &dispatch(roots));
+        let ours = host.dispatch(
+            &root_t,
+            &pso_t,
+            &Dispatch {
+                views: &twins,
+                ..dispatch(roots)
+            },
+        );
         if name.starts_with("terminates") {
             match ours {
                 Ok(_) => eprintln!("{name}: finished"),
