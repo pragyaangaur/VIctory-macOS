@@ -1906,6 +1906,16 @@ pub(crate) fn evict_heap_uav() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_EVICT_HEAP_UAV").is_some_and(|v| v != "0"))
 }
 
+/// The frame [`evict_unused`] last ran in.
+#[cfg(windows)]
+static EVICTED_IN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
+
+/// Whether [`evict_unused`] would run now (once per presented frame).
+#[cfg(windows)]
+pub(crate) fn evict_due() -> bool {
+    EVICTED_IN.load(std::sync::atomic::Ordering::Relaxed) != crate::queue::presented()
+}
+
 /// Once per presented frame, before a submission (`Host::execute`, one at a
 /// time, the last one has run): gives up host textures fed from title memory
 /// that the title has not used for [`IDLE_MS`], and past [`BUDGET_HIGH`] of
@@ -1913,14 +1923,6 @@ pub(crate) fn evict_heap_uav() -> bool {
 /// Host copies of title memory nothing asked for in as long go too
 /// ([`crate::shadow::release_stale`]).
 #[cfg(windows)]
-/// The frame [`evict_unused`] last ran in.
-static EVICTED_IN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
-
-/// Whether [`evict_unused`] would run now (once per presented frame).
-pub(crate) fn evict_due() -> bool {
-    EVICTED_IN.load(std::sync::atomic::Ordering::Relaxed) != crate::queue::presented()
-}
-
 pub(crate) fn evict_unused() {
     use std::sync::atomic::Ordering::Relaxed;
     let frame = crate::queue::presented();
