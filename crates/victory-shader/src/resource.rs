@@ -12,6 +12,8 @@
 //! memory address is traced through the SSA values back to those
 //! parameters, by data flow: copies, phis that agree, and additions.
 
+mod indexed;
+
 use crate::ShaderError;
 use crate::gfx10::{Fields, NULL, Operand};
 use crate::ir::{EXEC, Exit, Inst, Program, Reg, Value};
@@ -132,13 +134,9 @@ pub struct Resources {
     pub waterfall: Waterfall,
 }
 
-/// Waterfall loops over descriptors that differ between lanes: each pass
-/// reads the first active lane's descriptor with `v_readfirstlane_b32`,
-/// compares it with every lane's own (`v_cmp_eq`), and runs the access with
-/// the lanes that match. Their accesses take each lane's own descriptor
-/// ([`Source::Fetched`], [`Source::Lanes`]), so the first lane's dwords are
-/// each lane's own too: the compares hold in every lane and one pass serves
-/// all lanes.
+/// Equality waterfalls that can serve every participating lane in one pass.
+/// Each lane uses its own descriptor words ([`Source::Fetched`], [`Source::Lanes`])
+/// or integer VGPR index, so the key comparison is true for that lane.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Waterfall {
     /// The compares, true in every lane.
@@ -296,6 +294,9 @@ pub fn track(
             out.waterfall.reads.extend(proof.reads);
             out.waterfall.loads.extend(loads);
         }
+    }
+    if stage == HwStage::Cs && p.wave64 && t.lanes.is_some_and(|st| !st.literal) {
+        t.indexed_waterfalls(&mut out.waterfall)?;
     }
     Ok(out)
 }

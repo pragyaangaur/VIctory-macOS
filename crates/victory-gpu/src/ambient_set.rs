@@ -6,9 +6,9 @@
 // Used by `crate::ambient`, which is only built for Windows.
 #![cfg_attr(not(windows), allow(dead_code))]
 
-/// Whether `VICTORY_AMBIENT`'s value turns the stand-in on: it is set, and
-/// is not empty, `0` or `off`. Off by default on this line. (In Belobug's
-/// fork the variable is the light's level and the stand-in is on unless it
+/// Whether the effective `VICTORY_AMBIENT` value enables a stand-in: it is
+/// set and is not empty, `0` or `off`. (In Belobug's fork the variable is
+/// the light's level and the stand-in is on unless it
 /// says `off`; the level is `VICTORY_AMBIENT_LEVEL` here.)
 pub(crate) fn is_on(value: Option<&str>) -> bool {
     value
@@ -382,7 +382,7 @@ mod tests {
 
     /// Off unless set to something other than nothing, `0` or `off`.
     #[test]
-    fn off_by_default() {
+    fn the_value_selects_whether_a_stand_in_runs() {
         for off in [None, Some(""), Some("  "), Some("0"), Some(" 0 "), Some("off"), Some("OFF")] {
             assert!(!is_on(off), "{off:?}");
         }

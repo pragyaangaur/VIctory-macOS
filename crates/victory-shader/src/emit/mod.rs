@@ -251,7 +251,7 @@ mod crosslane_tests;
 mod diff_tests;
 #[cfg(all(test, windows))]
 mod flow_tests;
-#[cfg(all(test, windows))]
+#[cfg(test)]
 mod halves_tests;
 pub mod heap_sources;
 pub use heap_sources::{BufferBinding, HeapIndexSource, ScalarSource};
@@ -771,24 +771,31 @@ struct Prepared<'a> {
     res: resource::Resources,
 }
 
+/// Index of the first native program the runtime will translate.
+pub fn runtime_program_index(programs: &[NativeProgram]) -> Result<usize, ShaderError> {
+    programs
+        .iter()
+        .position(|p| supports_stage(p.stage))
+        .ok_or(ShaderError::Unsupported {
+            offset: 0,
+            what: "a container without a vertex, pixel, compute or mesh program",
+        })
+}
+
+/// Whether a native stage can be emitted as a standalone host shader.
+pub fn supports_stage(stage: HwStage) -> bool {
+    matches!(stage, HwStage::Vs | HwStage::Ps | HwStage::Cs | HwStage::Ms)
+}
+
 fn prepare(container: &[u8]) -> Result<Prepared<'_>, ShaderError> {
     let c = Container::parse(container)?;
     let dxil = c
         .part(FourCC::DXIL)
         .or(c.part(FourCC::ACCC))
         .ok_or(ShaderError::Malformed("no DXIL part"))?;
-    let native = crate::native_programs(dxil.data)?
-        .into_iter()
-        .find(|p| {
-            matches!(
-                p.stage,
-                HwStage::Vs | HwStage::Ps | HwStage::Cs | HwStage::Ms
-            )
-        })
-        .ok_or(ShaderError::Unsupported {
-            offset: 0,
-            what: "a container without a vertex, pixel, compute or mesh program",
-        })?;
+    let mut programs = crate::native_programs(dxil.data)?;
+    let index = runtime_program_index(&programs)?;
+    let native = programs.swap_remove(index);
     // Structurisation first: tracing per-lane descriptors needs it (its
     // failure is reported after the earlier stages').
     let (p, st) = crate::range::build(&native.patched_code(), native.wave64, native.vgprs)?;
@@ -2586,8 +2593,13 @@ mod tests {
             return;
         }
         let ps = constant_color();
-        let shaped = |v, p, rows: &[&[u8]], pr| -> Result<bool, String> {
+        let under_wine = super::host::under_wine();
+        let shaped = |v, p, rows: &[&[u8]], pr| -> Result<Option<bool>, String> {
             let ms = shaped_mesh(v, p, rows, pr).map_err(|e| e.to_string())?;
+            if under_wine && let Some(bytes) = over_limit_mesh_output_bytes(&ms.dxil) {
+                eprintln!("{bytes} bytes exceeds Metal's output limit; draw skipped under Wine");
+                return Ok(None);
+            }
             let root = host.root_signature_for(&[(&ms, D3D12_SHADER_VISIBILITY_MESH)])?;
             let pso = host.mesh_pipeline_with(&root, &ms.dxil, &ps)?;
             let texels = host.draw(
@@ -2603,13 +2615,13 @@ mod tests {
                     mesh_groups: 1,
                 },
             )?;
-            Ok(texels.iter().all(|t| *t == [1.0, 0.5, 0.25, 1.0]))
+            Ok(Some(texels.len() == 256 && texels.iter().all(|t| *t == [1.0, 0.5, 0.25, 1.0])))
         };
         let draws = |v, p, vr: u32, pr| shaped(v, p, &vec![&[4u8][..]; vr as usize - 1], pr);
         // 17 rows of 59 components: whole rows would be over the limit.
         assert_eq!(
             shaped(128, 128, &HALF_FILLED, 0),
-            Ok(true),
+            Ok(Some(true)),
             "17 rows of 59 components"
         );
         let one_more: Vec<&[u8]> = [&[&[4u8][..]; 15][..], &[&[1]]].concat();
@@ -2625,7 +2637,7 @@ mod tests {
         ] {
             assert_eq!(
                 draws(v, p, vr, pr),
-                Ok(true),
+                Ok(Some(true)),
                 "{v} vertices, {p} primitives, rows {vr} + {pr}"
             );
             eprintln!(
@@ -2697,13 +2709,18 @@ mod tests {
                 Some(bytes),
                 "{rows:?}, reversed {reversed}"
             );
+            assert_eq!(
+                over_limit_mesh_output_bytes(&ms.dxil),
+                (bytes > METAL_MESH_OUTPUT_BYTES).then_some(bytes),
+                "{rows:?}, reversed {reversed}"
+            );
             shaders.push((
                 format!("{front:?} {fours} x 4 {back:?} reversed {reversed}"),
                 ms,
             ));
         }
-        // Where the hardware has mesh shaders: the shapes within the limit
-        // draw; D3DMetal makes no-op pipelines of the others.
+        // The shapes within the limit draw on mesh-capable hardware.
+        // D3DMetal can make no-op pipelines of the others and stall the test.
         #[cfg(windows)]
         {
             use super::host::{Draw, Host, Root};
@@ -2732,7 +2749,14 @@ mod tests {
                 return;
             }
             let ps = constant_color();
+            let under_wine = super::host::under_wine();
             for ((label, ms), (.., bytes)) in shaders.iter().zip(cases) {
+                if under_wine && let Some(bytes) = over_limit_mesh_output_bytes(&ms.dxil) {
+                    eprintln!(
+                        "{label}: {bytes} bytes exceeds Metal's {METAL_MESH_OUTPUT_BYTES}-byte output limit; draw skipped under Wine"
+                    );
+                    continue;
+                }
                 let root = host
                     .root_signature_for(&[(ms, D3D12_SHADER_VISIBILITY_MESH)])
                     .unwrap();
@@ -2753,11 +2777,12 @@ mod tests {
                             },
                         )
                     });
-                let drawn = drawn.map(|t| t.iter().all(|t| *t == [1.0, 0.5, 0.25, 1.0]));
+                let drawn = drawn.map(|t| {
+                    t.len() == 256 && t.iter().all(|t| *t == [1.0, 0.5, 0.25, 1.0])
+                });
+                eprintln!("{label}: {bytes} bytes, drawn {drawn:?}");
                 if bytes <= METAL_MESH_OUTPUT_BYTES {
                     assert_eq!(drawn, Ok(true), "{label}: {bytes} bytes");
-                } else {
-                    eprintln!("{label}: {bytes} bytes, drawn {drawn:?}");
                 }
             }
         }
@@ -4000,12 +4025,22 @@ mod tests {
     /// WARP) with the expected texels.
     #[test]
     fn linked_mesh_moves_clip_distances_out_of_the_way_of_vectors() {
-        // TEXCOORD0..12 four channels, 13 two, 14 one: rows 2 to 16.
-        let cols = |k: u32| match k {
-            0..=12 => 4u8,
-            13 => 2,
-            _ => 1,
-        };
+        check_linked_clip_layout([4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 2, 1], true);
+    }
+
+    #[test]
+    fn linked_mesh_fills_three_component_alignment_gap() {
+        check_linked_clip_layout([4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 3, 4, 3, 1], true);
+    }
+
+    #[test]
+    fn linked_mesh_refuses_live_bytes_above_the_budget() {
+        check_linked_clip_layout([4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 3, 4, 4, 1], false);
+    }
+
+    fn check_linked_clip_layout(widths: [u8; 15], fits: bool) {
+        let cols = |k: u32| widths[k as usize];
+        let legacy_layout = cols(11) == 4;
         // v6 0.5, v7 1.0, v8 0.25, v10 0.0: x of TEXCOORD0 and TEXCOORD14 add
         // up to 1.0, y of TEXCOORD13 is 0.5, z of TEXCOORD5 0.25, w of
         // TEXCOORD12 1.0.
@@ -4055,8 +4090,23 @@ mod tests {
         for k in 0..15u32 {
             let n = cols(k);
             sig.push(element("TEXCOORD", 0, k, k + 2, n, (1 << n) - 1));
+            let source = if legacy_layout {
+                sources(k)
+            } else {
+                let first = 16 + 4 * k;
+                for ch in 0..u32::from(n) {
+                    // Each varying is NDC x or y plus a distinct exact offset.
+                    let value = (k + 16 * ch + 1) as f32 / 64.0;
+                    let axis = 4 + ((k + ch) % 2);
+                    words.extend([
+                        3 << 25 | (first + ch) << 17 | axis << 9 | 0xFF,
+                        value.to_bits(),
+                    ]);
+                }
+                (0..4).fold(0, |regs, ch| regs | (first + ch) << (8 * ch))
+            };
             // exp param<k> (the channels of the element)
-            words.extend([0xF800_0000 | ((1 << n) - 1) | ((32 + k) << 4), sources(k)]);
+            words.extend([0xF800_0000 | ((1 << n) - 1) | ((32 + k) << 4), source]);
             outputs.push(crate::native::VsOutput {
                 usage: crate::native::Usage::Generic,
                 row: k as u8 + 2,
@@ -4071,13 +4121,13 @@ mod tests {
             0xF800_00CF, // exp pos0 v4, v5, v6, v7
             0x0706_0504,
             0xF800_08D1, // exp pos1 v2 (clip distance 0.0 or 1.0: kept) done
-            0x0202_0202,
+            if legacy_layout { 0x0202_0202 } else { 0x0404_0404 },
             0xBF81_0000, // s_endpgm
         ]);
         let ms_native = NativeProgram {
             stage: HwStage::Ms,
             wave64: false,
-            vgprs: 12,
+            vgprs: if legacy_layout { 12 } else { 76 },
             layout: vec![],
             used: vec![],
             io: StageIo::Ms(crate::native::MeshIo {
@@ -4139,7 +4189,12 @@ mod tests {
             },
             code: ps_words.iter().flat_map(|w| w.to_le_bytes()).collect(),
         };
-        let ps_isg1 = container::signature(&sig, true);
+        let pixel_sig: Vec<_> = sig
+            .iter()
+            .filter(|e| legacy_layout || e.kind != 6)
+            .cloned()
+            .collect();
+        let ps_isg1 = container::signature(&pixel_sig, true);
         let ps_osg1 = rows(&[("SV_Target", 16, false)], false);
         let ps_bytes = crate::dxbc::build(&[(FourCC::ISG1, &ps_isg1), (FourCC::OSG1, &ps_osg1)]);
         let pc = Container::parse(&ps_bytes).unwrap();
@@ -4178,13 +4233,64 @@ mod tests {
                 res: &mres,
             };
             let standalone = emit_pruned(&ms_in, Options::default(), None).unwrap();
-            assert_eq!(mesh_bytes(&standalone.dxil), Some(30_720));
-            assert_eq!(mesh_aligned_bytes(&standalone.dxil), Some(refused));
-            let (linked_ms, linked_ps) =
-                link_prepared(&ms_in, Some(&ps_in), Options::default()).unwrap();
-            assert!(linked_ps.is_some());
+            if legacy_layout {
+                assert_eq!(mesh_bytes(&standalone.dxil), Some(30_720));
+                assert_eq!(mesh_aligned_bytes(&standalone.dxil), Some(refused));
+                assert_eq!(over_limit_mesh_output_bytes(&standalone.dxil), Some(refused));
+            }
+            let full_ps = emit_pruned(&ps_in, Options::default(), None).unwrap();
+            let reads = pixel_input_reads(&full_ps.dxil).unwrap();
+            let original = emit_pruned(&ms_in, Options::default(), Some(&reads)).unwrap();
+            let original_aligned = if legacy_layout { 32_768 } else { 33_792 };
+            assert_eq!(mesh_aligned_bytes(&original.dxil), Some(original_aligned));
+            assert_eq!(
+                mesh_bytes(&original.dxil),
+                Some(if fits { 30_720 } else { 31_232 })
+            );
+
+            let linked = link_prepared(&ms_in, Some(&ps_in), Options::default());
+            if !fits {
+                assert!(matches!(
+                    linked,
+                    Err(ShaderError::Unsupported {
+                        what: "mesh outputs required by the next stage exceed 32 KiB",
+                        ..
+                    })
+                ));
+                continue;
+            }
+            let (linked_ms, linked_ps) = linked.unwrap();
+            let linked_ps = linked_ps.unwrap();
             assert_eq!(mesh_bytes(&linked_ms.dxil), Some(30_720));
             assert_eq!(mesh_aligned_bytes(&linked_ms.dxil), Some(32_768));
+            let retained = pixel_input_reads(&linked_ps.dxil).unwrap().reads;
+            assert_eq!(retained.len(), reads.reads.len());
+            for (semantic, &mask) in &reads.reads {
+                let relocated = retained[semantic];
+                assert_eq!(relocated >> relocated.trailing_zeros(), mask);
+            }
+            let linked_container = Container::parse(&linked_ms.dxil).unwrap();
+            let mut linked_outputs =
+                signature(linked_container.part(FourCC::OSG1).unwrap().data).unwrap();
+            linked_outputs.sort_by_key(|e| (e.kind, e.index));
+            for (i, e) in linked_outputs.iter().enumerate() {
+                let (name, index, width) = match e.kind {
+                    0 => ("TEXCOORD", i as u32, widths[i]),
+                    3 => ("SV_Position", 0, 4),
+                    6 => ("SV_ClipDistance", 0, 1),
+                    _ => panic!("unexpected output semantic"),
+                };
+                assert_eq!((e.name.as_str(), e.index, e.cols, e.comp), (name, index, width, 9));
+            }
+            assert_eq!(linked_outputs.len(), 17);
+            if !legacy_layout {
+                let ps = Container::parse(&linked_ps.dxil).unwrap();
+                let ps_inputs = signature(ps.part(FourCC::ISG1).unwrap().data).unwrap();
+                assert!(ps_inputs.iter().all(|e| e.kind != 6));
+                let scalar = ps_inputs.iter().find(|e| e.kind == 0 && e.index == 14).unwrap();
+                assert_eq!(scalar.cols, 1);
+                assert_eq!(scalar.col, linked_outputs[14].col);
+            }
 
             // Written as the constant 1.0, the distance never clips: linked,
             // both stages leave it out (`lower::idle_clip`), and the vertex
@@ -4223,12 +4329,13 @@ mod tests {
                 };
                 assert!(!clip(&ms.dxil, FourCC::OSG1));
                 assert!(!clip(&ps.unwrap().dxil, FourCC::ISG1));
-                assert_eq!(mesh_aligned_bytes(&ms.dxil), Some(30_208));
+                // The two float3s leave one dword of alignment padding.
+                let idle_size = if legacy_layout { 30_208 } else { 30_720 };
+                assert_eq!(mesh_aligned_bytes(&ms.dxil), Some(idle_size));
             }
 
             #[cfg(windows)]
             {
-                let linked_ps = linked_ps.unwrap();
                 if let Ok(mut v) = super::validator::Validator::load(
                     super::validator::Validator::default_path().as_deref(),
                 ) {
@@ -4288,21 +4395,46 @@ mod tests {
                         )
                     };
                     let expected = [1.0, 0.5, 0.25, 1.0];
-                    // D3DMetal draws nothing with the standalone pair.
-                    let full_ps = emit_pruned(&ps_in, Options::default(), None).unwrap();
-                    let standalone_drawn = draw(&standalone, &full_ps)
-                        .map(|t| t.iter().filter(|t| **t == expected).count());
-                    eprintln!(
-                        "{label}, scalar first {scalar_first}: {refused} bytes, \
-                         {standalone_drawn:?} of 256 texels drawn"
-                    );
+                    if legacy_layout {
+                        if super::host::under_wine()
+                            && let Some(bytes) = over_limit_mesh_output_bytes(&standalone.dxil)
+                        {
+                            eprintln!(
+                                "{label}, scalar first {scalar_first}: standalone {bytes} bytes exceeds Metal's output limit; draw skipped under Wine"
+                            );
+                        } else {
+                            let standalone_drawn = draw(&standalone, &full_ps)
+                                .map(|t| t.iter().filter(|t| **t == expected).count());
+                            eprintln!(
+                                "{label}, scalar first {scalar_first}: {refused} bytes, \
+                                 {standalone_drawn:?} of 256 texels drawn"
+                            );
+                        }
+                    }
                     let texels = draw(&linked_ms, &linked_ps)
                         .unwrap_or_else(|e| panic!("{label}: linked mesh draw: {e}"));
-                    assert!(
-                        texels.iter().all(|t| *t == expected),
-                        "{label}, scalar first {scalar_first}: unexpected pixel {:?}",
-                        texels.first()
-                    );
+                    assert_eq!(texels.len(), 256, "{label}, scalar first {scalar_first}");
+                    if legacy_layout {
+                        assert!(
+                            texels.iter().all(|t| *t == expected),
+                            "{label}, scalar first {scalar_first}: unexpected pixel {:?}",
+                            texels.first()
+                        );
+                    } else {
+                        for (i, pixel) in texels.iter().enumerate() {
+                            let (x, y) = (i % 16, i / 16);
+                            let axes = [(x as f32 + 0.5) / 8.0 - 1.0, 1.0 - (y as f32 + 0.5) / 8.0];
+                            let mut expect = [0.0f32; 4];
+                            for (k, &width) in widths.iter().enumerate() {
+                                for (ch, channel) in expect.iter_mut().enumerate().take(width as usize) {
+                                    *channel += axes[(k + ch) % 2] + (k + 16 * ch + 1) as f32 / 64.0;
+                                }
+                            }
+                            let drawn = pixel.iter().zip(expect).all(|(got, want)| (got - want).abs() < 1e-4);
+                            assert_eq!(drawn, x >= 8, "{label}: ({x}, {y}) = {pixel:?}, shader colour {expect:?}");
+                        }
+                    }
+                    eprintln!("{label}, scalar first {scalar_first}: linked pixel oracle passed");
                 }
             }
         }

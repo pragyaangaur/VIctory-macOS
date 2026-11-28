@@ -501,12 +501,9 @@ pub(super) fn index_waterfalls(x: &Parts) -> HashSet<Value> {
         if read.name() != "v_readfirstlane_b32" {
             continue;
         }
-        let (Some(&(_, s)), Some(v)) = (
+        let (Some(&(key @ Reg::S(_), s)), Some(&(index, v))) = (
             read.writes.first(),
-            read.reads
-                .iter()
-                .find(|(r, _)| matches!(r, Reg::V(_)))
-                .map(|r| r.1),
+            read.reads.iter().find(|(r, _)| matches!(r, Reg::V(_))),
         ) else {
             continue;
         };
@@ -534,6 +531,10 @@ pub(super) fn index_waterfalls(x: &Parts) -> HashSet<Value> {
                 .all(|&(_, w)| save.reads.iter().any(|&(_, r)| r == w));
         let drops = drop.name() == "s_xor_b64"
             && drop.writes.iter().any(|w| w.0 == Reg::S(EXEC))
+            && [EXEC, EXEC + 1].into_iter().all(|code| {
+                let reg = Reg::S(code);
+                drop.read(reg).is_some() && drop.read(reg) == save.write(reg)
+            })
             && saved.len() == 2
             && saved
                 .iter()
@@ -543,15 +544,15 @@ pub(super) fn index_waterfalls(x: &Parts) -> HashSet<Value> {
         }
         // The body: `s_mov_b32 m0, s`, and vector operations on each lane's
         // own registers.
-        let mut m0s = Vec::new();
+        let mut m0 = None;
+        let mut access = false;
         let body_ok = insts[3..last - 1].iter().all(|i| {
             let name = i.name();
             if name == "s_mov_b32"
-                && i.writes.iter().all(|w| w.0 == Reg::S(M0))
-                && i.reads.iter().all(|&(_, r)| r == s)
+                && i.reads == [(key, s)]
+                && let [(Reg::S(M0), v)] = i.writes.as_slice()
             {
-                m0s.extend(i.writes.iter().map(|w| w.1));
-                return true;
+                return m0.replace(*v).is_none();
             }
             if matches!(name, "s_nop" | "s_waitcnt") {
                 return true;
@@ -559,18 +560,31 @@ pub(super) fn index_waterfalls(x: &Parts) -> HashSet<Value> {
             let Fields::Valu(f) = &i.fields else {
                 return false;
             };
+            if crate::ir::relative_operands(name) != (false, false) {
+                if !matches!(name, "v_movrels_b32" | "v_movreld_b32")
+                    || m0.is_none()
+                    || i.read(Reg::S(M0)) != m0
+                    || !i.relative_in_file(p.vgprs)
+                {
+                    return false;
+                }
+                access = true;
+            }
             f.dpp.is_none()
                 && f.sdwa.is_none()
-                && i.writes.iter().all(|w| matches!(w.0, Reg::V(_)))
+                && i.writes.iter().all(|w| matches!(w.0, Reg::V(_)) && w.0 != index)
                 && !["lane", "mbcnt", "permlane", "interp", "cmp"]
                     .iter()
                     .any(|n| name.contains(n))
         });
-        let seen_inside = only_in(s, b)
-            && m0s.iter().all(|&m| only_in(m, b))
-            && cmp.writes.iter().all(|w| only_in(w.1, b))
-            && saved.iter().all(|&m| only_in(m, b));
-        if body_ok && !m0s.is_empty() && seen_inside {
+        let seen_inside = insts.iter().enumerate().all(|(at, i)| {
+            i.writes.iter().all(|&(r, v)| {
+                matches!(r, Reg::V(_))
+                    || (at == last - 1 && matches!(r, Reg::S(code) if code == EXEC || code == EXEC + 1))
+                    || only_in(v, b)
+            })
+        });
+        if body_ok && access && seen_inside {
             out.insert(s);
         }
     }

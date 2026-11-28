@@ -68,6 +68,17 @@ use super::*;
 /// Console lanes per host wave in halves.
 const HALF: u32 = 32;
 
+/// Both the lane mapping and any proof relying on its bijection must
+/// reserve room for the ticket counter alongside the half-exchange scratch.
+pub(super) fn uses_lane_tickets(group: u32, wave: u32, lds_dwords: u32, halves: bool) -> bool {
+    let half_dwords = if halves {
+        group.div_ceil(2 * HALF) * 2
+    } else {
+        0
+    };
+    group > wave && super::super::thread_ticket() && lds_dwords + half_dwords < GROUP_SHARED_DWORDS
+}
+
 impl Lower<'_> {
     /// Whether a wave64 program whose lanes follow the console's runs in
     /// halves: the host's waves are 32 lanes at most.
@@ -101,15 +112,7 @@ impl Lower<'_> {
         let i32t = self.s.t.i32;
         let wave = self.s.wave_size.expect("set with console lanes");
         let group: u32 = self.s.threads.map_or(wave, |t| t.iter().product());
-        let half_dwords = if self.halves {
-            group.div_ceil(2 * HALF) * 2
-        } else {
-            0
-        };
-        let use_ticket = group > wave
-            && super::super::thread_ticket()
-            && self.s.lds_dwords + half_dwords < GROUP_SHARED_DWORDS;
-        let f = if use_ticket {
+        let f = if uses_lane_tickets(group, wave, self.s.lds_dwords, self.halves) {
             let arr = self.s.m.array(1, i32t);
             let counter = self.s.m.global("wave_ticket", arr, 3);
             let zero = self.s.m.i32(0);
@@ -684,21 +687,9 @@ const GROUP_SHARED_DWORDS: u32 = 8192;
 /// in the other half, and the value is not known to be the same there.
 pub(super) const FIRST_ACROSS: Why = "a first-lane read of a value that may differ between 32-lane halves (wave64 on a 32-lane host)";
 
-/// Whether `x` (a wave64 compute program) has a non-waterfall
-/// `v_readfirstlane_b32` whose vector source may differ between lanes of the
-/// console wave: such a read needs console-wave lane order (and halves on a
-/// 32-lane host) so both halves see the same first active lane. Not one each
-/// host half can make by itself (`alone`, [`super::first_lane::read_alone`]).
-pub(super) fn needs_first_lane(
-    x: &Parts,
-    alike: &mut Option<HashSet<Value>>,
-    alone: &HashSet<Value>,
-) -> bool {
-    if !x.native.wave64 {
-        return false;
-    }
+fn first_lane_sources<'a>(x: &'a Parts, alone: &'a HashSet<Value>) -> impl Iterator<Item = Value> + 'a {
     let wf = &x.res.waterfall.reads;
-    let is_vec_first = |i: &Inst| -> Option<Value> {
+    let is_vec_first = move |i: &Inst| -> Option<Value> {
         if i.name() != "v_readfirstlane_b32"
             || i.writes
                 .first()
@@ -714,13 +705,28 @@ pub(super) fn needs_first_lane(
             _ => None,
         }
     };
-    let mut srcs = x
+    x
         .p
         .blocks
         .iter()
         .flat_map(|b| &b.insts)
         .filter_map(is_vec_first)
-        .peekable();
+}
+
+/// Whether `x` (a wave64 compute program) has a non-waterfall
+/// `v_readfirstlane_b32` whose vector source may differ between lanes of the
+/// console wave: such a read needs console-wave lane order (and halves on a
+/// 32-lane host) so both halves see the same first active lane. Excludes
+/// reads each host half can make by itself (see [`super::first_lane::read_alone`]).
+pub(super) fn needs_first_lane(
+    x: &Parts,
+    alike: &mut Option<HashSet<Value>>,
+    alone: &HashSet<Value>,
+) -> bool {
+    if !x.native.wave64 {
+        return false;
+    }
+    let mut srcs = first_lane_sources(x, alone).peekable();
     if srcs.peek().is_none() {
         return false;
     }
@@ -1725,6 +1731,167 @@ pub(super) fn lane_uniform(x: &Parts) -> HashSet<Value> {
         same.extend(next);
         same_s.extend(next_s);
         pure.extend(next_pure);
+    }
+}
+
+/// In a wave-dependent loop, both host halves can compute the same recurrence
+/// without meeting. Prove induction over SSA phis, including the branches
+/// selecting their incoming edges. Only return proven first-lane sources.
+pub(super) fn shared_loop_first_lanes(
+    x: &Parts,
+    alone: &HashSet<Value>,
+    alike: &mut HashSet<Value>,
+) {
+    let Some(tid) = wave_tid(x) else { return };
+    let (p, st) = (x.p, x.st);
+    let wanted: HashSet<_> = first_lane_sources(x, alone)
+        .filter(|v| !alike.contains(v))
+        .collect();
+    if wanted.is_empty() || !p.blocks[0].preds.is_empty() {
+        return;
+    }
+    // A group barrier reached exactly once, before any branch. Any write
+    // afterwards, even beyond the loop exit, could race a slower half's load.
+    let entry = &p.blocks[0].insts;
+    let Some(fence) = entry.iter().rposition(|i| i.name() == "s_barrier") else {
+        return;
+    };
+    let writes_lds = |i: &Inst| match i.fields {
+        Fields::Ds { gds: false, .. } => {
+            !(i.name().starts_with("ds_read")
+                || i.name().starts_with("ds_swizzle")
+                || i.name().contains("permute"))
+        }
+        Fields::Buffer { lds, .. } => lds,
+        Fields::Flat { lds, .. } => {
+            lds || i.name().starts_with("flat_store_") || i.name().starts_with("flat_atomic_")
+        }
+        _ => false,
+    };
+    if entry[fence + 1..]
+        .iter()
+        .chain(p.blocks[1..].iter().flat_map(|b| &b.insts))
+        .any(writes_lds)
+    {
+        return;
+    }
+    let Some(regions) = branch_regions(p, st) else { return };
+    let mut candidates: HashSet<_> = p
+        .blocks
+        .iter()
+        .flat_map(|b| {
+            b.phis
+                .iter()
+                .map(|f| f.value)
+                .chain(b.insts.iter().flat_map(|i| i.writes.iter().map(|w| w.1)))
+        })
+        .collect();
+    // Start with possible definitions, then eliminate each whose dependency
+    // fails. Every reachable phi must pass its entry edge as well as its back
+    // edge; uninitialized program inputs never enter the candidate set.
+    loop {
+        let mut wave_all = vec![true; p.blocks.len()];
+        for (b, region) in &regions {
+            let LaneExit::Branch { when, .. } = st.exits[*b] else {
+                continue;
+            };
+            if !st
+                .bools
+                .support(when)
+                .iter()
+                .all(|a| matches!(a, Atom::Lane(v) if candidates.contains(v)))
+            {
+                for (all, inside) in wave_all.iter_mut().zip(region) {
+                    *all &= !inside;
+                }
+            }
+        }
+        let mut next = HashSet::new();
+        for (b, block) in p.blocks.iter().enumerate().filter(|(b, _)| wave_all[*b]) {
+            if block.preds.iter().all(|&q| wave_all[q]) {
+                next.extend(
+                    block
+                        .phis
+                        .iter()
+                        .filter(|phi| {
+                            matches!(phi.reg, Reg::V(_) | Reg::S(0..=105))
+                                && !x.res.waterfall.reads.contains(&phi.value)
+                                && phi.args.iter().all(|v| candidates.contains(v))
+                        })
+                        .map(|phi| phi.value),
+                );
+            }
+            for (i, inst) in block.insts.iter().enumerate() {
+                if st.guards[b][i].is_some() {
+                    continue;
+                }
+                let operand = |op: &Operand| match *op {
+                    Operand::Literal(_) | Operand::Const(128..=208) => true,
+                    Operand::Scalar {
+                        code: code @ 0..=105,
+                        dwords: 1,
+                    } => inst.read(Reg::S(code)).is_some_and(|v| {
+                        candidates.contains(&v)
+                            && !st.masks.contains_key(&v)
+                            && !st.highs.contains_key(&v)
+                    }),
+                    Operand::Vector { reg, dwords: 1 } => inst
+                        .read(Reg::V(reg))
+                        .is_some_and(|v| candidates.contains(&v)),
+                    _ => false,
+                };
+                let proven = match &inst.fields {
+                    Fields::Sop { src, .. }
+                        if matches!(
+                            inst.name(),
+                            "s_mov_b32" | "s_add_i32" | "s_add_u32" | "s_lshl_b32"
+                        ) =>
+                    {
+                        src.iter().all(operand)
+                    }
+                    Fields::Valu(v) if v.dpp.is_none() && v.sdwa.is_none() => {
+                        let wave_id = inst.name() == "v_lshrrev_b32"
+                            && v.neg == 0
+                            && v.abs == 0
+                            && v.opsel == 0
+                            && matches!(v.src.as_slice(),
+                            [Operand::Const(134..=159), Operand::Vector { reg, dwords: 1 }]
+                                if inst.read(Reg::V(*reg)) == Some(tid));
+                        wave_id
+                            || (matches!(
+                                inst.name(),
+                                "v_mov_b32"
+                                    | "v_lshlrev_b32"
+                                    | "v_xor_b32"
+                                    | "v_add_nc_u32"
+                                    | "v_readfirstlane_b32"
+                                    | "v_cmpx_lt_u32"
+                                    | "v_cmpx_eq_u32"
+                                    | "v_cmpx_ne_u32"
+                            ) && v.src.iter().all(operand))
+                    }
+                    Fields::Ds {
+                        gds: false,
+                        addr: Some(addr),
+                        ..
+                    } => inst.name() == "ds_read_b32" && (b != 0 || i > fence) && operand(addr),
+                    _ => false,
+                };
+                if proven {
+                    next.extend(
+                        inst.writes
+                            .iter()
+                            .filter(|(r, v)| *r != Reg::Scc && !x.res.waterfall.reads.contains(v))
+                            .map(|w| w.1),
+                    );
+                }
+            }
+        }
+        if next == candidates {
+            alike.extend(wanted.intersection(&next).copied());
+            return;
+        }
+        candidates = next;
     }
 }
 

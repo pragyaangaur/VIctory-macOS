@@ -176,6 +176,7 @@ The on/off switches below (`...=1`) are off when unset or set to `0`.
 | `VICTORY_KEYS_FILE=<path>` | one key name per line, each pressed 0.2 s once its line is newline-terminated, in order (`Add-Content <path> Enter`) |
 | `VICTORY_FRAME_HZ=60` | tests a 60 Hz frame interval for the runtime's flip events |
 | `VICTORY_CRASH_BREAKPOINTS=1` | appends first-chance breakpoints to `crashes.log`, including ones a handler may recover from |
+| `VICTORY_POOL_OBSERVE=1` | on the identified Series 1.0.2.1 main executable, records the first pool breakpoint in `crashes.log` and the most recent 1,200 periodic activity samples in `pool-observation.log`, and BUILDING slot and retirement observations in `pool-residents.bin` |
 | `VICTORY_CRASH_SAVE=<rva>:<len>,...` | saves title memory to the cache folder on a crash |
 | `VICTORY_CAPTURE=<dir>` | saves presented frames (powers of two, or `VICTORY_CAPTURE_FRAMES=<list>`) |
 | `VICTORY_DUMP_TARGETS=1` | with the two above, saves every render target of those frames |
@@ -196,6 +197,43 @@ The on/off switches below (`...=1`) are off when unset or set to `0`.
 | `VICTORY_LITERAL_HALVES=0` | disable the literal translation retry for 64-thread wave64 compute shaders on 32-lane hosts (separate shader cache entries) |
 | `VICTORY_AUDIO_CAPTURE=<file.wav>` | records what the title plays (our process only) |
 | `VICTORY_XMA_DUMP=<dir>` | saves the first 32 XMA voices' context and input |
+
+The external `pool-residents.bin` retains the latest 64 samples and the first
+validated active sample at each of four occupancy thresholds (any, 50%, 80%,
+95%). Each little-endian v2 frame is 968,152 bytes and begins with `BRES0002`.
+Older `BRES0001` files have 901,736-byte frames. Require the matching size,
+the sample sequence at byte 8, and its bitwise complement in
+the final eight bytes. For the regular ring also require `sequence % 64` to
+equal the frame index. Join to the aggregate log by sequence.
+
+The 68,144-byte v2 frame header records pool identity, queue, clock and budget
+fields, plus up to eight distinct IDs in slot order and eight rotating IDs from
+the remaining eligible population. Header offset 114 holds its u16 population
+size. Each cohort can retain the matched 28-byte stream entry, checked upstream
+fields and the two owner output-array reads bracketing the lookup.
+
+The primary request table at byte 2,528 has an 80-byte header and 2,048 entries
+of 32 bytes. It is sampled independently of BUILDING availability, before and
+after the cohort reads. Table status byte 0 equals 1 for matching storage;
+entry status is free (1), matched allocated observations (2), changed or inconsistent (3), or
+stable allocated with invalid primary identity (4). For an owner/request
+association require the stream ID and saved owner to match, unchanged header
+sequence and tagged head, and complete coverage. A repeated tuple, a changing
+table, or incomplete coverage needs separate treatment. A raw request state
+records an observed value; several game paths write state 4.
+
+Each subsequent
+40-byte record corresponds to one slot index. Interpret records only when the
+u32 at header offset 24 equals 1, and only up to the capacity at offset 56.
+Slot byte 0 identifies changed/unavailable (0), free metadata (1), a matched
+BUILDING handle/type/generation/vtable (2), or stable allocated metadata with
+a mismatched identity (3). For matched slots, bytes 12 and 14 record observed
+type-1 and mixed queue membership (0 unavailable, 1 absent, 2 unique, 3
+duplicate). Byte 3 is the entity's pending bit. The sampler checks repeated
+protected copies without locking title data. Events between reads, same-address
+reuse and generation wrap can escape detection. A queue membership or an
+output-array match describes an observation within that sample window.
+
 
 `VICTORY_KEYS` and `VICTORY_KEYS_FILE` work in ordinary Windows builds, no diagnostics needed: they press keys on the keyboard device and, through it, on the keyboard's stand-in pad. Injecting them into a connected XInput pad instead requires a diagnostics build.
 

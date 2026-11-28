@@ -73,6 +73,22 @@ impl Ranges {
         self.0.drain(kept..last);
     }
 
+    /// Plans missing refreshes without joining back across current untracked bytes.
+    pub(crate) fn plan_refresh(
+        &self,
+        from: usize,
+        to: usize,
+        join: usize,
+        tracked: bool,
+    ) -> (impl Iterator<Item = (usize, usize)> + '_, usize) {
+        let join = if !tracked && !self.0.is_empty() {
+            0
+        } else {
+            join
+        };
+        (self.missing(from, to), join)
+    }
+
     /// The parts of `[from, to)` not in the set, in order.
     pub(crate) fn missing(
         &self,
@@ -306,6 +322,68 @@ mod tests {
         assert_eq!(
             Ranges::default().missing(3, 9).collect::<Vec<_>>(),
             [(3, 9)]
+        );
+    }
+
+    fn planned_refreshes(
+        current: &Ranges,
+        requests: &[(usize, usize)],
+        tracked: bool,
+    ) -> Vec<(usize, usize)> {
+        let mut pending = Ranges::default();
+        for &(from, to) in requests {
+            let (missing, join) = current.plan_refresh(from, to, 0x10000, tracked);
+            for (from, to) in missing {
+                pending.insert(from, to, join);
+            }
+        }
+        all(&pending)
+    }
+
+    #[test]
+    fn untracked_refresh_keeps_current_bytes_out_of_the_pending_plan() {
+        let current = set(&[(0x1000, 0x9000)]);
+        let expected = [(0, 0x1000), (0x9000, 0xa000)];
+        assert_eq!(planned_refreshes(&current, &[(0, 0xa000)], false), expected);
+        assert_eq!(
+            planned_refreshes(&current, &[(0, 0x3000), (0x2000, 0xa000)], false),
+            expected
+        );
+        assert_eq!(
+            planned_refreshes(
+                &current,
+                &[
+                    (0, 0x800),
+                    (0x600, 0xc00),
+                    (0xc00, 0x1000),
+                    (0x9000, 0xa000)
+                ],
+                false,
+            ),
+            expected,
+            "overlapping and adjacent pending ranges still merge"
+        );
+
+        let mut current = set(&[(0, 0xa000)]);
+        current.remove(0x1000, 0x1008);
+        current.remove(0x9000, 0x9008);
+        assert_eq!(
+            planned_refreshes(&current, &[(0, 0xa000)], false),
+            [(0x1000, 0x1008), (0x9000, 0x9008)],
+            "only the two invalidated title-write intervals are due again"
+        );
+    }
+
+    #[test]
+    fn initial_and_tracked_refreshes_keep_the_gap_join() {
+        let requests = [(0, 0x1000), (0x9000, 0xa000)];
+        assert_eq!(
+            planned_refreshes(&Ranges::default(), &requests, false),
+            [(0, 0xa000)]
+        );
+        assert_eq!(
+            planned_refreshes(&set(&[(0x1000, 0x9000)]), &requests, true),
+            [(0, 0xa000)]
         );
     }
 

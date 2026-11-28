@@ -7,6 +7,7 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use anyhow::{Context, Result};
+use victory_gpu::shader_cache::translation_options;
 use victory_shader::emit::host::{self, Host};
 use victory_shader::emit::{self, validator::Validator};
 use victory_shader::structure::{self, Atom, LaneExit};
@@ -22,7 +23,9 @@ struct Tally {
     containers: usize,
     duplicates: usize,
     programs: usize,
-    translated: usize,
+    extra_programs: usize,
+    ir_built: usize,
+    runtime_emitted: usize,
     instructions: usize,
     structured: usize,
     vector: usize,
@@ -84,17 +87,45 @@ impl Tally {
             self.failed.entry(reason).or_insert((0, e)).0 += 1;
             return;
         }
+        self.note_failure(reason, example);
+    }
+
+    fn note_failure(&mut self, reason: String, example: impl FnOnce() -> String) {
         self.failed
             .entry(reason)
             .or_insert_with(|| (0, example()))
             .0 += 1;
     }
 
+    fn runtime_outcome(
+        &mut self,
+        hash: blake3::Hash,
+        selected: Option<(HwStage, usize)>,
+        result: Result<&emit::HostShader, &ShaderError>,
+        example: impl FnOnce() -> String,
+    ) {
+        self.runtime_emitted += usize::from(result.is_ok());
+        if self.list {
+            let stage = selected.map_or_else(
+                || "-".into(),
+                |(stage, index)| format!("{stage:?} #{index}"),
+            );
+            let outcome = match result {
+                Ok(shader) => format!("emitted {}", blake3::hash(&shader.dxil)),
+                Err(error) => format!("refused {error}"),
+            };
+            self.lines
+                .push(format!("runtime {hash} {stage} {outcome}  {}", example()));
+        }
+    }
+
     fn merge(&mut self, other: Tally) {
         self.containers += other.containers;
         self.duplicates += other.duplicates;
         self.programs += other.programs;
-        self.translated += other.translated;
+        self.extra_programs += other.extra_programs;
+        self.ir_built += other.ir_built;
+        self.runtime_emitted += other.runtime_emitted;
         self.instructions += other.instructions;
         self.structured += other.structured;
         self.vector += other.vector;
@@ -164,8 +195,10 @@ pub fn run(
     wave32: bool,
 ) -> Result<()> {
     // Dumped shaders and validator reports are game-derived (rule #1).
-    if let Some(dir) = std::env::var_os("VICTORY_EMIT_DUMP") {
-        victory_core::ensure_outside_repo(Path::new(&dir))?;
+    for name in ["VICTORY_EMIT_DUMP", "VICTORY_FAIL_DUMP"] {
+        if let Some(dir) = std::env::var_os(name) {
+            victory_core::ensure_outside_repo(Path::new(&dir))?;
+        }
     }
     let paths = crate::default_paths(paths)?;
     let dll = validate.then(Validator::default_path).flatten();
@@ -250,18 +283,24 @@ pub fn run(
     }
     let t = total.into_inner().unwrap_or_else(|e| e.into_inner());
     println!(
-        "containers   {} ({} duplicates skipped)",
+        "containers   {} distinct ({} duplicates skipped)",
         t.containers, t.duplicates
     );
     println!(
-        "programs     {} translated of {} ({} IR instructions)",
-        t.translated, t.programs, t.instructions
+        "runtime      {} emitted of {} distinct containers; {} refused",
+        t.runtime_emitted,
+        t.containers,
+        t.containers - t.runtime_emitted
+    );
+    println!(
+        "programs     {} IR builds of {} native programs ({} extra diagnostic programs; {} IR instructions)",
+        t.ir_built, t.programs, t.extra_programs, t.instructions
     );
     println!(
         "structured   {} of {} ({} vector instructions, {} guarded, {} on opaque masks; \
          branches {} per lane, {} uniform)",
         t.structured,
-        t.translated,
+        t.ir_built,
         t.vector,
         t.guarded,
         t.opaque,
@@ -271,7 +310,7 @@ pub fn run(
     println!(
         "resources    {} of {} tracked (descriptors {} loaded, {} built, {} constant; \
          {} scalar accesses; {} with a computed term)",
-        t.tracked, t.translated, t.loaded, t.built, t.constant, t.scalar, t.dynamic
+        t.tracked, t.ir_built, t.loaded, t.built, t.constant, t.scalar, t.dynamic
     );
     println!(
         "  used-resource entries {}: {} not traced {:?}; {} traced parameters not listed",
@@ -376,12 +415,7 @@ pub fn warm(
                         s.spawn(|| {
                             while let Some(job) = jobs.get(next.fetch_add(1, Ordering::Relaxed)) {
                                 let Some(bytes) = job.bytes() else { continue };
-                                // As the title passes it: the container's own size
-                                // (a raw source runs on to the end of the file).
-                                let size = bytes.get(0x18..0x1c).map_or(0, |b| {
-                                    u32::from_le_bytes(b.try_into().expect("4")) as usize
-                                });
-                                let container = &bytes[..size.min(bytes.len())];
+                                let container = declared_container(&bytes);
                                 let hash = blake3::hash(container);
                                 if !lock(&seen).insert(hash) {
                                     continue;
@@ -398,7 +432,10 @@ pub fn warm(
                                 };
                                 counts[k].fetch_add(1, Ordering::Relaxed);
                                 tracing::debug!(
-                                    hash = %&hash.to_hex()[..16],
+                                    hash = %hash,
+                                    stage = ?done.as_ref().ok().map(|shader| shader.stage),
+                                    dxil_hash = ?done.as_ref().ok().map(|shader| blake3::hash(&shader.dxil)),
+                                    reason = done.as_ref().err().map(String::as_str),
                                     ms = one.elapsed().as_millis() as u64,
                                     cached,
                                     ok = done.is_ok(),
@@ -513,11 +550,10 @@ fn translate(
     let Some(bytes) = source.bytes() else {
         return t.fail("corrupt record".into(), example);
     };
-    // The hash a run's log names the shader by (`hash=` in "shader
-    // translated", "shader does not translate"), as `VICTORY_SHADER_SAVE`
-    // names its files.
-    let hash = blake3::hash(&bytes).to_hex()[..16].to_owned();
-    // `VICTORY_TRANSLATE_ONLY=<hash prefix>,...`: those containers alone.
+    let bytes = declared_container(&bytes);
+    let hash = blake3::hash(bytes);
+    let short_hash = hash.to_hex()[..16].to_owned();
+    // Match the runtime's container identity, including when scanning a larger file.
     static ONLY: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
     let only = ONLY.get_or_init(|| {
         std::env::var("VICTORY_TRANSLATE_ONLY")
@@ -527,36 +563,88 @@ fn translate(
             .filter(|h| !h.is_empty())
             .collect()
     });
-    if !only.is_empty() && !only.iter().any(|o| hash.starts_with(o.as_str())) {
+    if !only.is_empty() && !only.iter().any(|o| short_hash.starts_with(o.as_str())) {
         return;
     }
-    let example = || format!("{}{} #{hash}", path.display(), source.label());
-    t.containers += 1;
-    let Ok(container) = Container::parse(&bytes) else {
-        return t.fail("no DXIL part (SM5 or older)".into(), example);
-    };
-    let Some(dxil) = container
-        .part(FourCC::DXIL)
-        .or(container.part(FourCC::ACCC))
-        .map(|p| p.data)
-    else {
-        return t.fail("no DXIL part (SM5 or older)".into(), example);
-    };
-    if !lock(seen).insert(blake3::hash(dxil)) {
+    let example = || format!("{}{} #{short_hash}", path.display(), source.label());
+    if !lock(seen).insert(hash) {
         t.duplicates += 1;
         return;
     }
-    let programs = match native_programs(dxil) {
-        Ok(p) => p,
-        Err(e) => return t.fail(e.to_string(), example),
+    t.containers += 1;
+
+    let container = Container::parse(bytes).and_then(|container| {
+        let part = container
+            .part(FourCC::DXIL)
+            .or(container.part(FourCC::ACCC))
+            .ok_or(ShaderError::Malformed("no DXIL part"))?;
+        let programs = native_programs(part.data)?;
+        Ok((container, programs))
+    });
+    let (container, programs) = match container {
+        Ok(ready) => ready,
+        Err(error) => {
+            t.runtime_outcome(hash, None, Err(&error), example);
+            return t.note_failure(error.to_string(), example);
+        }
     };
-    // `VICTORY_FAIL_DUMP=<dir>`: the first 3 containers of each failure
-    // reason, as the title has them (`.cdxil`), to work on a translator gap
-    // offline (`VICTORY_REF_PS`, `VICTORY_TRANSLATE_ONLY`).
     let dump = std::env::var_os("VICTORY_FAIL_DUMP");
-    let before: Option<BTreeMap<String, usize>> =
-        dump.as_ref().map(|_| t.failed.iter().map(|(k, v)| (k.clone(), v.0)).collect());
-    translate_programs(&container, programs, &example, t, checks);
+    let before: Option<BTreeMap<String, usize>> = dump
+        .as_ref()
+        .map(|_| t.failed.iter().map(|(k, v)| (k.clone(), v.0)).collect());
+    let selected = match emit::runtime_program_index(&programs) {
+        Ok(index) => Some(index),
+        Err(error) => {
+            t.runtime_outcome(hash, None, Err(&error), example);
+            t.note_failure(error.to_string(), example);
+            None
+        }
+    };
+    t.programs += programs.len();
+    t.extra_programs += programs.len() - usize::from(selected.is_some());
+    let options = translation_options(bytes, checks.wave32);
+    for (index, p) in programs.iter().enumerate() {
+        let label = || format!("{} {:?} #{index}", example(), p.stage);
+        let is_runtime = Some(index) == selected;
+        match diagnose_program(&container, p, options, t) {
+            Ok(Some(shader)) => {
+                if is_runtime {
+                    t.runtime_outcome(hash, Some((p.stage, index)), Ok(&shader), example);
+                } else if t.list {
+                    t.lines.push(format!("{}  extra program emitted", label()));
+                }
+                check(shader, t, checks, label);
+            }
+            Ok(None) => {
+                if t.list {
+                    t.lines.push(format!("{}  extra program analysed", label()));
+                }
+            }
+            Err((step, error)) => {
+                if is_runtime {
+                    t.runtime_outcome(hash, Some((p.stage, index)), Err(&error), example);
+                }
+                let (reason, offset) = match error {
+                    ShaderError::Unsupported { offset, what } => {
+                        (format!("{step}{what}"), Some(offset))
+                    }
+                    ShaderError::Isa { offset, reason } if step == "structure: " => {
+                        (format!("{step}{reason}"), Some(offset))
+                    }
+                    _ => (format!("{step}{error}"), None),
+                };
+                let where_ = || match offset {
+                    Some(offset) => format!("{} at {offset:#x}", label()),
+                    None => label(),
+                };
+                if is_runtime {
+                    t.note_failure(reason, where_);
+                } else {
+                    t.fail(reason, where_);
+                }
+            }
+        }
+    }
     if let (Some(dir), Some(before)) = (dump, before) {
         for (reason, (n, _)) in &t.failed {
             let was = before.get(reason).copied().unwrap_or(0);
@@ -568,120 +656,69 @@ fn translate(
                     .collect();
                 let dir = Path::new(&dir);
                 let _ = std::fs::create_dir_all(dir);
-                let _ = std::fs::write(dir.join(format!("{stem}_{was}.{hash}.cdxil")), &bytes[..]);
+                let _ = std::fs::write(dir.join(format!("{stem}_{was}.{short_hash}.cdxil")), bytes);
             }
         }
     }
 }
 
-fn translate_programs(
-    container: &Container,
-    programs: Vec<NativeProgram>,
-    example: &dyn Fn() -> String,
+/// Counts the intermediate results independently, then returns the first
+/// blocking error in the order used by the runtime's emitter.
+fn diagnose_program(
+    container: &Container<'_>,
+    p: &NativeProgram,
+    options: emit::Options,
     t: &mut Tally,
-    checks: &mut Checks,
-) {
-    for p in programs {
-        t.programs += 1;
-        match victory_shader::range::build(&p.patched_code(), p.wave64, p.vgprs) {
-            Ok((program, structured)) => {
-                t.translated += 1;
-                t.instructions += program.blocks.iter().map(|b| b.insts.len()).sum::<usize>();
-                // Per-lane descriptors are traced on the per-lane form; its
-                // failure is listed after the resources' and I/O's.
-                let lanes = structured.as_ref().ok();
-                let res = match resource::track(&program, &p.layout, p.stage, lanes) {
-                    Ok(r) => {
-                        tally_resources(&p, &r, t);
-                        Some(r)
-                    }
-                    Err(ShaderError::Unsupported { offset, what }) => {
-                        t.fail(format!("resources: {what}"), || {
-                            format!("{} {:?} at {offset:#x}", example(), p.stage)
-                        });
-                        None
-                    }
-                    Err(e) => {
-                        t.fail(e.to_string(), || format!("{} {:?}", example(), p.stage));
-                        None
-                    }
-                };
-                let graphics = matches!(p.stage, HwStage::Vs | HwStage::Ps);
-                let compute = p.stage == HwStage::Cs;
-                let mut raised = None;
-                if graphics || compute || p.stage == HwStage::Ms {
-                    t.io_programs += usize::from(graphics);
-                    match io::raise(&program, &p) {
-                        Ok(r) => {
-                            if graphics {
-                                tally_io(&r, t);
-                            }
-                            raised = Some(r);
-                        }
-                        Err(ShaderError::Unsupported { offset, what }) => t
-                            .fail(format!("I/O: {what}"), || {
-                                format!("{} {:?} at {offset:#x}", example(), p.stage)
-                            }),
-                        Err(e) => t.fail(e.to_string(), || format!("{} {:?}", example(), p.stage)),
-                    }
-                }
-                let structured = match structured {
-                    Ok(s) => {
-                        tally_structured(&program, &s, t);
-                        Some(s)
-                    }
-                    Err(e) => {
-                        let reason = match e {
-                            ShaderError::Unsupported { what, .. } => format!("structure: {what}"),
-                            ShaderError::Isa { reason, .. } => format!("structure: {reason}"),
-                            e => e.to_string(),
-                        };
-                        t.fail(reason, || format!("{} {:?}", example(), p.stage));
-                        None
-                    }
-                };
-                if let (Some(r), Some(i), Some(s)) = (res, raised, structured) {
-                    let label = || format!("{} {:?}", example(), p.stage);
-                    *counter(t, p.stage, 0) += 1;
-                    let marks =
-                        emit_options(checks.wave32, victory_gpu::shader_cache::narrow_waves());
-                    match emit::emit_with(container, &p, &program, &s, &i, &r, marks) {
-                        Ok(shader) => {
-                            *counter(t, p.stage, 1) += 1;
-                            check(shader, t, checks, label);
-                        }
-                        Err(ShaderError::Unsupported { offset, what }) => t
-                            .fail(format!("emit: {what}"), || {
-                                format!("{} at {offset:#x}", label())
-                            }),
-                        Err(e) => t.fail(format!("emit: {e}"), label),
-                    }
-                }
-            }
-            Err(e) => {
-                let reason = match e {
-                    ShaderError::Unsupported { what, .. } => format!("unsupported: {what}"),
-                    e => e.to_string(),
-                };
-                t.fail(reason, || format!("{} {:?}", example(), p.stage));
-            }
+) -> Result<Option<emit::HostShader>, (&'static str, ShaderError)> {
+    let (program, structured) = victory_shader::range::build(&p.patched_code(), p.wave64, p.vgprs)
+        .map_err(|e| {
+            (
+                if matches!(e, ShaderError::Unsupported { .. }) {
+                    "unsupported: "
+                } else {
+                    ""
+                },
+                e,
+            )
+        })?;
+    t.ir_built += 1;
+    t.instructions += program.blocks.iter().map(|b| b.insts.len()).sum::<usize>();
+    let res = resource::track(&program, &p.layout, p.stage, structured.as_ref().ok());
+    if let Ok(r) = &res {
+        tally_resources(p, r, t);
+    }
+
+    let graphics = matches!(p.stage, HwStage::Vs | HwStage::Ps);
+    let io = emit::supports_stage(p.stage).then(|| io::raise(&program, p));
+    if graphics {
+        t.io_programs += 1;
+        if let Some(Ok(io)) = &io {
+            tally_io(io, t);
         }
     }
+    if let Ok(s) = &structured {
+        tally_structured(&program, s, t);
+    }
+
+    let res = res.map_err(|error| ("resources: ", error))?;
+    let io = io.transpose().map_err(|error| ("I/O: ", error))?;
+    let st = structured.map_err(|error| ("structure: ", error))?;
+    let Some(io) = io else {
+        return Ok(None);
+    };
+    *counter(t, p.stage, 0) += 1;
+    let shader = emit::emit_with(container, p, &program, &st, &io, &res, options)
+        .map_err(|error| ("emit: ", error))?;
+    *counter(t, p.stage, 1) += 1;
+    Ok(Some(shader))
 }
 
-/// The emit options for one program. For 32-lane waves (`wave32`), as
-/// `run` translates where its host narrows the waves (`narrow`: under Wine,
-/// D3DMetal runs wave64 programs in 32-lane waves whatever `WaveSize` says;
-/// `VICTORY_NARROW_WAVES` overrides): a group that is one console wave64
-/// with LDS then gets barriers between its halves instead of being refused.
-/// Without them the offline check refuses programs `run` translates.
-fn emit_options(wave32: bool, narrow: bool) -> emit::Options {
-    emit::Options {
-        view_marks: true,
-        host_wave32: wave32,
-        narrow_waves: wave32 && narrow,
-        ..Default::default()
-    }
+/// As the title passes it: a raw source runs on to the end of its file.
+fn declared_container(bytes: &[u8]) -> &[u8] {
+    let size = bytes.get(0x18..0x1c).map_or(0, |size| {
+        u32::from_le_bytes(size.try_into().expect("four bytes")) as usize
+    });
+    &bytes[..size.min(bytes.len())]
 }
 
 /// Validates an emitted shader if asked to.
@@ -725,9 +762,6 @@ fn check(
         }
     }
     let Some(v) = checks.validator.as_mut() else {
-        if t.list && checks.host.is_none() {
-            t.lines.push(format!("{}  emitted", label()));
-        }
         return;
     };
     match v.validate(&mut shader.dxil) {
@@ -950,32 +984,28 @@ pub(crate) fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 
 #[cfg(test)]
 mod tests {
-    /// `--wave32` translates as `run` does on a host that narrows the waves
-    /// (D3DMetal under Wine), and only then; without `--wave32` the waves are
-    /// never narrowed, as on a host whose waves hold a whole wave64.
-    #[test]
-    fn narrow_waves_follow_wave32_and_the_host() {
-        let o = super::emit_options(true, true);
-        assert!(o.host_wave32 && o.narrow_waves);
-        let o = super::emit_options(true, false);
-        assert!(
-            o.host_wave32 && !o.narrow_waves,
-            "NVIDIA, Intel: halves only"
-        );
-        let o = super::emit_options(false, true);
-        assert!(!o.host_wave32 && !o.narrow_waves);
-        assert!(super::emit_options(false, false).view_marks);
-    }
-
     /// Shader dumps are game-derived, so a dump directory in the repo is refused.
     #[test]
     fn emit_dump_inside_repo_is_refused() {
-        // SAFETY: no other test in this binary touches the environment.
-        unsafe { std::env::set_var("VICTORY_EMIT_DUMP", env!("CARGO_MANIFEST_DIR")) };
+        let repo = env!("CARGO_MANIFEST_DIR");
+        if std::env::var("VICTORY_EMIT_DUMP").as_deref() != Ok(repo) {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "translate::tests::emit_dump_inside_repo_is_refused",
+                ])
+                .env("VICTORY_EMIT_DUMP", repo)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stdout)
+            );
+            return;
+        }
         let missing = std::env::temp_dir().join("victory-translate-no-such-dir");
         let err = super::run(vec![missing], false, false, false, Some(1), false).unwrap_err();
-        // SAFETY: as above; unset so a later test's `run` is not refused.
-        unsafe { std::env::remove_var("VICTORY_EMIT_DUMP") };
         assert!(
             matches!(
                 err.downcast_ref(),
@@ -983,5 +1013,78 @@ mod tests {
             ),
             "{err}"
         );
+    }
+
+    /// Each child gets its own process-wide translation switches.
+    #[test]
+    fn diagnostic_options_match_runtime_translation() {
+        use std::process::Command;
+        use victory_shader::emit::Options;
+
+        let container = b"an original synthetic container";
+        let hash = blake3::hash(container).to_hex();
+        if let Ok(case) = std::env::var("VICTORY_TEST_TRANSLATION_OPTIONS") {
+            let (wide, configured) = match case.as_str() {
+                "configured" => (false, true),
+                "wide" => (true, true),
+                "disabled" => (true, false),
+                other => panic!("unexpected test case {other}"),
+            };
+            let expected = Options {
+                view_marks: true,
+                atomic_locks: configured,
+                atomic_lock_rounds: configured,
+                atomic_umax: configured,
+                bias_as_gradients: configured,
+                host_wave32: !wide,
+                narrow_waves: configured,
+                disable_literal_halves: configured,
+                per_vertex_center: false,
+                uav_size_level0: configured,
+                halves_rendezvous: configured,
+                thread_limits: false,
+            };
+            assert_eq!(super::translation_options(container, !wide), expected);
+            assert_eq!(
+                super::translation_options(b"another container", !wide),
+                Options {
+                    uav_size_level0: false,
+                    ..expected
+                },
+            );
+            return;
+        }
+
+        for (case, value, size) in [
+            ("configured", "1", &hash[..16]),
+            ("wide", "1", &hash[..16]),
+            ("disabled", "0", "0"),
+        ] {
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "translate::tests::diagnostic_options_match_runtime_translation",
+                ])
+                .env("VICTORY_TEST_TRANSLATION_OPTIONS", case)
+                .env("VICTORY_ATOMIC_LOCKS", value)
+                .env("VICTORY_ATOMIC_LOCK_ROUNDS", value)
+                .env("VICTORY_ATOMIC_UMAX", value)
+                .env("VICTORY_BIAS_AS_GRADIENTS", value)
+                .env("VICTORY_NARROW_WAVES", value)
+                .env("VICTORY_HALVES_RENDEZVOUS", value)
+                .env(
+                    "VICTORY_LITERAL_HALVES",
+                    if value == "1" { "0" } else { "1" },
+                )
+                .env("VICTORY_UAV_SIZE_LEVEL0", size)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{case}: {}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
     }
 }

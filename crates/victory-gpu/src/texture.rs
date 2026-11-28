@@ -56,6 +56,8 @@ pub(crate) struct Staging {
     size: u64,
     footprints: Vec<D3D12_PLACED_SUBRESOURCE_FOOTPRINT>,
     rows: Vec<u32>,
+    #[cfg(feature = "diagnostics")]
+    row_sizes: Vec<u64>,
     layout: victory_formats::texture::Layout,
     /// Mips per array slice.
     mips: u32,
@@ -530,21 +532,52 @@ fn copies(
     (buffer, at): (&ID3D12Resource, u64),
     subresources: &[Sub],
 ) {
+    let block = staging.layout.desc.block.max(1);
     for (i, band) in subresources {
         let i = *i as usize;
         let mut footprint = staging.footprints[i];
         footprint.Offset += at;
-        let footprint = &footprint;
+        let f = footprint.Footprint;
+        let (top, source_box) = match band {
+            Some(r) if *r != (0..staging.rows[i]) => {
+                // Other rows in the staging allocation may still contain old data.
+                if block > 1 {
+                    // D3DMetal 4.0 beta 1 copies the wrong rows from a nonzero BC source box.
+                    let (offset, texels) = staging
+                        .compact_rows(i, at, r)
+                        .expect("compressed row band selected before detiling");
+                    footprint.Offset = offset;
+                    footprint.Footprint.Height = texels.end - texels.start;
+                    (texels.start, None)
+                } else {
+                    let (top, bottom) = (r.start, r.end.min(f.Height));
+                    if top >= bottom {
+                        continue;
+                    }
+                    let rows = D3D12_BOX {
+                        left: 0,
+                        top,
+                        front: 0,
+                        right: f.Width,
+                        bottom,
+                        back: f.Depth,
+                    };
+                    (top, Some(rows))
+                }
+            }
+            _ => (0, None),
+        };
         #[cfg(feature = "diagnostics")]
         {
             let f = footprint.Footprint;
             // SAFETY: live resources.
             let (gpu, d) = unsafe { (buffer.GetGPUVirtualAddress(), texture.GetDesc()) };
-            let len = u64::from(f.RowPitch) * u64::from(staging.rows[i]) * u64::from(f.Depth);
+            let (first, end) = source_box.as_ref().map_or((0, f.Height), |b| (b.top, b.bottom));
+            let (first_byte, len) = staging.copy_read_span(i, footprint, first..end);
             list.note_read(
                 || {
                     format!(
-                        "texture upload ({}x{}x{} f{} mips {}) sub {i} of {} from staging {gpu:#x}+{:#x}: offset {:#x} {}x{}x{} pitch {}",
+                        "texture upload ({}x{}x{} f{} mips {}) sub {i} of {} from staging {gpu:#x}+{:#x}: offset {first_byte:#x} {}x{}x{} pitch {} to y={top}",
                         d.Width,
                         d.Height,
                         d.DepthOrArraySize,
@@ -552,14 +585,13 @@ fn copies(
                         d.MipLevels,
                         staging.footprints.len(),
                         staging.size,
-                        footprint.Offset,
                         f.Width,
-                        f.Height,
+                        end - first,
                         f.Depth,
                         f.RowPitch
                     )
                 },
-                (gpu + footprint.Offset, len),
+                (gpu + first_byte, len),
             );
         }
         let to = D3D12_TEXTURE_COPY_LOCATION {
@@ -575,33 +607,12 @@ fn copies(
             pResource: unsafe { std::mem::transmute_copy(buffer) },
             Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
             Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
-                PlacedFootprint: *footprint,
+                PlacedFootprint: footprint,
             },
         };
-        // Only the rows detiled: the staging buffer's other rows hold whatever
-        // its last user left.
-        let f = footprint.Footprint;
-        let block = staging.layout.desc.block.max(1);
-        match band {
-            Some(r) if *r != (0..staging.rows[i]) => {
-                let (top, bottom) = (r.start * block, (r.end * block).min(f.Height));
-                if top >= bottom {
-                    continue;
-                }
-                let rows = D3D12_BOX {
-                    left: 0,
-                    top,
-                    front: 0,
-                    right: f.Width,
-                    bottom,
-                    back: f.Depth,
-                };
-                // SAFETY: an open list; both locations name live resources,
-                // and the box lies inside the footprint.
-                unsafe { list.list.CopyTextureRegion(&to, 0, top, 0, &from, Some(&rows)) };
-            }
-            // SAFETY: an open list; both locations name live resources.
-            _ => unsafe { list.list.CopyTextureRegion(&to, 0, 0, 0, &from, None) },
+        // SAFETY: an open list; both locations name live resources.
+        unsafe {
+            list.list.CopyTextureRegion(&to, 0, top, 0, &from, source_box.as_ref().map(std::ptr::from_ref));
         }
     }
 }
@@ -900,6 +911,44 @@ impl Staging {
         WorkerRefresh::Uploaded((b, at, fresh))
     }
 
+    #[cfg(feature = "diagnostics")]
+    fn copy_read_span(
+        &self,
+        i: usize,
+        footprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT,
+        texels: std::ops::Range<u32>,
+    ) -> (u64, u64) {
+        let f = footprint.Footprint;
+        let block = self.layout.desc.block.max(1);
+        let pitch = u64::from(f.RowPitch);
+        let first = texels.start / block;
+        let rows = texels.end.div_ceil(block) - first;
+        let first_byte = footprint.Offset + pitch * u64::from(first);
+        let slice_rows = u64::from(self.rows[i]);
+        let len = pitch * ((u64::from(f.Depth) - 1) * slice_rows + u64::from(rows) - 1)
+            + self.row_sizes[i];
+        (first_byte, len)
+    }
+
+    fn compact_rows(
+        &self,
+        i: usize,
+        at: u64,
+        rows: &std::ops::Range<u32>,
+    ) -> Option<(u64, std::ops::Range<u32>)> {
+        let footprint = self.footprints[i];
+        let f = footprint.Footprint;
+        crate::texture_rows::compact(
+            at,
+            footprint.Offset,
+            f.RowPitch,
+            f.Height,
+            f.Depth,
+            self.layout.desc.block,
+            rows,
+        )
+    }
+
     /// Returns the bytes of title memory read, and the buffer it detiled
     /// into with the subresources detiled.
     fn refresh_now(
@@ -1024,6 +1073,14 @@ impl Staging {
                     let band = if use_rows && own(i) {
                         self.layout
                             .touched_rows(s % self.mips, s / self.mips, &changed)
+                            .filter(|(rows, _)| {
+                                // Select the whole read and detile before touching scratch.
+                                // Staging allocation bases are 512-byte aligned.
+                                self.layout.desc.block <= 1
+                                    || rows.is_empty()
+                                    || *rows == (0..self.rows[i])
+                                    || self.compact_rows(i, 0, rows).is_some()
+                            })
                     } else {
                         None
                     };
@@ -1627,6 +1684,12 @@ pub(crate) fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<St
     };
     let mut footprints = vec![D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default(); count as usize];
     let mut rows = vec![0u32; count as usize];
+    #[cfg(feature = "diagnostics")]
+    let mut row_sizes = vec![0u64; count as usize];
+    #[cfg(feature = "diagnostics")]
+    let row_sizes_out = Some(row_sizes.as_mut_ptr());
+    #[cfg(not(feature = "diagnostics"))]
+    let row_sizes_out = None;
     let mut total = 0;
     // SAFETY: outputs for `count` subresources.
     unsafe {
@@ -1637,7 +1700,7 @@ pub(crate) fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<St
             0,
             Some(footprints.as_mut_ptr()),
             Some(rows.as_mut_ptr()),
-            None,
+            row_sizes_out,
             Some(&mut total),
         );
     }
@@ -1648,6 +1711,8 @@ pub(crate) fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<St
         size: total,
         footprints,
         rows,
+        #[cfg(feature = "diagnostics")]
+        row_sizes,
         layout,
         mips: u32::from(d.MipLevels),
         memory,
@@ -1709,13 +1774,14 @@ pub(crate) mod tests {
     }
 
     /// Simulates unavailable staging space after the texture took its pages.
-    pub(crate) fn defer_one_upload(staging: &Staging) {
+    pub(crate) fn defer_one_upload(staging: &Staging) -> usize {
         let mut attempted = false;
         let (read, upload) = staging.refresh_now(|_, _, _| {
             attempted = true;
             None
         });
         assert!(attempted && read > 0 && upload.is_none());
+        read
     }
 
     #[test]
@@ -2366,11 +2432,13 @@ pub(crate) mod tests {
         }
     }
 
-    fn linear_rgba8_staging(
+    fn linear_staging(
         address: usize,
         width: u32,
         height: u32,
         slices: u32,
+        format: u32,
+        flags: u32,
     ) -> Option<(This, Arc<Staging>)> {
         let _host = host()?;
         let words: [u32; 14] = [
@@ -2382,11 +2450,11 @@ pub(crate) mod tests {
             0,
             height,
             slices | (1 << 16),
-            28, // DXGI_FORMAT_R8G8B8A8_UNORM
+            format,
             1,
             0,
             0x100, // linear
-            0,
+            flags,
             0,
         ];
         let iid = crate::object::guid(
@@ -2409,6 +2477,33 @@ pub(crate) mod tests {
         let tex = crate::resource::host_resource(out).expect("host texture created");
         let s = staging(out, &tex).expect("staging created");
         Some((out, s))
+    }
+
+    #[cfg(feature = "diagnostics")]
+    #[test]
+    fn partial_upload_marker_covers_the_unpadded_host_row() {
+        let address = crate::watch::tests::pool(1);
+        // The width leaves padding in the host pitch for either format.
+        let Some((obj, s)) = linear_staging(address, 2559, 5, 1, 115, 4) else {
+            return;
+        };
+        let mut footprint = s.footprints[0];
+        let format = footprint.Footprint.Format.0;
+        eprintln!("upload marker fixture host format {format}");
+        let (pitch, last_row) = match format {
+            28 => (10_240, 10_236), // RGBA8 after packed-color promotion
+            115 => (5120, 5118),    // native packed color on a capable device
+            _ => panic!("unexpected host format {format}"),
+        };
+        assert_eq!(s.layout.desc.element_bytes, 2);
+        assert_eq!(u64::from(footprint.Footprint.RowPitch), pitch);
+        footprint.Offset += 1024;
+        assert_eq!(
+            s.copy_read_span(0, footprint, 2..5),
+            (1024 + 2 * pitch, 2 * pitch + last_row)
+        );
+        release_staging(obj, s);
+        crate::object::release(obj);
     }
 
     fn release_staging(object: This, s: Arc<Staging>) {
@@ -2441,7 +2536,7 @@ pub(crate) mod tests {
         let page = crate::watch::PAGE;
         let mut mem = PlaceholderPages::new(2);
         mem.map(0, 0x42);
-        let Some((obj, s)) = linear_rgba8_staging(mem.base, 128, 128, 2) else {
+        let Some((obj, s)) = linear_staging(mem.base, 128, 128, 2, 28, 0) else {
             return; // no host GPU here
         };
         assert!(s.tracked.is_some(), "placeholder views must be tracked");
@@ -2503,7 +2598,7 @@ pub(crate) mod tests {
         let page = crate::watch::PAGE;
         let mut mem = PlaceholderPages::new(2);
         mem.map(0, 0x33);
-        let Some((obj, s)) = linear_rgba8_staging(mem.base, 128, 256, 1) else {
+        let Some((obj, s)) = linear_staging(mem.base, 128, 256, 1, 28, 0) else {
             return; // no host GPU here
         };
         assert!(s.tracked.is_some());

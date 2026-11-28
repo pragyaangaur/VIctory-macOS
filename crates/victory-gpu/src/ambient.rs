@@ -18,9 +18,9 @@
 //!
 //! What differs from the fork's file, for this line (Wine's HLSL compiler
 //! and D3DMetal; one host texture per texture memory):
-//! - Off by default, behind `VICTORY_AMBIENT=1`; the level is
-//!   `VICTORY_AMBIENT_LEVEL` (0.6 by default). Off, nothing here runs: the
-//!   title's containers are not searched for names and no pass is made.
+//! - `VICTORY_AMBIENT=1` selects the constant stand-in. Its level is
+//!   `VICTORY_AMBIENT_LEVEL` (0.6 by default). With both stand-ins off,
+//!   the title's containers are not searched for names and no pass is made.
 //! - The pass's root signature is built in code and its shader keeps to
 //!   what Wine's compiler takes (`crate::ambient_set::SOURCE`).
 //! - Programs are known per title pipeline (`crate::pipeline::ambient_role`,
@@ -47,11 +47,9 @@ use crate::resource::HostTexture;
 
 pub(crate) use set::{DEPTH, DRAWS_SKY, ENDS_REFLECTIONS, LIGHT, REFLECTIONS, RESOLVES};
 
-/// Whether the stand-in is on: `VICTORY_AMBIENT=1` (off when unset, empty,
-/// `0` or `off`). Read once.
+/// Whether either ambient stand-in is on.
 pub(crate) fn on() -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| set::is_on(var("VICTORY_AMBIENT").as_deref()))
+    crate::ray_settings::ambient().enabled
 }
 
 fn var(name: &str) -> Option<String> {

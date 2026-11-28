@@ -278,6 +278,10 @@ pub fn run(
     victory_hle::runtime::use_console_timers();
     #[cfg(feature = "diagnostics")]
     diagnostics(&image, &cfg);
+    let image = Arc::new(image);
+    #[cfg(feature = "diagnostics")]
+    let _pool_observer =
+        victory_loader::start_pool_observation(&image, &temp.with_file_name("pool-observation.log"));
     let late = LateDlls {
         host: resolver.host.clone(),
         title_dir: title_dir.to_owned(),
@@ -290,7 +294,7 @@ pub fn run(
         late.load(file, show).map_err(|e| format!("{e:#}"))
     }));
     // SAFETY: imports are bound; from here on we run title code.
-    let main = unsafe { Arc::new(image).spawn_main(dlls)? };
+    let main = unsafe { image.clone().spawn_main(dlls)? };
     let code = main
         .join()
         .map_err(|_| anyhow::anyhow!("title main thread panicked"))??;

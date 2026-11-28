@@ -144,7 +144,7 @@ fn decoded(color: u16) -> [f32; 4] {
 /// A block-compressed texture whose block rows span the page boundaries: a
 /// write into one page copies only the 4x4 block rows it covers, and the
 /// other pages keep what they had.
-fn check_block_rows(address: usize, mixed: bool) {
+fn check_block_rows(address: usize, mixed: bool, skip_block_rows: usize) {
     let host = crate::host::host().unwrap();
     const WIDTH: usize = 64;
     let words = |height: usize| texture_words(WIDTH as u32, height as u32, 71, 0x100, 0);
@@ -164,7 +164,9 @@ fn check_block_rows(address: usize, mixed: bool) {
         "block row pitch {pitch}"
     );
     let rows_per_page = PAGE / pitch * 4;
-    let height = 3 * rows_per_page;
+    let first_page_rows = rows_per_page - skip_block_rows * 4;
+    let height = first_page_rows + 2 * rows_per_page;
+    let offset = skip_block_rows * pitch;
     let fill = |page: usize, color: u16| {
         let at = address + page * PAGE;
         let block = [color.to_le_bytes(), color.to_le_bytes(), [0; 2], [0; 2]].concat();
@@ -174,12 +176,12 @@ fn check_block_rows(address: usize, mixed: bool) {
             unsafe { std::ptr::copy_nonoverlapping(block.as_ptr(), (at + offset) as *mut u8, 8) };
         }
     };
-    let object = texture_at_address(address as u64, &words(height));
+    let object = texture_at_address((address + offset) as u64, &words(height));
     let (_, desc) = crate::resource::texture_memory(object).unwrap();
     let layout = crate::resource::texture_layout(&desc).unwrap();
     let layout = &layout.planes[0].layout;
-    assert_eq!(layout.offset(0, 0, rows_per_page as u32 / 4, 0).unwrap(), PAGE as u64);
-    assert_eq!(layout.size, (3 * PAGE) as u64);
+    assert_eq!(layout.offset(0, 0, first_page_rows as u32 / 4, 0).unwrap(), (PAGE - offset) as u64);
+    assert_eq!(layout.size, (3 * PAGE - offset) as u64);
     let copy = crate::resource::host_copy(object).unwrap();
     let staging = crate::texture::staging(object, &copy.texture).unwrap();
     let ordinary = crate::texture::tests::untracked_bytes(&staging);
@@ -197,17 +199,20 @@ fn check_block_rows(address: usize, mixed: bool) {
     srv[..6].copy_from_slice(&[71, 4, 0x1688, 0, 0, 1]);
     let view = View::Shader(object as usize, Some(srv));
     slots.make(0, &view);
-    let (output, mapped) = host.shared_buffer((WIDTH * height * 16) as u64).unwrap();
+    let groups = height.div_ceil(8);
+    let (output, mapped) = host.shared_buffer((WIDTH * groups * 8 * 16) as u64).unwrap();
     let submit = |expected: [u16; 3], copies| {
         let list = host.new_list().unwrap();
         readable(&list, &used(ResourceType::Srv), &view, false);
-        run(&list, &slots, &read, 0, Some(&output), (8, height as u32 / 8));
+        run(&list, &slots, &read, 0, Some(&output), (8, groups as u32));
         list.close();
         let before = crate::texture::copied(object);
         host.execute(&[&list]);
         // SAFETY: the completed dispatch wrote WIDTH * height float4s.
         let pixels = unsafe { std::slice::from_raw_parts(mapped.cast::<[f32; 4]>(), WIDTH * height) };
-        for (page, group) in pixels.chunks(WIDTH * rows_per_page).enumerate() {
+        let boundaries = [0, first_page_rows, first_page_rows + rows_per_page, height];
+        for (page, rows) in boundaries.windows(2).enumerate() {
+            let group = &pixels[WIDTH * rows[0]..WIDTH * rows[1]];
             let want = decoded(expected[page]);
             let wrong = group
                 .iter()
@@ -224,6 +229,10 @@ fn check_block_rows(address: usize, mixed: bool) {
         submit([YELLOW, GREEN, BLUE], 0);
     } else {
         fill(1, YELLOW);
+        if skip_block_rows != 0 {
+            // Page 1 starts at an odd block row and cannot be rebased.
+            assert_eq!(crate::texture::tests::defer_one_upload(&staging), 3 * PAGE - offset);
+        }
         submit([RED, YELLOW, BLUE], 1);
         fill(2, WHITE);
         crate::texture::tests::defer_one_upload(&staging);
@@ -244,6 +253,15 @@ fn block_compressed_rows_keep_their_block_alignment_across_pages() {
     // The pools stay allocated, as in the test above.
     let mixed = mixed_pages();
     let tracked = crate::watch::tests::pool(3);
-    check_block_rows(mixed, true);
-    check_block_rows(tracked, false);
+    check_block_rows(mixed, true, 0);
+    check_block_rows(tracked, false, 0);
+}
+
+#[test]
+fn block_compressed_odd_row_placement_reloads_the_whole_subresource() {
+    if crate::host::host().is_none() {
+        return;
+    }
+    let tracked = crate::watch::tests::pool(3);
+    check_block_rows(tracked, false, 1);
 }

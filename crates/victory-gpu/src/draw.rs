@@ -1570,7 +1570,7 @@ impl State {
         // The acceleration-structure builder runs whole or not at all
         // (`pipeline::builder`).
         if crate::pipeline::held_back(self.pipeline as This) {
-            once!("a dispatch of the BVH builder held back");
+            once!("a dispatch of the BVH builder was held back");
             DROPPED.fetch_add(1, Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
             dropped(list, self.pipeline, "dispatch");

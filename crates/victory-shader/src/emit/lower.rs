@@ -33,6 +33,8 @@ mod first_lane;
 #[path = "half_views.rs"]
 mod half_views;
 mod halves;
+mod literal_lds;
+mod literal_publish;
 mod marks;
 mod meet;
 mod packed;
@@ -40,6 +42,7 @@ mod round_mode;
 mod mesh;
 mod predicate;
 mod retry;
+mod terminal_owner;
 mod thread_limits;
 #[cfg(test)]
 use barriers::split_wave_barriers;
@@ -51,12 +54,15 @@ use mesh::prune_signature;
 pub(crate) use meet::MeetSite;
 use super::bitcode::Rmw;
 use packed::packed_half;
+use predicate::reads_mask_as_data;
+#[cfg(test)]
+pub(in crate::emit) use predicate::publication_gates;
 use round_mode::round16;
 pub(super) use round_mode::round16_after;
 #[cfg(any(test, all(windows, feature = "host")))]
 pub(crate) use retry::lower;
 pub(crate) use retry::lower_limited;
-#[cfg(all(test, windows))]
+#[cfg(test)]
 pub(crate) use retry::{lower_literal, lower_pruned};
 
 type Why = &'static str;
@@ -65,7 +71,7 @@ type Why = &'static str;
 thread_local! {
     /// Set by a test that probes the value analysis behind a refusal, which
     /// selective predication would otherwise route around.
-    static NO_PREDICATION: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    pub(super) static NO_PREDICATION: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// Whether the current test turned selective predication off.
@@ -147,12 +153,20 @@ pub(crate) struct Lowered {
     /// Written typed-buffer calls, for structural tests of the dynamic path.
     #[cfg(test)]
     pub typed_buffer_calls: TypedBufferCalls,
+    #[cfg(test)]
+    pub owner_reads: usize,
     /// What the written module holds, for structural tests.
     #[cfg(test)]
     pub shape: Shape,
-    /// Barriers added for narrow host waves ([`split_wave_barriers`]).
+    #[cfg(test)]
+    pub guest_lds: super::bitcode::lds_tests::GuestLds,
+    /// Barriers added for narrow host waves.
     #[cfg(test)]
     pub split_barriers: usize,
+    #[cfg(test)]
+    pub live_scalar_exchanges: Vec<super::bitcode::ScalarExchange>,
+    #[cfg(test)]
+    pub barrier_cfg: (Vec<Vec<usize>>, Vec<usize>),
     /// Group barriers written (`dx.op.barrier`), for structural tests of
     /// the exchanges between 32-lane halves.
     #[cfg(test)]
@@ -389,6 +403,8 @@ struct Lower<'a> {
     halves: bool,
     /// Why such a program cannot run in halves.
     halves_refused: Option<Why>,
+    /// All mutable scalar data reads on this literal path require publication.
+    literal_publication: bool,
     /// Selective acyclic divergent-branch predication plan (`predicate`).
     pred: predicate::PredicatePlan,
     /// Per-lane active predicate for each IR block under predication.
@@ -562,33 +578,6 @@ const LANE_MASK: Why = "a lane mask read as data";
 const MASK_CYCLE: Why = "a lane mask whose lanes depend on its own value";
 const MASK_ELSEWHERE: Why = "a lane mask holding lanes elsewhere read as data";
 
-/// Instructions that read a lane mask (not EXEC implicitly, not a lane's
-/// bit) as a number.
-fn reads_mask_as_data(st: &Structured, i: &Inst) -> bool {
-    let is_mask = |v: Value| st.masks.contains_key(&v) || st.highs.contains_key(&v);
-    let ops: Vec<&Operand> = match &i.fields {
-        // A mask operation (its result a mask) is no data use.
-        Fields::Sop { .. }
-            if i.writes
-                .iter()
-                .any(|&(r, w)| matches!(r, Reg::S(_)) && is_mask(w)) =>
-        {
-            return false;
-        }
-        Fields::Sop { src, .. } => src.iter().collect(),
-        Fields::Valu(v)
-            if !matches!(i.name(), "v_cndmask_b32") && !i.name().contains("_co_ci_") =>
-        {
-            v.src.iter().collect()
-        }
-        _ => return false,
-    };
-    ops.into_iter().any(|op| match *op {
-        Operand::Scalar { code, .. } if code != NULL => i.read(Reg::S(code)).is_some_and(is_mask),
-        _ => false,
-    })
-}
-
 /// Vertex or mesh outputs of 16-bit values (see [`Lower::half_outputs`]),
 /// by row: whether two per dword.
 fn half_outputs(io: &StageIo) -> HashMap<u8, bool> {
@@ -668,6 +657,24 @@ fn smem_dwords(name: &str) -> Option<u32> {
     }
 }
 
+/// The last resource range starting at or before a table descriptor.
+fn table_kind(native: &NativeProgram, a: Address, first: u8) -> Option<&UsedResource> {
+    let rp = native.layout.get(a.param)?;
+    if rp.root != RootType::Table {
+        return None;
+    }
+    let dword = (a.offset / 4) + u32::from(first);
+    native
+        .used
+        .iter()
+        .filter(|u| {
+            u.root == RootType::Table
+                && u.user_data == rp.user_data
+                && u.table_offset_dwords <= dword
+        })
+        .max_by_key(|u| u.table_offset_dwords)
+}
+
 /// Where a program's constant table starts in its code: where its
 /// instructions end, unless a load at a fixed offset reads below that (then
 /// at `lowest`, the lowest offset any load or descriptor names). The
@@ -693,7 +700,7 @@ impl<'a> Lower<'a> {
         per_vertex_center: bool,
         meet_plan: &'a Set<MeetSite>,
         meet_found: &'a std::cell::RefCell<Set<MeetSite>>,
-    ) -> Self {
+    ) -> Result<Self, Stop> {
         let p = x.p;
         let mut phi_at = Map::default();
         for (b, block) in p.blocks.iter().enumerate() {
@@ -706,10 +713,13 @@ impl<'a> Lower<'a> {
         s.outputs = x.outputs.clone();
         if let Some(keep) = keep {
             s.repack_signatures = true;
-            if x.native.stage == HwStage::Ps {
-                prune_signature(&mut s.inputs, keep);
-            } else if x.native.stage == HwStage::Ms {
-                prune_signature(&mut s.outputs, keep);
+            let elements = match x.native.stage {
+                HwStage::Ps => Some(&mut s.inputs),
+                HwStage::Ms => Some(&mut s.outputs),
+                _ => None,
+            };
+            if let Some(elements) = elements {
+                prune_signature(elements, keep);
             }
         }
         let insts = || p.blocks.iter().flat_map(|b| &b.insts);
@@ -732,6 +742,7 @@ impl<'a> Lower<'a> {
         } else {
             HashSet::new()
         };
+        let mut literal_control = None;
         let mut split_barriers = Set::default();
         let mut pred = predicate::PredicatePlan::empty(Vec::new());
         if let StageIo::Cs(cs) = x.native.io {
@@ -779,26 +790,48 @@ impl<'a> Lower<'a> {
                 })
             } || halves::needs_first_lane(x, &mut alike_cache, &first_alone);
             let wave = if x.native.wave64 { 64 } else { 32 };
-            let group = cs.threads.iter().product::<u32>();
+            let group = if x.st.literal && s.lds_dwords != 0 {
+                literal_lds::group_size(cs.threads)?
+            } else {
+                cs.threads.iter().product::<u32>()
+            };
             let one_wave = group <= wave;
             let one_wave_lds = (x.narrow_waves || x.st.literal) && one_wave && group > 32 && s.lds_dwords > 0;
             let step_plan = if x.st.literal {
                 // Whole-wave control flow keeps its own branches.
-                predicate::PredicatePlan::empty(in_step(p, x.st))
+                if let Some(proof) = literal_publish::prove(x, group, s.lds_dwords, bad)? {
+                    let mut plan = predicate::PredicatePlan::empty(proof.step.clone());
+                    split_barriers = proof.guest_barriers;
+                    plan.scalar_publications = proof.sites;
+                    literal_control = Some((proof.step, vec![false; p.blocks.len()], proof.common));
+                    plan
+                } else {
+                    predicate::PredicatePlan::empty(in_step(p, x.st))
+                }
             } else if x.native.wave64
                 && group > 32
                 && (x.host_wave32 || one_wave_lds)
                 && !predication_off()
             {
                 let base_step = in_step(p, x.st);
-                predicate::PredicatePlan::build(p, x.st, base_step, one_wave_lds, x.host_wave32)
+                let mapped_group = (console_lanes && x.host_wave32)
+                    .then(|| (x, halves::uses_lane_tickets(group, 32, s.lds_dwords, true), &first_alone));
+                predicate::PredicatePlan::build(
+                    p,
+                    x.st,
+                    base_step,
+                    one_wave_lds,
+                    x.host_wave32,
+                    mapped_group.filter(|_| group == 64),
+                    mapped_group.filter(|&(_, tickets, _)| group > 64 && tickets).map(|(x, ..)| x),
+                )
             } else {
                 predicate::PredicatePlan::empty(Vec::new())
             };
             // The console's one wave is several host waves: LDS no longer
             // passes between its lanes without a barrier.
-            let mut synced = false;
-            if one_wave_lds {
+            let mut synced = !split_barriers.is_empty();
+            if one_wave_lds && !synced {
                 // shortcut: a read in divergent code of what divergent code
                 // wrote gets no barrier (none could be placed there); the
                 // program then runs as before.
@@ -887,10 +920,19 @@ impl<'a> Lower<'a> {
                 }
             }
         }
-        let (step, cap_escaped, group_scalars) = step_and_cap(p, x.st, halves);
+        let literal_publication = literal_control.is_some();
+        let (step, cap_escaped, group_scalars) =
+            literal_control.unwrap_or_else(|| step_and_cap(p, x.st, halves));
         let one_host_wave = s.threads.is_some_and(|t| t.iter().product::<u32>() <= 32);
         let meet = (halves && !one_host_wave && x.halves_rendezvous)
             .then(|| meet::meet_regions(p, x.st, &step));
+        if let (Some(owner), Some(meet)) = (&pred.owner, &meet)
+            && owner.overlaps_meet(meet)
+        {
+            // An independently planned exchange can also insert a barrier at its join.
+            // Only multi-wave groups reach this proof, so no split-wave LDS plan changes.
+            pred = predicate::PredicatePlan::build(p, x.st, step.clone(), false, true, None, None);
+        }
         let mut l = Lower {
             s,
             x,
@@ -943,6 +985,7 @@ impl<'a> Lower<'a> {
             console_lanes,
             halves,
             halves_refused,
+            literal_publication,
             step: if !halves {
                 Vec::new()
             } else if pred.step.is_empty() {
@@ -968,7 +1011,13 @@ impl<'a> Lower<'a> {
             meet_epoch: Map::default(),
             level: 0,
             alike: if halves {
-                alike_cache.unwrap_or_else(|| halves::lane_uniform(x))
+                let mut alike = alike_cache.unwrap_or_else(|| halves::lane_uniform(x));
+                // A value shared by one console wave can differ in the next.
+                // Its proof may elide an exchange only after mapping host lanes.
+                if console_lanes {
+                    halves::shared_loop_first_lanes(x, &first_alone, &mut alike);
+                }
+                alike
             } else {
                 HashSet::new()
             },
@@ -1028,7 +1077,7 @@ impl<'a> Lower<'a> {
             mode16: Some(0),
         };
         l.lay_out_meet();
-        l
+        Ok(l)
     }
 
     /// The dword of the program's code at byte `byte` (a constant table
@@ -1385,14 +1434,21 @@ impl<'a> Lower<'a> {
                         .shapes
                         .values()
                         .any(|s| matches!(s, super::wave::Shape::CountF64Hi(..)));
-                    !section
+                    // A section replacing a proved lane read must still
+                    // return a whole-wave value at its live scalar output.
+                    let interior = &p.blocks[b].insts[start + 1..section.end];
+                    let scalars_preserved = !self.literal_publication || interior.iter()
+                        .flat_map(|inst| &inst.writes)
+                        .filter(|(_, v)| self.group_scalars.contains(v))
+                        .all(|(_, v)| matches!(section.shapes.get(v),
+                            Some(super::wave::Shape::K(_) | super::wave::Shape::Active(..))));
+                    scalars_preserved && !section
                         .shapes
                         .values()
                         .any(|s| matches!(s, super::wave::Shape::Half(..)))
-                        && p.blocks[b].insts[start + 1..section.end].iter().all(|i| {
-                            matches!(i.fields, Fields::Valu(_))
-                                || (count_f64 && matches!(i.fields, Fields::Sop { .. }))
-                        })
+                        && interior.iter()
+                            .all(|i| matches!(i.fields, Fields::Valu(_))
+                                || (count_f64 && matches!(i.fields, Fields::Sop { .. })))
                 });
             }
             for (&start, sec) in &found {
@@ -1725,7 +1781,17 @@ impl<'a> Lower<'a> {
             self.level = self.cur;
             self.exit(b)?;
         }
+        if let Some(&(b, i)) = self.pred.scalar_publications.iter().next() {
+            return Err(unsupported(
+                p.blocks[b].insts[i].machine.offset,
+                "a skipped scalar-buffer publication",
+            ));
+        }
         self.fill_phis()?;
+        #[cfg(test)]
+        if let Some(owner) = &self.pred.owner {
+            owner.verify_emission(&self);
+        }
         let user_data = self.user_reads.values().copied().collect();
         self.s.samplers = self.samplers.len() as u32;
         let root_cbvs = self.s.root_cbvs.iter().map(|r| r.0).collect();
@@ -1815,6 +1881,8 @@ impl<'a> Lower<'a> {
                 ],
             },
             #[cfg(test)]
+            owner_reads: self.pred.owner.as_ref().map_or(0, |o| o.emitted.len()),
+            #[cfg(test)]
             shape: {
                 let (blocks, instructions, branches) = self.s.m.written_shape();
                 Shape {
@@ -1827,7 +1895,13 @@ impl<'a> Lower<'a> {
                 }
             },
             #[cfg(test)]
+            guest_lds: self.s.m.guest_lds_trace(),
+            #[cfg(test)]
             split_barriers: self.split_barriers.len(),
+            #[cfg(test)]
+            live_scalar_exchanges: self.s.m.live_scalar_exchanges(),
+            #[cfg(test)]
+            barrier_cfg: self.s.m.written_cfg(&self.s.m.written_call_blocks("dx.op.barrier")),
             #[cfg(test)]
             barriers: self.s.m.written_calls("dx.op.barrier"),
             #[cfg(test)]
@@ -4148,17 +4222,6 @@ impl<'a> Lower<'a> {
         Ok(())
     }
 
-    /// Thread-group sync with a shared-memory fence, and a UAV fence when
-    /// the program writes UAVs (the waits before an s_barrier make those
-    /// writes visible on the console).
-    fn group_barrier(&mut self) {
-        let mode = if self.writes_uavs { 1 | 2 | 8 } else { 1 | 8 };
-        let mode = self.s.m.i32(mode);
-        let void = self.s.t.void;
-        self.s
-            .op(self.cur, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
-    }
-
     // ---- instructions ----
 
     fn inst(&mut self, b: usize, i: usize) -> Result<(), Stop> {
@@ -4223,7 +4286,9 @@ impl<'a> Lower<'a> {
         };
         match r {
             Ok(()) => Ok(()),
-            Err(why) if effect => Err(unsupported(offset, why)),
+            Err(why) if effect || self.pred.scalar_publications.contains(&(b, i)) => {
+                Err(unsupported(offset, why))
+            }
             Err(why) => {
                 for &(_, v) in &inst.writes {
                     self.vals.insert(v, Val::Missing(why));
@@ -4783,6 +4848,11 @@ impl<'a> Lower<'a> {
             return self.memory_smem(inst, a);
         }
         let Some(rest) = name.strip_prefix("s_buffer_load_dword") else {
+            if self.literal_publication {
+                // The tracker supplies the handle. Its storage words have no
+                // proved numeric value on the publication path.
+                return Err("a literal descriptor word read as numeric data");
+            }
             return self.descriptor_data(inst, site);
         };
         let count = match rest {
@@ -4840,10 +4910,25 @@ impl<'a> Lower<'a> {
             && matches!(src, Source::Built { address, .. }
                 if self.x.native.layout.get(address.param).is_some_and(|p| p.root == RootType::Descriptor));
         if srv || root_uav {
+            let publish = self.pred.scalar_publications.contains(&site);
+            if publish && (self.x.st.guards[site.0][site.1].is_some()
+                || (0..count).any(|k| inst.write(Reg::S(code + k as u8)).is_none()))
+            {
+                return Err("a guarded or incomplete scalar-buffer publication");
+            }
             let (h, addr) = self.raw_view(site, src, addr, 4 * count, (11, 0), false, None)?;
-            for (k, x) in self.raw_run(h, addr, count).into_iter().enumerate() {
+            if publish && (self.cur != c || self.memory_offsets.contains(&addr)) {
+                return Err("a scalar-buffer publication through a guarded raw view");
+            }
+            let words = if publish {
+                self.published_scalar_words(h, addr, count)?
+            } else {
+                self.raw_run(h, addr, count)
+            };
+            for (k, x) in words.into_iter().enumerate() {
                 self.write(inst, Reg::S(code + k as u8), x, None);
             }
+            self.pred.scalar_publications.remove(&site);
             return Ok(());
         }
         let h = self.handle(site, src, false, (13, 0x1_0000))?;
@@ -6077,22 +6162,7 @@ impl<'a> Lower<'a> {
         let (Source::Loaded { load, first } | Source::Fetched { load, first }) = src else {
             return None;
         };
-        let a = self.scalar.get(load)?;
-        let rp = self.x.native.layout.get(a.param)?;
-        if rp.root != RootType::Table {
-            return None;
-        }
-        let dword = (a.offset / 4) + u32::from(*first);
-        self.x
-            .native
-            .used
-            .iter()
-            .filter(|u| {
-                u.root == RootType::Table
-                    && u.user_data == rp.user_data
-                    && u.table_offset_dwords <= dword
-            })
-            .max_by_key(|u| u.table_offset_dwords)
+        table_kind(self.x.native, *self.scalar.get(load)?, *first)
     }
 
     /// A handle for the descriptor `src` read at `site`; the heap index of
@@ -6613,6 +6683,18 @@ impl<'a> Lower<'a> {
             Some(Operand::Scalar { .. }) if name != "v_readfirstlane_b32" => None,
             _ => self.guard(b, i)?,
         };
+        if self.halves
+            && name == "v_readfirstlane_b32"
+            && guard.is_none()
+            && self.cur == self.level
+            && let Some(owner) = &mut self.pred.owner
+            && owner.sites.contains(&(b, i))
+        {
+            #[cfg(test)]
+            owner.emitted.push(self.cur);
+            let own = self.src(inst, 0)?;
+            return self.write_i(inst, own, None);
+        }
         if let Some(d) = v.dpp {
             let (x, enable) = self.dpp(inst, d, guard)?;
             guard = match (guard, enable) {
@@ -7451,7 +7533,14 @@ impl<'a> Lower<'a> {
                     .first()
                     .is_some_and(|w| self.x.st.restored.contains_key(&w.1)) =>
             {
-                let a = self.i32_of(self.x.st.restored[&inst.writes[0].1])?;
+                let source = self.x.st.restored[&inst.writes[0].1];
+                if self.literal_publication
+                    && !(halves::uniform_selector(inst, &self.group_scalars)
+                        && self.group_scalars.contains(&source))
+                {
+                    return Err("an unproved restored scalar in literal publication");
+                }
+                let a = self.i32_of(source)?;
                 int(self, a)
             }
             "v_writelane_b32"

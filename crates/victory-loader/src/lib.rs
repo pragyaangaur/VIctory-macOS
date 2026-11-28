@@ -27,6 +27,8 @@ pub mod masked;
 pub mod wide;
 #[cfg(windows)]
 mod patch;
+#[cfg(any(all(windows, feature = "diagnostics"), test))]
+mod pool;
 pub mod prepare;
 pub(crate) mod publish;
 pub mod resolution;
@@ -51,6 +53,8 @@ pub use crash::{
 };
 #[cfg(windows)]
 pub use patch::patch_code;
+#[cfg(all(windows, feature = "diagnostics"))]
+pub use pool::windows::{PoolObserver, start_pool_observation};
 pub use prepare::{PrepareError, PreparedImage, prepare};
 pub use resolve::{ImportResolver, Provenance, Resolution};
 #[cfg(all(windows, feature = "diagnostics"))]

@@ -14,8 +14,8 @@ use windows::Win32::Graphics::Dxgi::Common::*;
 
 use super::paged::Paged;
 use super::{
-    VIEW_TAG, View, ViewPin, view_at, view_gen_current, views_at_batch, views_current_into,
-    views_forgot,
+    VIEW_TAG, View, ViewPin, read_sync_record, sync_record, view_at, view_gen_current, views_at_batch,
+    views_current_into, views_forgot,
 };
 use crate::backend::{HostGpu, HostMemory};
 use crate::host::host;
@@ -29,6 +29,12 @@ thread_local! {
     /// True while this thread is inside [`HostHeap::publish`], preventing
     /// `mirror(..., true)` from re-enqueuing the slot being published.
     static PUBLISHING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+fn read_matching_record(handle: u64, key: u64) -> Option<[u32; 3]> {
+    read_sync_record(handle).filter(|&[tag, i, generation]| {
+        tag == VIEW_TAG && (u64::from(generation) << 32 | u64::from(i)) == key
+    })
 }
 
 struct PublishingGuard(bool);
@@ -1595,16 +1601,11 @@ impl HostHeap {
                                         buf.as_ptr().add(off).cast::<[u32; 3]>().read_unaligned()
                                     }
                                 } else if !buf.is_empty() {
-                                    let mut raw = [0u8; 12];
-                                    if !crate::host::read_into(addr as *const u8, &mut raw) {
+                                    let Some(record) = read_sync_record(addr) else {
                                         i += 1;
                                         continue;
-                                    }
-                                    [
-                                        u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]),
-                                        u32::from_le_bytes([raw[4], raw[5], raw[6], raw[7]]),
-                                        u32::from_le_bytes([raw[8], raw[9], raw[10], raw[11]]),
-                                    ]
+                                    };
+                                    record
                                 } else {
                                     // SAFETY: direct test path (`sync_slots`) in committed memory.
                                     unsafe { (addr as *const [u32; 3]).read_unaligned() }
@@ -1658,15 +1659,10 @@ impl HostHeap {
                     // SAFETY: `off + 12 <= buf.len()`, unaligned copy of 12 bytes.
                     unsafe { buf.as_ptr().add(off).cast::<[u32; 3]>().read_unaligned() }
                 } else if !buf.is_empty() {
-                    let mut raw = [0u8; 12];
-                    if !crate::host::read_into(addr as *const u8, &mut raw) {
+                    let Some(record) = read_sync_record(addr) else {
                         continue;
-                    }
-                    [
-                        u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]),
-                        u32::from_le_bytes([raw[4], raw[5], raw[6], raw[7]]),
-                        u32::from_le_bytes([raw[8], raw[9], raw[10], raw[11]]),
-                    ]
+                    };
+                    record
                 } else {
                     // SAFETY: direct test path (`sync_slots`) in committed memory.
                     unsafe { (addr as *const [u32; 3]).read_unaligned() }
@@ -1705,7 +1701,7 @@ impl HostHeap {
             }
 
             for i in stale {
-                self.mirror(i, at(i), false);
+                self.mirror_synced_slot(i, at(i));
             }
             legacy_verify = legacy_fast;
         }
@@ -1846,20 +1842,15 @@ impl HostHeap {
                 let addr = at(index);
                 // Re-read live title memory under `self.made`: if a title
                 // thread overwrote the slot since the page snapshot (including
-                // during `prepare`), defer to `mirror` after dropping locks.
-                // SAFETY: the caller holds the heap alive until the sync completes.
-                let mut raw = [0u8; 12];
-                if span_read {
+                // during `prepare`), retry the live record after dropping locks.
+                let live = if span_read {
                     let off = (addr - span.0) as usize;
-                    raw.copy_from_slice(&live_span[off..off + 12]);
-                } else if !crate::host::read_into(addr as *const u8, &mut raw) {
+                    sync_record(&live_span[off..off + 12])
+                } else if let Some(live) = read_sync_record(addr) {
+                    live
+                } else {
                     continue;
-                }
-                let live = [
-                    u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]),
-                    u32::from_le_bytes([raw[4], raw[5], raw[6], raw[7]]),
-                    u32::from_le_bytes([raw[8], raw[9], raw[10], raw[11]]),
-                ];
+                };
                 if live != snapshot {
                     again.push(index);
                     continue;
@@ -2094,7 +2085,7 @@ impl HostHeap {
         crate::host::retire_all(retired);
         drop(pins);
         for index in again {
-            self.mirror(index, at(index), false);
+            self.mirror_synced_slot(index, at(index));
         }
     }
 
@@ -2156,6 +2147,31 @@ impl HostHeap {
     }
 
     pub(crate) fn mirror(&self, index: u32, handle: u64, for_draw: bool) -> Option<ViewPin> {
+        self.mirror_read(index, handle, for_draw, || {
+            // SAFETY: the descriptor API caller supplies a live slot.
+            Some(unsafe { (handle as *const [u32; 3]).read_unaligned() })
+        })
+    }
+
+    /// A shader-read index can name a placed slot whose backing page is gone.
+    pub(crate) fn mirror_shader_read(&self, index: u32, handle: u64) {
+        self.mirror_read(index, handle, true, || read_sync_record(handle));
+    }
+
+    fn mirror_synced_slot(&self, index: u32, handle: u64) {
+        let left = stale_left();
+        self.mirror_read(index, handle, false, || {
+            read_sync_record(handle).filter(|record| !left || record[0] == VIEW_TAG)
+        });
+    }
+
+    fn mirror_read(
+        &self,
+        index: u32,
+        handle: u64,
+        for_draw: bool,
+        read_record: impl Fn() -> Option<[u32; 3]>,
+    ) -> Option<ViewPin> {
         if index >= self.count {
             // Diagnostic (NVIDIA heap cap): the highest title slot past the
             // host heap seen so far.
@@ -2170,8 +2186,7 @@ impl HostHeap {
             }
             return None;
         }
-        // SAFETY: the handle is a descriptor slot in title memory.
-        let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
+        let [tag, i, generation] = read_record()?;
         // Generations start at 1, so a made slot's key is never 0.
         let key = u64::from(generation) << 32 | u64::from(i);
         // Made from this record already and readable as it is (what the
@@ -2186,8 +2201,7 @@ impl HostHeap {
         }
         let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
         // A second recorder may have replaced the slot while this thread waited.
-        // SAFETY: the caller holds the heap alive until the update completes.
-        let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
+        let [tag, i, generation] = read_record()?;
         let key = u64::from(generation) << 32 | u64::from(i);
         let view = (tag == VIEW_TAG).then(|| view_at(i, generation)).flatten();
         let Some(view) = view else {
@@ -2247,11 +2261,11 @@ impl HostHeap {
             made = self.made.lock().unwrap_or_else(|e| e.into_inner());
             // The title may have written another record there meanwhile (and
             // another thread made it): that one is the slot's.
-            // SAFETY: as above.
-            if unsafe { (handle as *const [u32; 3]).read_unaligned() } != [tag, i, generation] {
+            let live = read_record();
+            if live != Some([tag, i, generation]) {
                 drop(made);
                 drop(view);
-                return self.mirror(index, handle, for_draw);
+                return live.and_then(|_| self.mirror_read(index, handle, for_draw, read_record));
             }
             if made[index as usize] == key && !needs_remake() {
                 return Some(view);
@@ -2315,16 +2329,12 @@ impl HostHeap {
     /// record `key`. Called inside `Host::execute` once the texture's upload is
     /// recorded in the submission's upload list (`crate::heap_worker`).
     pub(crate) fn publish(&self, index: u32, handle: u64, key: u64) -> bool {
-        if handle == 0 || index >= self.count {
-            return false;
-        }
-        // SAFETY: the handle is a descriptor slot in title memory.
-        let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
-        if tag != VIEW_TAG || (u64::from(generation) << 32 | u64::from(i)) != key {
+        if index >= self.count {
             return false;
         }
         let _guard = PublishingGuard(PUBLISHING.replace(true));
-        self.mirror(index, handle, true).is_some()
+        self.mirror_read(index, handle, true, || read_matching_record(handle, key))
+            .is_some()
     }
 
     /// Leaves slot `index` showing what it showed, to be made from the
@@ -2361,15 +2371,13 @@ impl HostHeap {
         };
         let mut shown = 0;
         for (index, (handle, key)) in held {
-            // SAFETY: a descriptor slot in the live title heap the caller
-            // holds (`SHADER_HEAPS`).
-            let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
-            if tag != VIEW_TAG || (u64::from(generation) << 32 | u64::from(i)) != key {
+            let read = || read_matching_record(handle, key);
+            if read().is_none() {
                 // Written again since: that write made (or held) the slot.
                 SHOWN_AFTER[2].fetch_add(1, Ordering::Relaxed);
                 continue;
             }
-            if self.mirror(index, handle, true).is_some() {
+            if self.mirror_read(index, handle, true, read).is_some() {
                 shown += 1;
             }
         }
@@ -2401,8 +2409,9 @@ impl HostHeap {
         if handle == 0 || index >= self.count {
             return false;
         }
-        // SAFETY: descriptor slot in title memory.
-        let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
+        let Some([tag, i, generation]) = read_sync_record(handle) else {
+            return false;
+        };
         if tag != VIEW_TAG {
             return false;
         }
@@ -2545,7 +2554,7 @@ impl HostHeap {
                 made[index as usize] = 0;
                 self.set_made_nonzero(index, false);
             }
-            self.mirror(index, start + u64::from(index) * step, true);
+            self.mirror_shader_read(index, start + u64::from(index) * step);
         }
         slots.len()
     }
@@ -5386,6 +5395,49 @@ mod tests {
         assert!(unsafe { host_gpu.device.GetDeviceRemovedReason() }.is_ok());
         let _ = title_heap.as_mut_ptr();
         let _ = mem.as_ptr();
+    }
+
+    #[test]
+    #[ignore = "requires a real D3D12 host heap"]
+    fn sync_keeps_the_previous_slot_if_placement_is_decommitted_during_prepare() {
+        use windows_sys::Win32::System::Memory::{MEM_DECOMMIT, VirtualFree};
+        for fast in [false, true] {
+            let heap = HostHeap::new(true, 1).expect("the test requires a real D3D12 heap");
+            let page = crate::watch::tests::pool(1);
+            let sampler = |handle, filter| {
+                let desc = [filter, 3, 3, 3, 0, 1, 0, 0, 0, 0, 0, 0x7f7f_ffff, 0];
+                crate::descriptor::create_sampler(std::ptr::null(), &desc, handle);
+            };
+            sampler(page as u64, 0);
+            assert!(heap.mirror(0, page as u64, false).is_some());
+            let previous = heap.ready[0].load(Ordering::Acquire);
+            assert_ne!(previous, 0);
+
+            let mut snapshot = [0u8; 16];
+            sampler(snapshot.as_mut_ptr() as u64, 21);
+            sampler(page as u64, 1);
+            let decommit = move || {
+                // SAFETY: this fixture owns the committed allocation until after the sync.
+                assert_ne!(unsafe { VirtualFree(page as *mut _, 4096, MEM_DECOMMIT) }, 0);
+            };
+            if fast {
+                // The batch prepares the snapshot first. The mismatched live record
+                // then enters the single-slot retry, where its prepare decommits the page.
+                when_preparing(move || when_preparing(decommit));
+            } else {
+                when_preparing(decommit);
+            }
+            heap.sync_slots_bytes_with(0..1, page as u64, 16, page as u64, &snapshot, fast);
+            assert!(prepared());
+            assert!(!crate::host::read_into(page as *const _, &mut [0u8; 12]));
+            assert_eq!(heap.ready[0].load(Ordering::Acquire), previous);
+            assert!(!heap.publish(0, page as u64, previous));
+            heap.hold(0, page as u64, previous);
+            assert_eq!(heap.show_held(), 0);
+            heap.mirror_shader_read(0, page as u64);
+            assert_eq!(heap.ready[0].load(Ordering::Acquire), previous);
+            crate::watch::tests::free(page);
+        }
     }
 
     #[test]

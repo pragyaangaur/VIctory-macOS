@@ -3,7 +3,7 @@
 //! VIctory-7900XTX at 9576c45f, after beloooo's constant). On with
 //! `VICTORY_AMBIENT=estimate` (or `estimate:<share>`), beside the constant
 //! stand-in of `crate::ambient` (`VICTORY_AMBIENT=1`), which it leaves as it
-//! is; off, nothing here runs.
+//! is. The estimate is also the default when the BVH builder is disabled.
 //!
 //! The constant stand-in gives every point of the picture one light: far
 //! too little outdoors by day, flat grey indoors. This one works the light
@@ -46,8 +46,8 @@
 //!
 //! What differs from the fork's file, for this line (as `crate::ambient`
 //! differs from Belobug's):
-//! - The mode is chosen by `VICTORY_AMBIENT=estimate[:<share>]`; in the
-//!   fork a number alone is the share and `constant:<level>` the constant.
+//! - `VICTORY_AMBIENT=estimate[:<share>]` selects the estimate explicitly.
+//!   In the fork a number alone is the share and `constant:<level>` the constant.
 //! - The root signatures are built in code, and the shader keeps to what
 //!   Wine's compiler takes (`crate::ambient_estimate_set::SOURCE`).
 //! - The passes have a view heap of their own, made with other threads'
@@ -99,8 +99,7 @@ fn var(name: &str) -> Option<String> {
 /// The share of the estimate asked for (`VICTORY_AMBIENT=estimate` or
 /// `estimate:<share>`), if the estimate is. Read once.
 fn share() -> Option<f32> {
-    static SHARE: OnceLock<Option<f32>> = OnceLock::new();
-    *SHARE.get_or_init(|| set::share(var("VICTORY_AMBIENT").as_deref()))
+    crate::ray_settings::ambient().estimate_share
 }
 
 /// Whether the stand-in is the estimate.

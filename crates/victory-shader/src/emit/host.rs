@@ -1475,6 +1475,8 @@ pub enum View<'a> {
     Levels(u32, u32),
     /// A raw buffer UAV of this many dwords, zeroed.
     RawUav(u32),
+    /// A raw buffer UAV initialized with these dwords.
+    RawUavData(&'a [u32]),
     /// An RGBA32F texture UAV (width, height), zeroed.
     TextureUav(u32, u32),
     /// An R32_UINT texture UAV (width, height), zeroed (atomics).
@@ -1529,7 +1531,7 @@ pub fn view_strides(views: &[View]) -> Vec<u32> {
     views
         .iter()
         .map(|v| match *v {
-            View::Buffer { stride: Stride::Raw, .. } | View::RawUav(_) => 4,
+            View::Buffer { stride: Stride::Raw, .. } | View::RawUav(_) | View::RawUavData(_) => 4,
             View::Buffer { stride: Stride::Typed, .. } => 16,
             View::Buffer { stride: Stride::Structured(n), .. } => n,
             View::Buffer { stride: Stride::Format(f, n), .. } | View::TypedUav(f, _, n) => n | kind(f),
@@ -1982,12 +1984,13 @@ impl Host {
                         dev.CreateShaderResourceView(&b, Some(&desc), at);
                         keep.push(b);
                     }
-                    View::Memory(_) | View::NullPair => {
-                        let n = match *v {
-                            View::Memory(data) => data.len() as u32,
-                            _ => 0,
+                    View::RawUavData(_) | View::Memory(_) | View::NullPair => {
+                        let data = match *v {
+                            View::RawUavData(data) | View::Memory(data) => Some(data),
+                            _ => None,
                         };
-                        let b = if let View::Memory(data) = *v {
+                        let n = data.map_or(0, |d| d.len() as u32);
+                        let b = if let Some(data) = data {
                             let bytes = u64::from(n) * 4;
                             let b = make(
                                 D3D12_HEAP_TYPE_DEFAULT,
@@ -2029,10 +2032,12 @@ impl Host {
                                 },
                             },
                         };
-                        let mut next = at;
-                        next.ptr += view_size;
-                        dev.CreateShaderResourceView(b.as_ref(), Some(&srv), at);
-                        dev.CreateUnorderedAccessView(b.as_ref(), None, Some(&uav), next);
+                        let mut uav_at = at;
+                        if !matches!(v, View::RawUavData(_)) {
+                            dev.CreateShaderResourceView(b.as_ref(), Some(&srv), at);
+                            uav_at.ptr += view_size;
+                        }
+                        dev.CreateUnorderedAccessView(b.as_ref(), None, Some(&uav), uav_at);
                         if let Some(b) = b {
                             let rb = make(
                                 D3D12_HEAP_TYPE_READBACK,

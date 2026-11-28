@@ -109,6 +109,14 @@ pub(super) struct PredicatePlan {
     pub(super) early_conts: Map<usize, usize>,
     /// Trivial `End` blocks bypassed by at least one `EarlyOut`.
     pub(super) skipped_ends: Set<usize>,
+    /// Scalar-buffer reads whose results codegen must publish to both halves.
+    pub(super) scalar_publications: Set<Site>,
+    /// Common SCC branches, established before assuming any publication.
+    publication_scc: Set<usize>,
+    /// Original immediate postdominators, before flattening any branch.
+    original_ipdom: Vec<Option<usize>>,
+    /// First-lane sites physically reached by a single guest thread.
+    pub(super) owner: Option<terminal_owner::Owner>,
     /// Updated `in_step` vector reflecting predicated control flow.
     pub(super) step: Vec<bool>,
 }
@@ -131,6 +139,10 @@ impl PredicatePlan {
             idom: Vec::new(),
             early_conts: Map::default(),
             skipped_ends: Set::default(),
+            scalar_publications: Set::default(),
+            publication_scc: Set::default(),
+            original_ipdom: Vec::new(),
+            owner: None,
             step,
         }
     }
@@ -148,6 +160,8 @@ impl PredicatePlan {
         base_step: Vec<bool>,
         one_wave_lds: bool,
         host_wave32: bool,
+        mapped_wave: Option<(&Parts, bool, &HashSet<Value>)>,
+        ticketed_group: Option<&Parts>,
     ) -> Self {
         let n = p.blocks.len();
         if n <= 1 {
@@ -166,24 +180,110 @@ impl PredicatePlan {
         let idom = crate::ir::idoms(&p.blocks, &order, &rpo);
 
         let mut plan = PredicatePlan {
-            exits: Map::default(),
-            in_diamond: Set::default(),
-            diamond_joins: Map::default(),
-            skip_bodies: Map::default(),
-            skip_joins: Map::default(),
-            skipped_edges: Set::default(),
-            linear_merges: Set::default(),
-            lockstep_headers: Map::default(),
-            lockstep_exits: Map::default(),
-            in_lockstep_loop: Set::default(),
-            uniform_branches: Set::default(),
-            dead_blocks: Set::default(),
             idom,
-            early_conts: Map::default(),
-            skipped_ends: Set::default(),
-            step: base_step,
+            ..Self::empty(base_step)
         };
         let mut eff_exits = st.exits.clone();
+        // Each latch uses the same lowered counter at its header. A complete,
+        // mapped console wave can prove both latch choices from scalar
+        // broadcasts. Recheck participation after each CFG transformation.
+        let owner = ticketed_group.and_then(|x| terminal_owner::find(x, &order));
+        let wave = mapped_wave
+            .map(|x| (x, two_latch_blocks(p, &rpo)))
+            .filter(|(_, blocks)| !blocks.is_empty())
+            .map(|((x, tickets, first_alone), blocks)| {
+                let res = x.res;
+                // These fixed-address loads lower to data embedded in the
+                // program or supplied as dispatch root constants.
+                let immutable = res
+                    .scalar
+                    .iter()
+                    .filter_map(|&(site, address)| {
+                        (matches!(address.param, CODE | USER_DATA) && address.dynamic.is_none())
+                            .then_some(site)
+                    })
+                    .collect();
+                let before = blocks
+                    .iter()
+                    .map(|&b| rpo[b])
+                    .min()
+                    .expect("nonempty loops");
+                let buffers = if tickets {
+                    fixed_scalar_buffers(x, |kind| kind == ResourceType::Srv)
+                        .filter(|((b, _), ..)| rpo[*b] < before)
+                        .map(|(site, offset, ..)| (site, offset))
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+                let per_lane = res.waterfall.reads.iter().chain(first_alone).copied().collect();
+                (per_lane, blocks, immutable, buffers)
+            });
+        let update_step = |plan: &mut PredicatePlan, exits: &[LaneExit]| {
+            let mut step = barriers::in_step_with(p, st, exits, &plan.uniform_branches);
+            if let Some((per_lane, loop_blocks, immutable, buffers)) = &wave {
+                plan.scalar_publications.clear();
+                let analyze = |plan: &Self| {
+                    barriers::step_and_cap_with(
+                        p,
+                        st,
+                        exits,
+                        &plan.uniform_branches,
+                        true,
+                        Some(barriers::WaveReads {
+                            plan,
+                            per_lane,
+                            immutable,
+                            loop_blocks,
+                            base_step: &step,
+                        }),
+                    )
+                };
+                // Establish arrival and offset without any published-value facts.
+                let (mut wave_step, _, alike) = analyze(plan);
+                plan.publication_scc = plan
+                    .exits
+                    .keys()
+                    .copied()
+                    .filter(|&d| {
+                        let Some(branch) = p.blocks[d].insts.last() else {
+                            return false;
+                        };
+                        let LaneExit::Branch { when, .. } = st.exits[d] else {
+                            return false;
+                        };
+                        let (lo, hi) = match branch.name() {
+                            "s_cbranch_scc0" => (Bool::TRUE, Bool::FALSE),
+                            "s_cbranch_scc1" => (Bool::FALSE, Bool::TRUE),
+                            _ => return false,
+                        };
+                        branch.read(Reg::Scc).is_some_and(|v| {
+                            alike.contains(&v)
+                                && st.bools.node(when) == Some((Atom::Uniform(v), lo, hi))
+                        })
+                    })
+                    .collect();
+                for &(site @ (b, _), offset) in buffers {
+                    if step[b]
+                        && wave_step[b]
+                        && !plan.dead_blocks.contains(&b)
+                        && offset.is_none_or(|v| alike.contains(&v))
+                    {
+                        plan.scalar_publications.insert(site);
+                    }
+                }
+                if !plan.scalar_publications.is_empty() {
+                    wave_step = analyze(plan).0;
+                }
+                for &b in loop_blocks {
+                    step[b] |= wave_step[b];
+                }
+            }
+            step
+        };
+        if wave.is_some() {
+            plan.step = update_step(&mut plan, &eff_exits);
+        }
 
         // Iteratively predicate eligible divergent branches and loops whose
         // regions contain candidate blocks needing `in_step`.
@@ -191,9 +291,16 @@ impl PredicatePlan {
             let mut changed = false;
             let pdom = post_dominators(&eff_exits);
             let ipdom = immediate_post_dominators(&eff_exits, &pdom);
+            if wave.is_some() && plan.exits.is_empty() {
+                plan.original_ipdom.clone_from(&ipdom);
+            }
 
             for &d in &order {
-                if !plan.step[d] || plan.exits.contains_key(&d) || plan.dead_blocks.contains(&d) {
+                if owner.as_ref().is_some_and(|o| o.gate == d)
+                    || !plan.step[d]
+                    || plan.exits.contains_key(&d)
+                    || plan.dead_blocks.contains(&d)
+                {
                     continue;
                 }
                 let LaneExit::Branch {
@@ -224,8 +331,7 @@ impl PredicatePlan {
                     }) {
                         plan.dead_blocks.insert(end_blk);
                     }
-                    plan.step =
-                        barriers::in_step_with(p, st, &eff_exits, &plan.uniform_branches);
+                    plan.step = update_step(&mut plan, &eff_exits);
                     changed = true;
                     break;
                 }
@@ -250,8 +356,7 @@ impl PredicatePlan {
                     plan.skip_joins.insert(join, d);
                     plan.skipped_edges.insert((d, join));
                     eff_exits[d] = LaneExit::Jump(body);
-                    plan.step =
-                        barriers::in_step_with(p, st, &eff_exits, &plan.uniform_branches);
+                    plan.step = update_step(&mut plan, &eff_exits);
                     changed = true;
                     break;
                 }
@@ -283,8 +388,7 @@ impl PredicatePlan {
                     }
                     plan.diamond_joins.insert(join, d);
                     plan.linear_merges.insert(join);
-                    plan.step =
-                        barriers::in_step_with(p, st, &eff_exits, &plan.uniform_branches);
+                    plan.step = update_step(&mut plan, &eff_exits);
                     changed = true;
                     break;
                 }
@@ -315,8 +419,7 @@ impl PredicatePlan {
                         plan.lockstep_exits.insert(exit, h);
                         plan.uniform_branches.insert(latch);
                         plan.in_lockstep_loop.extend(body);
-                        plan.step =
-                            barriers::in_step_with(p, st, &eff_exits, &plan.uniform_branches);
+                        plan.step = update_step(&mut plan, &eff_exits);
                         changed = true;
                         break;
                     }
@@ -351,8 +454,7 @@ impl PredicatePlan {
                         plan.lockstep_exits.insert(lp.exit, h);
                         plan.uniform_branches.insert(lp.exiting);
                         plan.in_lockstep_loop.extend(lp.body);
-                        plan.step =
-                            barriers::in_step_with(p, st, &eff_exits, &plan.uniform_branches);
+                        plan.step = update_step(&mut plan, &eff_exits);
                         changed = true;
                         break;
                     }
@@ -367,8 +469,112 @@ impl PredicatePlan {
         for &b in &plan.dead_blocks {
             plan.step[b] = false;
         }
+        if let Some(owner) = owner {
+            if !owner.preserved(p, st, &eff_exits, &plan) {
+                // Keep the established predicate plan when a rewrite would invalidate ownership.
+                return Self::build(p, st, barriers::in_step(p, st), one_wave_lds, host_wave32, mapped_wave, None);
+            }
+            plan.owner = Some(owner);
+        }
         plan
     }
+}
+
+/// A fixed buffer in the descriptor table and its scalar byte offset.
+/// Waterfalls can replace a scalar with lane-local data.
+pub(super) fn fixed_scalar_buffers<'a>(
+    x: &'a Parts,
+    accepts: fn(ResourceType) -> bool,
+) -> impl Iterator<Item = (Site, Option<Value>, Site, u8)> + 'a {
+    let addresses: Map<_, _> = x.res.scalar.iter().copied().collect();
+    x.res.descriptors.iter().filter_map(move |desc| {
+        let (b, i) = desc.site;
+        let inst = &x.p.blocks[b].insts[i];
+        if desc.role != Role::Resource || !inst.name().starts_with("s_buffer_load_dword") {
+            return None;
+        }
+        let Fields::Smem { cache, soffset, .. } = inst.fields else {
+            return None;
+        };
+        let Source::Loaded { load, first } = desc.source else {
+            return None;
+        };
+        let address = *addresses.get(&load)?;
+        let binding = table_kind(x.native, address, first)?;
+        if cache != Default::default()
+            || address.dynamic.is_some()
+            || x.res.waterfall.loads.contains(&load)
+            || !accepts(binding.kind)
+            || binding.dwords != 4
+            || !address.offset.is_multiple_of(4)
+            || address.offset / 4 + u32::from(first) != binding.table_offset_dwords
+        {
+            return None;
+        }
+        let offset = match soffset {
+            Operand::Scalar { code: NULL, .. } => None,
+            _ => Some(sgpr_operand(inst, soffset).filter(|v| !x.res.waterfall.reads.contains(v))?),
+        };
+        Some((desc.site, offset, load, first))
+    })
+}
+
+/// Natural loops with exactly two unconditional back edges to the same
+/// header. Structurisation already checked that the reachable CFG is reducible.
+fn two_latch_blocks(p: &Program, rpo: &[usize]) -> Set<usize> {
+    let mut blocks = Set::default();
+    for (header, block) in p.blocks.iter().enumerate() {
+        let mut back = block
+            .preds
+            .iter()
+            .copied()
+            .filter(|&q| rpo[q] != usize::MAX && rpo[q] >= rpo[header]);
+        let (Some(a), Some(b), None) = (back.next(), back.next(), back.next()) else {
+            continue;
+        };
+        if ![a, b]
+            .iter()
+            .all(|&q| p.blocks[q].exit == Exit::Jump(header))
+        {
+            continue;
+        }
+        let mut body = Set::from_iter([header]);
+        let mut stack = vec![a, b];
+        while let Some(q) = stack.pop() {
+            if body.insert(q) {
+                stack.extend(p.blocks[q].preds.iter().filter(|&&v| rpo[v] != usize::MAX));
+            }
+        }
+        blocks.extend(body);
+    }
+    blocks
+}
+
+/// Instructions that read a lane mask (not EXEC implicitly, not a lane's
+/// bit) as a number.
+pub(super) fn reads_mask_as_data(st: &Structured, i: &Inst) -> bool {
+    let is_mask = |v: Value| st.masks.contains_key(&v) || st.highs.contains_key(&v);
+    let ops: Vec<&Operand> = match &i.fields {
+        // A mask operation (its result a mask) is no data use.
+        Fields::Sop { .. }
+            if i.writes
+                .iter()
+                .any(|&(r, w)| matches!(r, Reg::S(_)) && is_mask(w)) =>
+        {
+            return false;
+        }
+        Fields::Sop { src, .. } => src.iter().collect(),
+        Fields::Valu(v)
+            if !matches!(i.name(), "v_cndmask_b32") && !i.name().contains("_co_ci_") =>
+        {
+            v.src.iter().collect()
+        }
+        _ => return false,
+    };
+    ops.into_iter().any(|op| match *op {
+        Operand::Scalar { code, .. } if code != NULL => i.read(Reg::S(code)).is_some_and(is_mask),
+        _ => false,
+    })
 }
 
 /// Blocks that contain an operation needing `in_step` in `halves` mode
@@ -1170,11 +1376,264 @@ fn immediate_post_dominators(exits: &[LaneExit], pdom: &[Vec<u64>]) -> Vec<Optio
         .collect()
 }
 
+/// A whole-pair copy, or the saved destination of AND_SAVEEXEC, can restore
+/// a known EXEC even when the instruction's narrowed EXEC depends on a phi.
+fn restored_publication_exec(
+    p: &Program,
+    st: &Structured,
+    idom: &[usize],
+    head: usize,
+    branch: &Inst,
+    direct: &Set<Value>,
+) -> Option<()> {
+    if !p.wave64 || st.literal || !matches!(branch.name(), "s_cbranch_execz" | "s_cbranch_execnz") {
+        return None;
+    }
+    let read_pair =
+        |inst: &Inst, code| Some((inst.read(Reg::S(code))?, inst.read(Reg::S(code + 1))?));
+    let mut code = EXEC;
+    let mut pair = read_pair(branch, code)?;
+    let mask = st.mask_bits(pair.0, Some(pair.1))?;
+    for b in std::iter::successors(Some(head), |&b| (b != 0).then(|| idom[b])) {
+        for inst in p.blocks[b].insts.iter().rev() {
+            // SSA identities require both dwords to come from this very
+            // definition. No phi or one-dword update can match the pair.
+            if inst.write(Reg::S(code)) != Some(pair.0)
+                || inst.write(Reg::S(code + 1)) != Some(pair.1)
+            {
+                continue;
+            }
+            let Fields::Sop {
+                dst:
+                    Some(Operand::Scalar {
+                        code: dst,
+                        dwords: 2,
+                    }),
+                src,
+                ..
+            } = &inst.fields
+            else {
+                return None;
+            };
+            if *dst != code {
+                return None;
+            }
+            code = match (inst.name(), src.as_slice()) {
+                (
+                    "s_mov_b64",
+                    [
+                        Operand::Scalar {
+                            code: from @ (0..=104 | EXEC),
+                            dwords: 2,
+                        },
+                    ],
+                ) => *from,
+                ("s_and_saveexec_b64", _) if code <= 104 => EXEC,
+                _ => return None,
+            };
+            pair = read_pair(inst, code)?;
+            if code == EXEC && direct.contains(&pair.0) && direct.contains(&pair.1) {
+                return (st.mask_bits(pair.0, Some(pair.1)) == Some(mask)).then_some(());
+            }
+        }
+    }
+    None
+}
+
+/// Check the guest branches after identifying the flattened bodies supplying activity.
+pub(in crate::emit) fn publication_gates(
+    p: &Program,
+    st: &Structured,
+    gates: &[(usize, usize)],
+    common_scc: &Set<usize>,
+    idom: &[usize],
+) -> bool {
+    // BDD simplification can erase a mask phi. Walk the actual SSA operands
+    // on the proved path; a phi never establishes a wave-wide predecessor.
+    let mut direct: Set<_> = p.inputs.iter().map(|&(_, v)| v).collect();
+    let exact_bits = |m, direct: &Set<Value>| {
+        st.bools.support(m).into_iter().all(|atom| match atom {
+            Atom::Lane(v) => direct.contains(&v),
+            Atom::Constant(_) => true,
+            _ => false,
+        })
+    };
+    let mut outer = None;
+    let mut enclosing = Vec::new();
+    for &(body, d) in gates {
+        let LaneExit::Branch {
+            when,
+            taken,
+            not_taken,
+        } = st.exits[d]
+        else {
+            return false;
+        };
+        let head = &p.blocks[d];
+        for (i, inst) in head.insts.iter().enumerate() {
+            // WQM of the original full wave is an identity; the compute
+            // emitter approximates expansion of any other mask.
+            let full_wqm = || {
+                matches!(inst.reads.as_slice(), [lo, hi] if
+                lo.0 == Reg::S(EXEC) && hi.0 == Reg::S(EXEC + 1)
+                && p.inputs.contains(lo) && p.inputs.contains(hi))
+            };
+            if inst.reads.iter().all(|(_, v)| direct.contains(v))
+                && st.guards[d][i].is_none_or(|g| exact_bits(g, &direct))
+                && (inst.name() != "s_wqm_b64" || full_wqm())
+            {
+                direct.extend(inst.writes.iter().map(|&(_, v)| v));
+            }
+        }
+        let Some(branch) = head.insts.last() else {
+            return false;
+        };
+        if !branch.reads.iter().all(|(_, v)| direct.contains(v))
+            && restored_publication_exec(p, st, idom, d, branch, &direct).is_none()
+        {
+            return false;
+        }
+        let taken_edge = body == taken;
+        if !common_scc.contains(&d) {
+            let nonempty = match branch.name() {
+                "s_cbranch_execz" => not_taken,
+                "s_cbranch_execnz" => taken,
+                _ => return false,
+            };
+            if body != nonempty {
+                return false;
+            }
+            let mask = branch
+                .read(Reg::S(EXEC))
+                .zip(branch.read(Reg::S(EXEC + 1)))
+                .and_then(|(lo, hi)| st.mask_bits(lo, Some(hi)));
+            let Some(mask) = mask else { return false };
+            // Quad approximates expansion and Phi selects by lane in normal
+            // code. Neither is an exact source for a wave-wide EXEC visit.
+            if !exact_bits(mask, &direct) || !exact_bits(when, &direct) {
+                return false;
+            }
+            // A disjoint restored EXEC could enter a nested guest arm
+            // even though no lane meets both flattened edge predicates.
+            if outer.is_some_and(|m| st.bools.meet(&[(mask, true), (m, false)])) {
+                return false;
+            }
+            // The structurizer can simplify an exit using lane reachability.
+            // It must still match the full EXEC bit on the inherited mask.
+            let mismatch = |exec, edge| {
+                st.bools
+                    .meet(&[enclosing.as_slice(), &[(mask, exec), (when, edge)]].concat())
+            };
+            if mismatch(true, !taken_edge) || mismatch(false, taken_edge) {
+                return false;
+            }
+            outer = Some(mask);
+        }
+        enclosing.push((when, taken_edge));
+    }
+    true
+}
+
 impl Lower<'_> {
     /// Per-lane active predicate for IR block `b`, if `b` executes under
     /// predication (`None` means all lanes in the workgroup are active).
     pub(super) fn pred_active(&self, b: usize) -> Option<V> {
         self.block_active.get(b).copied().flatten()
+    }
+
+    /// Find the single-entry body supplying this block's emitted predicate.
+    /// Through intervening merges it must also dominate the block, which
+    /// must postdominate the body: every original surviving visit gets here.
+    fn scalar_publication_guard(&self, b: usize) -> Option<(usize, usize)> {
+        let active = self.pred_active(b)?;
+        let plan = &self.pred;
+        let mut dominators = std::iter::successors(Some(b), |&q| (q != 0).then(|| plan.idom[q]));
+        let (body, head) = dominators.find_map(|q| {
+            let d = plan
+                .early_conts
+                .get(&q)
+                .or_else(|| plan.skip_bodies.get(&q))?;
+            Some((q, *d))
+        })?;
+        if self.x.p.blocks[body].preds != [head]
+            || self.pred_edge_active.get(&(head, body)) != Some(&active)
+            || self.on_cycle(b)
+        {
+            return None;
+        }
+        if body != b {
+            let postdominators = std::iter::successors(Some(body), |&q| plan.original_ipdom[q]);
+            if self.pred_active(body) != Some(active)
+                || self.on_cycle(body)
+                || !postdominators.take(plan.idom.len()).any(|q| q == b)
+            {
+                return None;
+            }
+        }
+        Some((body, head))
+    }
+
+    fn proved_scalar_visit(&self, mut b: usize) -> bool {
+        let mut gates = Vec::new();
+        while b != 0 {
+            let Some((body, d)) = self.scalar_publication_guard(b) else {
+                return false;
+            };
+            gates.push((body, d));
+            b = d;
+        }
+        gates.reverse();
+        publication_gates(
+            self.x.p,
+            self.x.st,
+            &gates,
+            &self.pred.publication_scc,
+            &self.pred.idom,
+        )
+    }
+
+    pub(super) fn published_scalar_words(
+        &mut self,
+        h: V,
+        mut addr: V,
+        count: u32,
+    ) -> Result<Vec<V>, Why> {
+        if !self.across_here() {
+            return Err("a scalar-buffer publication outside converged instruction control flow");
+        }
+        let active = self.pred_active(self.cur_ir);
+        let visit = if let Some(act) = active {
+            if self.x.st.literal || !self.proved_scalar_visit(self.cur_ir) {
+                return Err(
+                    "a scalar-buffer publication without a proved predicated address or visit",
+                );
+            }
+            // Inactive lanes need not hold the guest address. Broadcast an
+            // actual visitor's common byte offset before all lanes load it.
+            if self.s.m.int_value(addr).is_none() {
+                addr = self.first_lane_across(addr, Some(act))?;
+            }
+            Some(self.group_any_true(act, self.cur)?)
+        } else {
+            None
+        };
+        let guard = self.begin_guarded(visit);
+        let load_block = self.cur;
+        let mut words = self.raw_run(h, addr, count);
+        if self.cur != load_block {
+            return Err("a scalar-buffer publication through a guarded raw view");
+        }
+        // Both ticketed halves enter together, including logical lane zero
+        // when its EXEC bit is clear. SALU takes its value for each component.
+        for x in &mut words {
+            *x = self.first_lane_across(*x, None)?;
+        }
+        if guard.is_some() {
+            let zero = self.s.m.i32(0);
+            let pairs: Vec<_> = words.into_iter().map(|x| (x, zero)).collect();
+            words = self.end_guarded(guard, &pairs);
+        }
+        Ok(words)
     }
 
     /// Computes `self.block_active[b]` at the start of IR block `b` (when

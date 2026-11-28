@@ -936,6 +936,12 @@ unsafe fn report(what: &str, info: *const EXCEPTION_POINTERS, to_file: bool) {
     let (record, context) = unsafe { (&*(*info).ExceptionRecord, &*(*info).ContextRecord) };
     let code = record.ExceptionCode;
     let at = record.ExceptionAddress as usize;
+    #[cfg(feature = "diagnostics")]
+    let pool = (what == "first-chance exception" && code == EXCEPTION_BREAKPOINT)
+        .then(|| crate::pool::windows::first_fault(at, context))
+        .flatten();
+    #[cfg(feature = "diagnostics")]
+    let to_file = to_file || pool.is_some();
     let p = record.ExceptionInformation;
     let detail = if code == EXCEPTION_ACCESS_VIOLATION {
         let kind = match p[0] {
@@ -966,6 +972,10 @@ unsafe fn report(what: &str, info: *const EXCEPTION_POINTERS, to_file: bool) {
         code as u32,
         locate(at)
     ));
+    #[cfg(feature = "diagnostics")]
+    if let Some(pool) = pool {
+        line(format!("  {pool}"));
+    }
     line(format!(
         "  rax {:#x} rbx {:#x} rcx {:#x} rdx {:#x} rsi {:#x} rdi {:#x} rsp {:#x} rbp {:#x}",
         context.Rax,
@@ -1300,6 +1310,12 @@ unsafe fn dump_title_registry(context: &CONTEXT) {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "diagnostics")]
+    #[test]
+    fn first_pool_fault_preserves_dispatch() {
+        crate::pool::windows::tests::check_dispatch(super::handler);
+    }
+
     use super::*;
 
     #[test]

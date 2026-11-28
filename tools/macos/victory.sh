@@ -25,14 +25,23 @@ if [ -z "${WINE:-}" ]; then
     [ -x "$WINE" ] || WINE="$HOME/Library/Caches/victory-macos/target/wine-cx/bin/wine"
 fi
 [ -x "$WINE" ] || { echo "no Wine at $WINE: run tools/macos/build-crossover-wine.sh first" >&2; exit 1; }
-[ -d "$(dirname "$WINE")/../lib/external/D3DMetal.framework" ] || {
-    echo "D3DMetal is missing: copy the redist/lib folder of Apple's evaluation environment over $(dirname "$WINE")/../lib" >&2
+. tools/macos/gptk-version.sh
+FRAMEWORK="$(dirname "$WINE")/../lib/external/D3DMetal.framework"
+if [ ! -d "$FRAMEWORK" ]; then
+    echo "D3DMetal is missing at $FRAMEWORK. Run ./setup.sh with Apple's Game Porting Toolkit." >&2
     exit 1
-}
+fi
+if ! version=$(gptk_framework_version "$FRAMEWORK"); then
+    version="unreadable ($FRAMEWORK/Resources/Info.plist)"
+fi
+if ! gptk_version_supported "$version"; then
+    echo "D3DMetal version $version is unsupported. Set GPTK_DMG to an Apple Game Porting Toolkit .dmg with D3DMetal 4.0b3 or newer and run ./setup.sh." >&2
+    exit 1
+fi
 # The 64-thread argument clamp is compiled at build time with the DXC that
 # D3DMetal ships: CrossOver's own compiler refuses it, and without it the
 # one-thread form runs instead. A VICTORY_HELPER_DXC already set wins.
-DXC_LIB="$(dirname "$WINE")/../lib/external/D3DMetal.framework/Versions/A/Resources/libdxcompiler.dylib"
+DXC_LIB="$FRAMEWORK/Versions/A/Resources/libdxcompiler.dylib"
 if [ -z "${VICTORY_HELPER_DXC:-}" ] && [ -f "$DXC_LIB" ]; then
     # A build product of this checkout, as its target/ holds them.
     helper="$ROOT/target/dxc-d3dmetal"

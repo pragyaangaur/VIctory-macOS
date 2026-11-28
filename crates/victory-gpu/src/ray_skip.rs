@@ -1,15 +1,14 @@
 //! Ray passes left out while nothing builds the ray-tracing structures
-//! (`VICTORY_RAY_SKIP`, off by default). The idea is cool_fox's
+//! (`VICTORY_RAY_SKIP`). The idea is cool_fox's
 //! (codec-d/cool_fox 8cc31ab3, `pipeline/make.rs` `left_out`); the code is
 //! this line's own. Plain std, so its tests run everywhere.
 //!
 //! The title traces its reflections and the rays of its screen probes
 //! against structures that its builder (`XboxBvhBuilder.dll`) makes every
-//! frame. This line holds the builder back in every frame where it cannot
-//! run whole (`crate::pipeline::held_back`, upstream #2118), and always
-//! with `VICTORY_HALVES_LOCAL=1` or `VICTORY_HALVES_SHARED_LDS=1`. Then the
-//! traces run against structures that were never built, and two kinds of
-//! programs work on what they find:
+//! frame. This line holds the builder back by default and in every frame
+//! where it cannot run whole (`crate::pipeline::held_back`, upstream #2118).
+//! Traces can then run against structures that were never built, and two
+//! kinds of programs work on what they find:
 //!
 //! - `CS_RaytracingResolve_*` (technique `raytracingresolve_dispatch`, one
 //!   program per material effect; 1,000 in the title's shader file): each
@@ -57,8 +56,8 @@
 //!
 //! `VICTORY_RAY_SKIP=1` (or `on`, `all`): both; `resolve`: the resolves
 //! only; `activate`: the activation only (`resolve,activate` is both).
-//! Unset, empty, `0` or `off`: nothing is left out and nothing here runs
-//! but one check of a stored value per container and per pipeline.
+//! Unset: skip only the resolves if the builder is disabled, or skip
+//! nothing if it is opted in. Empty, `0` or `off`: skip nothing.
 
 // Used by `crate::pipeline` and `crate::draw`, which are only built for
 // Windows.
@@ -100,15 +99,23 @@ fn parts(value: Option<&str>) -> (u8, bool) {
     (parts, true)
 }
 
+fn configured_parts(value: Option<&str>, builder_enabled: bool) -> (u8, bool) {
+    if value.is_none() && !builder_enabled {
+        return (RESOLVE, true);
+    }
+    parts(value)
+}
+
 /// The parts that are on, read once.
 pub(crate) fn on() -> u8 {
     static ON: OnceLock<u8> = OnceLock::new();
     *ON.get_or_init(|| {
-        let value = std::env::var("VICTORY_RAY_SKIP").ok();
-        let (on, understood) = parts(value.as_deref());
+        let value = std::env::var_os("VICTORY_RAY_SKIP");
+        let value = value.as_deref().map(|v| v.to_str().unwrap_or_default());
+        let (on, understood) = configured_parts(value, crate::ray_settings::builder_enabled());
         if !understood {
             tracing::warn!(
-                value = value.as_deref().unwrap_or_default(),
+                value = value.unwrap_or_default(),
                 "VICTORY_RAY_SKIP takes 1, resolve or activate: nothing is left out"
             );
         }
@@ -244,6 +251,29 @@ pub(crate) fn log(frames: f64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unset_skips_only_resolves_with_the_builder_disabled() {
+        assert_eq!(configured_parts(None, false), (RESOLVE, true));
+        assert_eq!(configured_parts(None, true), (0, true));
+    }
+
+    #[test]
+    fn explicit_skip_parts_override_either_default() {
+        for builder_enabled in [false, true] {
+            for (value, mask, understood) in [
+                ("", 0, true),
+                ("0", 0, true),
+                ("off", 0, true),
+                ("resolve", RESOLVE, true),
+                ("activate", ACTIVATE, true),
+                ("all", RESOLVE | ACTIVATE, true),
+                ("yes", 0, false),
+            ] {
+                assert_eq!(configured_parts(Some(value), builder_enabled), (mask, understood), "{value:?}");
+            }
+        }
+    }
 
     #[test]
     fn the_switch_names_its_parts() {

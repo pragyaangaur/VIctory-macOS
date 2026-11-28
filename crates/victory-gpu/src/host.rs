@@ -5417,7 +5417,7 @@ impl HostList {
 }
 
 /// A submission's refreshes not done yet, as the ranges of each buffer copy
-/// asked for (ranges less than [`JOIN`] apart are done as one): done before
+/// asked for (nearby ranges may join across a gap of up to [`JOIN`]): done before
 /// a step that writes title memory or gives a range to shaders, and before
 /// the lists run.
 ///
@@ -5583,7 +5583,8 @@ impl Batch {
         // a title copy took a few bytes of it.
         let empty = crate::ranges::Ranges::default();
         let have = self.current.get(&key).map_or(&empty, |(_, have)| have);
-        let mut todo = have.missing(address, end).peekable();
+        let (missing, join) = have.plan_refresh(address, end, JOIN, crate::watch::fault_tracking());
+        let mut todo = missing.peekable();
         if todo.peek().is_none() {
             // Already current: what a later list asked again, and what
             // #259 keeps current across its moves.
@@ -5607,7 +5608,7 @@ impl Batch {
             }
         };
         for (from, to) in todo {
-            self.refreshes[i].1.insert(from, to, JOIN);
+            self.refreshes[i].1.insert(from, to, join);
         }
     }
 

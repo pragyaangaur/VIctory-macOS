@@ -85,7 +85,9 @@ pub mod queue;
 // Plain std, so its tests run everywhere.
 #[cfg(any(windows, test))]
 mod ranges;
-// Plain std, so its tests run everywhere.
+// Plain std, so these policies' tests run everywhere.
+#[cfg(any(windows, test))]
+mod ray_settings;
 #[cfg(any(windows, test))]
 mod ray_skip;
 #[cfg(any(windows, test))]
@@ -108,6 +110,8 @@ mod tdr;
 mod texback;
 #[cfg(windows)]
 mod texture;
+#[cfg(any(windows, test))]
+mod texture_rows;
 // Plain std, so its tests run everywhere.
 #[cfg(any(windows, test))]
 mod timing_cuts;

@@ -159,9 +159,8 @@ fn bias_as_gradients() -> bool {
 
 /// Whether translations take wave64 programs to run in 32-lane host waves:
 /// under Wine, whose D3DMetal reports 32 lanes and ignores `WaveSize(64)`.
-/// `VICTORY_NARROW_WAVES=0` or `1` overrides. Also what the offline
-/// `translate --wave32` follows, so its results match `run`'s.
-pub fn narrow_waves() -> bool {
+/// `VICTORY_NARROW_WAVES=0` or `1` overrides.
+fn narrow_waves() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| match std::env::var("VICTORY_NARROW_WAVES").as_deref() {
         Ok("0") => false,
@@ -339,6 +338,16 @@ pub(crate) fn translation_build(options: victory_shader::emit::Options) -> &'sta
 }
 
 pub(crate) fn runtime_options() -> victory_shader::emit::Options {
+    base_options(host_wave32(), uav_size_level0())
+}
+
+/// Runtime translation settings for a container and a known host wave width.
+/// Offline diagnostics can supply the wave width without opening a GPU device.
+pub fn translation_options(container: &[u8], host_wave32: bool) -> victory_shader::emit::Options {
+    base_options(host_wave32, uav_size_level0_for(container))
+}
+
+fn base_options(host_wave32: bool, uav_size_level0: bool) -> victory_shader::emit::Options {
     // Writes through views mark their pages: copy-backs compare only those
     // (`crate::shadow::copy_back_marks`).
     // Under Wine (D3DMetal), 64-bit image atomics run under locks: its own
@@ -350,11 +359,11 @@ pub(crate) fn runtime_options() -> victory_shader::emit::Options {
         atomic_lock_rounds: atomic_lock_rounds(),
         atomic_umax: atomic_umax(),
         bias_as_gradients: bias_as_gradients(),
-        host_wave32: host_wave32(),
+        host_wave32,
         narrow_waves: narrow_waves(),
         disable_literal_halves: literal_halves_disabled(),
         per_vertex_center: false,
-        uav_size_level0: uav_size_level0(),
+        uav_size_level0,
         halves_rendezvous: halves_rendezvous(),
         // Only for the pipelines a dispatch counted in threads needs it
         // for (`crate::pipeline::thread_limited`).
@@ -371,9 +380,8 @@ pub fn host_shader(container: &[u8]) -> (Result<HostShader, String>, bool) {
 /// [`host_shader`] made as `options` say (cached under their own key).
 pub(crate) fn host_shader_with(
     container: &[u8],
-    options: victory_shader::emit::Options,
+    mut options: victory_shader::emit::Options,
 ) -> (Result<HostShader, String>, bool) {
-    let mut options = options;
     // One program at a time, if the switch lists hashes.
     options.uav_size_level0 = uav_size_level0_for(container);
     let translate =
@@ -864,20 +872,85 @@ mod tests {
     }
 
     #[test]
-    fn disabling_literal_halves_changes_the_translation_key() {
-        let options = victory_shader::emit::Options {
+    fn translation_settings_invalidate_cached_shaders() {
+        use victory_shader::emit::Options;
+
+        let base = Options {
             host_wave32: true,
-            ..runtime_options()
+            halves_rendezvous: true,
+            ..Options::default()
         };
-        let on = translation_build(victory_shader::emit::Options {
-            disable_literal_halves: false,
-            ..options
-        });
-        let off = translation_build(victory_shader::emit::Options {
-            disable_literal_halves: true,
-            ..options
-        });
-        assert_ne!(on, off);
+        for (name, options) in [
+            (
+                "atomic locks",
+                Options {
+                    atomic_locks: true,
+                    ..base
+                },
+            ),
+            (
+                "bias as gradients",
+                Options {
+                    bias_as_gradients: true,
+                    ..base
+                },
+            ),
+            (
+                "narrow waves",
+                Options {
+                    narrow_waves: true,
+                    ..base
+                },
+            ),
+            (
+                "literal halves",
+                Options {
+                    disable_literal_halves: true,
+                    ..base
+                },
+            ),
+            (
+                "UAV size level 0",
+                Options {
+                    uav_size_level0: true,
+                    ..base
+                },
+            ),
+            (
+                "halves rendezvous",
+                Options {
+                    halves_rendezvous: false,
+                    ..base
+                },
+            ),
+            (
+                "thread limits",
+                Options {
+                    thread_limits: true,
+                    ..base
+                },
+            ),
+        ] {
+            assert_ne!(
+                translation_build(base),
+                translation_build(options),
+                "{name}"
+            );
+        }
+        let locks = Options {
+            atomic_locks: true,
+            ..base
+        };
+        let rounds = Options {
+            atomic_lock_rounds: true,
+            ..locks
+        };
+        let umax = Options {
+            atomic_umax: true,
+            ..rounds
+        };
+        assert_ne!(translation_build(locks), translation_build(rounds));
+        assert_ne!(translation_build(rounds), translation_build(umax));
     }
 
     fn shader() -> HostShader {

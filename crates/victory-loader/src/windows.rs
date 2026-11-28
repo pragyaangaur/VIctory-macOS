@@ -24,6 +24,8 @@ use crate::{
 #[derive(Debug, Clone)]
 pub struct LoadedImage {
     module: HMODULE,
+    #[cfg(feature = "diagnostics")]
+    pub(crate) original_hash: blake3::Hash,
     path: PathBuf,
     info: ImageInfo,
 }
@@ -76,6 +78,8 @@ pub fn load(prepared: &PreparedImage, dir: &Path) -> Result<LoadedImage> {
     }
     let loaded = LoadedImage {
         module,
+        #[cfg(feature = "diagnostics")]
+        original_hash: prepared.original_hash,
         path,
         info: prepared.info.clone(),
     };

@@ -35,7 +35,7 @@ WINE="/Applications/Game Porting Toolkit.app/Contents/Resources/wine/bin/wine64"
 
 ## CrossOver Wine with D3DMetal, 24 November 2026
 
-`tools/macos/build-crossover-wine.sh` builds CodeWeavers' CrossOver 26.3 Wine (Wine 11.0) from its published source into `target/wine-cx`, using x86_64 FreeType and GnuTLS from `DEPS`. Copy the `redist/lib` folder of Apple's "Evaluation environment for Windows games" over `target/wine-cx/lib`, and run the tests with this command.
+`tools/macos/build-crossover-wine.sh` builds CodeWeavers' CrossOver 26.3 Wine (Wine 11.0) from its published source into `target/wine-cx`, using x86_64 FreeType and GnuTLS from `DEPS`. Apply a qualifying Game Porting Toolkit using the setup command below, then run the tests.
 
 ```sh
 WINEDLLOVERRIDES="d3d12,d3d12core,dxgi=b" tools/macos/test-wine.sh --workspace --no-fail-fast
@@ -49,7 +49,7 @@ On an M4 with D3DMetal 4.0 beta 3 this gives 260 passed, 4 failed and 4 ignored.
 
 After these fixes the whole suite passed under CrossOver Wine with D3DMetal on an M4: 343 passed, 0 failed and 4 ignored. After the merge of 25 November 2026 and the fixes below it gives 481 passed, 0 failed and 7 ignored.
 
-A Wine built with a macOS 27 SDK used to crash on macOS 26 at its first start, in `server_pipe`. Configure found `pipe2`, which only macOS 27 has (MarshallStunt, #50). Of the 33 functions Wine's configure checks for, it is the only one that macOS 27.0.1 exports and the macOS 26.5 SDK lacks. `build-crossover-wine.sh` now tells configure that `pipe2` is missing, and Wine falls back to `pipe` and `fcntl`. A Wine that crashes this way has to be built again: remove `target/crossover/build` and `target/wine-cx`, then run `./setup.sh`.
+A Wine built with a macOS 27 SDK used to crash on macOS 26 at its first start, in `server_pipe`. Configure found `pipe2`, which only macOS 27 has (MarshallStunt, #50). Of the 33 functions Wine's configure checks for, it is the only one that macOS 27.0.1 exports and the macOS 26.5 SDK lacks. `build-crossover-wine.sh` now tells configure that `pipe2` is missing, and Wine falls back to `pipe` and `fcntl`. For a Wine that crashes this way, move `target/crossover/build` aside and follow the full rebuild steps below.
 
 ## Run-time HLSL and textures under Wine and D3DMetal
 
@@ -118,6 +118,17 @@ Later work replaces the Windows host underneath the title. That needs a Rosetta 
 
 Run `./setup.sh` from the top of the repository. It checks the Mac, installs the Homebrew tools, builds checksum-verified x86_64 GMP, Nettle, GnuTLS, FreeType and SDL2, builds CrossOver Wine, adds D3DMetal from the Game Porting Toolkit in Downloads, and builds VIctory. The only manual step is downloading the toolkit from Apple. A clean run on an M4 on 24 November 2026 finished without help, and the full suite then passed (343 passed, 0 failed).
 
+The reference runtime requires **D3DMetal 4.0 beta 3 (`4.0b3`) or newer**. Setup and `tools/macos/victory.sh` read the installed framework version from its `Resources/Info.plist`. On a fresh installation, setup uses the newest Game Porting Toolkit disk image in Downloads. To refresh an existing installation, quit VIctory and Wine, sign in to [Apple Developer Downloads](https://developer.apple.com/download/all/?q=game%20porting%20toolkit), and select a qualifying image explicitly.
+
+```sh
+GPTK_DMG="$HOME/Downloads/Game_Porting_Toolkit_4.0_beta_3.dmg" ./setup.sh
+tools/macos/victory.sh gpu-check
+```
+
+Setup resolves a relative `GPTK_DMG` path from the directory where you invoke it. Setup validates the selected disk image and stages its redistributables in Wine's own directory. If extraction, validation, copying, or activation fails, setup keeps or restores the previous library directory. The toolkit refresh leaves saves and game caches alone. Rerunning setup with a supported toolkit, current Wine build and no `GPTK_DMG` reuses both.
+
+If a refresh was interrupted, first make sure setup has stopped. In `target/wine-cx`, if `lib` is missing and `.gptk-refresh/previous-lib` exists, restore it with `mv .gptk-refresh/previous-lib lib`. Once `lib` is in place, remove the leftover `.gptk-refresh` directory before retrying.
+
 ## CrossOver's Wine is patched
 
 `tools/macos/build-crossover-wine.sh` applies the patches in `tools/macos/patches` to CrossOver's source. One of them, `wineserver-view-tree.patch`, is UwUCammie's from fxceless/victory-fork#184 (see #155 and WineHQ bug 60868). Wine's server keeps a process's memory views in a list and walks the list on every map and unmap request. The patch also keeps them in a red-black tree by base address, so those requests take O(log n). The protocol is unchanged.
@@ -126,7 +137,9 @@ On an M5 Pro with 20,000 live views, the `wine_views` benchmark from #159 took 1
 
 The other, `ntdll-skip-host-mappings.patch`, is for thread creation. To find room for a new thread's stack, Wine's `try_map_free_area` tries an address and, if something is mapped there already, moves on by one 64 KiB granule. Memory that the host maps outside Wine, such as Metal's, looks free to Wine, so the search stepped through gigabytes of it one granule at a time, with `virtual_mutex` held. Every page fault, `VirtualQuery`, `VirtualProtect` and `GetWriteWatch` of the other threads waits for that lock. On an M3 Max with the Series S profile (`--console series-s`), each thread the title made took about 2.5 s, and the intro ran at 0.1 fps with frames of 7.6 s (#50, runs 65 to 68). Stack dumps showed one thread in `NtCreateThreadEx` → `virtual_alloc_thread_stack` → `map_view` → `try_map_free_area` → `mach_vm_map` in all twelve dumps, and the others waiting for `virtual_mutex`. With the patch, a failed address asks `mach_vm_region` for the mapping in the way and moves past it. Every address it skips overlaps that mapping, so no free area is missed. The same intro then ran at 20 to 30 fps, and the longest wait for the lock fell from 2.5 to 7 s to 27 ms (run 69). World frames with the Series X profile were unchanged (run 70): the title does not make threads there at that rate.
 
-`./setup.sh` compares the selected CrossOver release and patch stamp with `target/wine-cx/.victory-patches`. A release change or an old stamp without a release triggers a full install and reapplies D3DMetal. Within the same release, changes limited to `server/` and `dlls/ntdll/unix/` rebuild just the server, `ntdll.so` and `winebus.so`, preserving the existing D3DMetal overlay. Patches outside those paths trigger a full install.
+`./setup.sh` compares the selected CrossOver release and patch stamp with `target/wine-cx/.victory-patches`. Within the same release, changes limited to `server/` and `dlls/ntdll/unix/` rebuild just the server, `ntdll.so` and `winebus.so`, preserving the D3DMetal overlay.
+
+A release change, missing metadata or patches outside those paths require a full rebuild. Setup stops before changing the installed Wine or toolkit. Once you have a qualifying toolkit disk image, move `target/wine-cx` to a backup and run the `GPTK_DMG` setup command above. Keep the backup until `gpu-check` passes.
 
 ## Game controllers
 
@@ -361,15 +374,27 @@ None of these changes the default, except `VICTORY_OUTPUT`, which sets the title
 | `VICTORY_SILENT_AUDIO=1` | Routes title playback to VIctory's silent spatial-audio endpoint even when the host has an active output device, keeping the title's playback clock running during muted or automated runs. (Hosts without an active render device use the silent endpoint automatically.) |
 | `VICTORY_UAV_SIZE_LEVEL0=<hash>[,<hash>]` | Makes a size query on a writable image ask for level 0 in the listed programs (16-digit shader hashes, as the log prints them). D3DMetal answers the undefined level DXC writes with a size of 0, so the shadow min/max program `07f451a14b13fecb` writes one flat value and sun shadows get 16x16-tile edges; `VICTORY_UAV_SIZE_LEVEL0=07f451a14b13fecb` smooths them. `=1` does it in every program, which also gave speckles on skin, so the list is the one to try. |
 
-## An ambient light in place of ray-traced indirect light
+## Ray tracing and indirect light
 
-`VICTORY_AMBIENT=1` turns on a stand-in from Belobug's fork (`victory-gpu/src/ambient.rs`). It is off by default, and off it changes nothing. The game lights what the sun does not reach with probes it fills by tracing rays. Right after the game's program that resolves those probes (`CS_ScreenProbes_TemporalResolve_*`), a compute pass of VIctory's own replaces that program's output with an ambient light: the same everywhere in a frame, darker in creases and under objects (worked out from the depth image). By default its level and colour follow the sky dome the game draws for its reflections. After the game's last reflection pass (`CS_UpdateHistory`), a second pass of the same shader holds reflections to half of that light.
+By default VIctory suppresses dispatches from the title's BVH builder and skips `CS_RaytracingResolve_*` dispatches. Probe activation and other tracing shaders can still run. VIctory estimates indirect diffuse light from the frame and clamps reflections to half the local estimated light.
+
+For ray-tracing reference and acceptance runs, leave `VICTORY_AMBIENT` and `VICTORY_RAY_SKIP` unset and opt in to the builder when launching.
+
+```sh
+VICTORY_BVH_BUILDER=1 tools/macos/victory.sh run --execute "/path/to/game.exe"
+```
+
+Only the exact value `1` opts in. The builder runs in frames where all its host pipelines are ready. With the builder opted in, an unset `VICTORY_AMBIENT` leaves the game's lighting in place and an unset `VICTORY_RAY_SKIP` skips no ray passes. Explicit values override these defaults in either mode. An empty value, `0` or `off` disables the corresponding fallback. For `VICTORY_RAY_SKIP`, `resolve` selects the reflection-hit resolves, `activate` selects probe activation and `1` selects both. These skips apply only in frames where the builder is held back.
+
+### Constant ambient light
+
+`VICTORY_AMBIENT=1` turns on a stand-in from Belobug's fork (`victory-gpu/src/ambient.rs`). The game lights what the sun does not reach with probes it fills by tracing rays. Right after the game's program that resolves those probes (`CS_ScreenProbes_TemporalResolve_*`), a compute pass of VIctory's own replaces that program's output with an ambient light: the same everywhere in a frame, darker in creases and under objects (worked out from the depth image). By default its level and colour follow the sky dome the game draws for its reflections. After the game's last reflection pass (`CS_UpdateHistory`), a second pass of the same shader holds reflections to half of that light.
 
 VIctory logs one line at start when the switch is on, one line for each program it found by name, and one line the first time each part runs (`ambient light: the first image it writes`, `ambient light follows the sky dome`, `reflections held to the ambient light`). `no ambient light: ...` says why a pass did not run.
 
 | Variable | Effect |
 | --- | --- |
-| `VICTORY_AMBIENT=1` | Turns the stand-in on. Unset, empty, `0` and `off` leave the game's own output. |
+| `VICTORY_AMBIENT=1` | Selects the constant stand-in. Empty, `0` and `off` leave the game's own output. |
 | `VICTORY_AMBIENT_SKY=off` or `gain,least,power` | `off` keeps a constant level. Otherwise the level is `gain * mean^power + least` of the sky dome's mean (0.36, 0.05, 0.4). |
 | `VICTORY_AMBIENT_LEVEL=<level>` | The constant level (0.6), used while the light does not follow the sky. |
 | `VICTORY_AMBIENT_TINT=r,g,b` | The constant light's colour (1, 0.98, 0.94). |
@@ -383,7 +408,7 @@ The pass is compiled at run time, so under Wine its shader keeps to what Wine's 
 
 ### The estimate: `VICTORY_AMBIENT=estimate`
 
-`VICTORY_AMBIENT=estimate` (or `estimate:<share>`) turns on another stand-in in the same place, from avatarmanz's fork (`victory-gpu/src/ambient_estimate.rs`). Every other value of the variable means what it meant before, and the constant stand-in above is unchanged. The constant one gives the whole picture one light. The estimate works the light out from the frame, so it follows the hour, the room and its lamps by itself:
+`VICTORY_AMBIENT=estimate` (or `estimate:<share>`) selects the stand-in from avatarmanz's fork (`victory-gpu/src/ambient_estimate.rs`). An unset `VICTORY_AMBIENT` selects the estimate when the BVH builder is disabled. The estimate works the light out from the frame, so it follows the hour, the room and its lamps by itself:
 
 - The game keeps the light its visible surfaces send out, for its own screen traces (`CS_CacheScreenSpaceRadiance`, an R11G11B10 image of half the picture's size). Right after that program, in the same host list, VIctory averages the image in 64x36 cells of a buffer of its own, and moves a slow mean of all cells toward this frame's.
 - Right after the program that resolves the screen probes, in the next frame, VIctory places the cells in space by the depth image the resolve reads. At 160x90 points of the picture it sums the cells' light, each cell weighted by the share of the point's surroundings it covers, as a mean and a direction per colour. Every texel of the resolve's light image then gets what lies between the four points around it (those at its own depth first), turned by its normal, a fifth of it the slow mean, darker in creases.

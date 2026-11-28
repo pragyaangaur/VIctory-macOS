@@ -349,33 +349,43 @@ pub(crate) fn seen_before(keys: &[u64]) -> u64 {
 
 /// Mirrors what the title wrote into its shader-visible heaps without a
 /// call: Grand Theft Auto VI copies descriptors (our records) into its heap
-/// as bytes, so only a change of its memory shows them. Each slot of a page
-/// written since the last sync is made again if its record changed (in the
-/// world 1,300-14,400 slots a frame, against a few hundred views made by
-/// calls). Called before each submission: shaders take descriptors from the
-/// heap at indices in their data, where a slot never mirrored reads nothing.
+/// as bytes, so only a change of its memory shows them. Before submission,
+/// check the pages written since the last sync and any bytes that cannot be
+/// tracked. Shaders select slots by index, including slots only written by copy.
 #[cfg(windows)]
 pub(crate) fn sync_heaps() {
-    /// A heap's start, its address, and the ranges written since the last sync.
-    type Written = (u64, usize, Vec<(usize, usize)>);
-    // The written ranges of every heap, taken in one short hold of the lock.
+    /// A heap's start, its address, and the byte ranges to examine.
+    type HeapRanges = (u64, usize, Vec<(usize, usize)>);
+    // The ranges of every placed heap, taken in one short hold of the lock.
     let taking = std::time::Instant::now();
     sync_stat(SyncStat::Syncs, 1);
-    let work: Vec<Written> = {
+    let work: Vec<HeapRanges> = {
         let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
         heaps
             .iter()
-            .filter_map(|&(start, _, at)| {
+            .filter_map(|&(start, end, at)| {
                 // SAFETY: registered heaps are live (removed when dropped).
                 let heap = unsafe { &*(at as *const Heap) };
-                // As before: ranges are taken only once the heap has its
-                // host heap, so writes before that are not lost.
-                let (Some(Some(_)), Some(written), Some(_)) =
-                    (heap.host.get(), &heap.written, increment(heap.desc.kind))
-                else {
+                if heap.memory.is_some() {
                     return None;
+                }
+                // Preserve writes until the host heap has been made.
+                let host = heap.made_host()?;
+                let count = heap.desc.count.min(host.count());
+                let bytes = u64::from(count) * u64::from(increment(heap.desc.kind)?);
+                let end = end.min(start.saturating_add(bytes));
+                let (from, to) = (start as usize, end as usize);
+                if from >= to {
+                    return None;
+                }
+                let ranges = if let Some(written) = &heap.written {
+                    let mut ranges = written.take(from, to);
+                    ranges.extend(written.untracked(from, to));
+                    ranges
+                } else {
+                    vec![(from, to)]
                 };
-                Some((start, at, written.take(start as usize, usize::MAX)))
+                (!ranges.is_empty()).then_some((start, at, ranges))
             })
             .collect()
     };
@@ -440,10 +450,11 @@ pub(crate) fn sync_heaps() {
                     break;
                 };
                 let step = u64::from(step);
-                let heap_end = start.saturating_add(u64::from(heap.desc.count).saturating_mul(step));
+                let count = heap.desc.count.min(host.count());
+                let heap_end = start.saturating_add(u64::from(count).saturating_mul(step));
                 let (page, end) = (
                     page.max(from),
-                    (page + page_size).min(to).min(heap_end as usize),
+                    page.saturating_add(page_size).min(to).min(heap_end as usize),
                 );
                 if page >= end {
                     continue;
@@ -457,15 +468,15 @@ pub(crate) fn sync_heaps() {
                 let read = crate::host::read_into(page as *const u8, &mut page_buf[..len]);
                 sync_stat(SyncStat::ReadUs, reading.elapsed().as_micros() as u64);
                 if read {
-                    sync_range(host, heap.desc.count, start, step, page, end, &page_buf[..len]);
+                    sync_range(host, count, start, step, page, end, &page_buf[..len]);
                 } else {
                     for sub in (page & !(SUB_PAGE - 1)..end).step_by(SUB_PAGE) {
-                        let (sub_from, sub_to) = (sub.max(page), (sub + SUB_PAGE).min(end));
+                        let (sub_from, sub_to) = (sub.max(page), sub.saturating_add(SUB_PAGE).min(end));
                         let sub_len = sub_to - sub_from;
                         if crate::host::read_into(sub_from as *const u8, &mut page_buf[..sub_len]) {
                             sync_range(
                                 host,
-                                heap.desc.count,
+                                count,
                                 start,
                                 step,
                                 sub_from,
@@ -522,7 +533,7 @@ pub(crate) fn make_read(slots: &[u32]) {
                 // SAFETY: registered heaps are live under `SHADER_HEAPS`.
                 let heap = unsafe { &*(at as *const Heap) };
                 if let (Some(host), Some(handle)) = (heap.made_host(), heap.handle(i)) {
-                    host.mirror(i, handle, true);
+                    host.mirror_shader_read(i, handle);
                     host.stamp_read(i);
                 }
             }
@@ -569,7 +580,7 @@ pub(crate) fn make_read(slots: &[u32]) {
             continue;
         }
         for &i in slots.iter().filter(|&&i| i < heap.desc.count) {
-            host.mirror(i, start + u64::from(i) * u64::from(step), true);
+            host.mirror_shader_read(i, start + u64::from(i) * u64::from(step));
             host.stamp_read(i);
         }
     }
@@ -1451,32 +1462,35 @@ pub(crate) fn view(handle: u64) -> Option<ViewPin> {
     (tag == VIEW_TAG).then(|| view_at(i, generation)).flatten()
 }
 
+/// A placement page can be unmapped between reading a slot and making its view.
+#[cfg(windows)]
+fn read_sync_record(handle: u64) -> Option<[u32; 3]> {
+    let mut raw = [0u8; 12];
+    (handle != 0 && crate::host::read_into(handle as *const u8, &mut raw))
+        .then(|| sync_record(&raw))
+}
+
+#[cfg(windows)]
+fn sync_record(raw: &[u8]) -> [u32; 3] {
+    [
+        u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]),
+        u32::from_le_bytes([raw[4], raw[5], raw[6], raw[7]]),
+        u32::from_le_bytes([raw[8], raw[9], raw[10], raw[11]]),
+    ]
+}
+
 /// Like [`view`], but reads the title descriptor slot through
 /// [`crate::host::read_into`] so unmapped heap pages never fault.
 #[cfg(windows)]
 pub(crate) fn view_safe(handle: u64) -> Option<ViewPin> {
-    if handle == 0 {
-        return None;
-    }
-    let mut raw = [0u8; 12];
-    if !crate::host::read_into(handle as *const u8, &mut raw) {
-        return None;
-    }
-    let tag = u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]);
-    let i = u32::from_le_bytes([raw[4], raw[5], raw[6], raw[7]]);
-    let generation = u32::from_le_bytes([raw[8], raw[9], raw[10], raw[11]]);
+    let [tag, i, generation] = read_sync_record(handle)?;
     (tag == VIEW_TAG).then(|| view_at(i, generation)).flatten()
 }
 
-/// The view recorded at `handle` and the `(generation << 32) | index` key that
-/// identifies that specific record (`host::HostHeap::publish`).
-#[cfg(any(windows, test))]
+/// The view and its key for background work that can outlive the mapping.
+#[cfg(windows)]
 pub(crate) fn view_and_key(handle: u64) -> Option<(ViewPin, u64)> {
-    if handle == 0 {
-        return None;
-    }
-    // SAFETY: as in `view`.
-    let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
+    let [tag, i, generation] = read_sync_record(handle)?;
     if tag != VIEW_TAG {
         return None;
     }
@@ -2095,6 +2109,75 @@ pub(crate) mod tests {
         }
         slot::<extern "system" fn(This) -> u32>(h, 0x10)(h);
         crate::watch::tests::free(memory);
+    }
+
+    #[cfg(windows)]
+    fn placed_sampler_heap(address: usize) -> HeapOwner {
+        let desc = HeapDesc { kind: SAMPLERS, count: 8, flags: SHADER_VISIBLE, nodes: 1 };
+        owner(desc, Placement { address: address as u64, size: 8 * 16 })
+    }
+
+    #[cfg(windows)]
+    fn check_raw_sampler_updates(heap: &Heap) {
+        let host = heap.host().expect("the test requires a real D3D12 heap");
+        let slot = heap.handle(5).unwrap();
+        let mut records = [[0_u64; 2]; 2];
+        for (record, filter) in records.iter_mut().zip([21, 0]) {
+            let desc = [filter, 3, 3, 3, 0, 1, 0, 0, 0, 0, 0, 0x7f7f_ffff, 0];
+            create_sampler(std::ptr::null(), &desc, record.as_mut_ptr() as u64);
+        }
+        assert_ne!(records[0], records[1]);
+        assert!(!host.made(5));
+        for record in records {
+            // SAFETY: the fixture owns this aligned, committed 16-byte sampler slot.
+            unsafe { (slot as *mut [u64; 2]).write(record) };
+            sync_heaps();
+            assert!(host.texture_slot_made_from(5, slot), "raw record must reach the host slot");
+        }
+        // SAFETY: the same slot belongs to the fixture until the heap drops.
+        unsafe { (slot as *mut [u64; 2]).write([0; 2]) };
+        sync_heaps();
+        assert!(!host.made(5), "raw clear must remove the previous record");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "requires a real D3D12 host heap"]
+    fn untracked_placed_heap_syncs_raw_record_creation_replacement_and_clear() {
+        let mut slots = [[0_u64; 2]; 8];
+        let h = placed_sampler_heap(slots.as_mut_ptr() as usize);
+        let heap = heap(h.0);
+        assert!(heap.written.is_none(), "these private bytes have no write tracker");
+        check_raw_sampler_updates(heap);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "requires a real D3D12 host heap and fault tracking"]
+    fn partially_tracked_placed_heap_syncs_the_untracked_slots() {
+        use crate::watch::PAGE;
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+        };
+        // SAFETY: a fresh reservation, with only the second page committed as private memory.
+        let base = unsafe { VirtualAlloc(std::ptr::null(), 2 * PAGE, MEM_RESERVE, PAGE_READWRITE) };
+        assert!(!base.is_null());
+        let plain = base as usize + PAGE;
+        assert_eq!(
+            // SAFETY: this page lies inside the fixture's fresh reservation.
+            unsafe { VirtualAlloc(plain as *const _, PAGE, MEM_COMMIT, PAGE_READWRITE) } as usize,
+            plain
+        );
+        {
+            // The first two slots are reserved, the remaining six are writable and untracked.
+            let h = placed_sampler_heap(plain - 32);
+            let heap = heap(h.0);
+            let tracker = heap.written.as_ref().expect("the reserved page is tracked");
+            assert_eq!(tracker.untracked(plain - 32, plain + 96), [(plain, plain + 96)]);
+            check_raw_sampler_updates(heap);
+        }
+        // SAFETY: the heap and its tracker dropped before freeing the reservation.
+        assert_ne!(unsafe { VirtualFree(base, 0, MEM_RELEASE) }, 0);
     }
 
     #[cfg(windows)]

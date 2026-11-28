@@ -23,3 +23,5 @@ The step 0 probe for that work, which needs no game files, is in issue #221.
 6. **Choosing the host** with a switch. D3D12 stays the default.
 
 The Metal backend itself starts after step 2. It is first useful for title buffers, which is where the copies are.
+
+The [Direct Metal implementation plan](superpowers/plans/2026-11-27-direct-metal.md) places shared shader and tooling prerequisites before these backend milestones, with separate checks for memory, compute, rendering, and game behavior. Its [design](superpowers/specs/2026-11-27-direct-metal-design.md) records the scope and acceptance criteria.

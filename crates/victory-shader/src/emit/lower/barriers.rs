@@ -172,7 +172,52 @@ pub(crate) fn step_and_cap(
     st: &Structured,
     need_step: bool,
 ) -> (Vec<bool>, Vec<bool>, Set<Value>) {
-    step_and_cap_with(p, st, &st.exits, &Set::default(), need_step)
+    step_and_cap_with(p, st, &st.exits, &Set::default(), need_step, None)
+}
+
+/// VCC dwords with scalar definitions that structuring has not classified as masks.
+pub(super) fn scalar_scratch(p: &Program, st: &Structured) -> Set<Value> {
+    // A plain number the compiler keeps in VCC_LO or VCC_HI as a spare
+    // scalar register, not a lane mask: written alone (besides
+    // SCC) by a scalar ALU instruction, and not a mask the structure knows
+    // (`masks`, `highs`, `other`). Such a value may be read as data like any
+    // SGPR; callers still need every value it is computed from
+    // to be alike, so this admits no lane mask:
+    // - EXEC on entry, and any phi, is no instruction's write;
+    // - `v_cmp`/`v_cmpx` and other VALU results are never alike (`own`), so
+    //   neither is anything a scalar instruction computes from them;
+    // - a saved copy of either (`s_mov_b64 s[10:11], exec`,
+    //   `s_and_saveexec_b64`) reads the mask and so is not alike, and nor is
+    //   a later move of the copy back into VCC; a spill through
+    //   `v_writelane`/`v_readlane` goes by `st.restored`;
+    // - a 64-bit write (`s_and_b64 vcc, …`, `s_mov_b64 vcc, …`) is left out
+    //   whatever it reads: in wave64 halves VCC_HI is the upper 32 lanes'
+    //   bits, which differ between the host waves;
+    // - EXEC is never scratch: a write to it changes which lanes run.
+    p
+        .blocks
+        .iter()
+        .flat_map(|b| b.insts.iter())
+        .filter(|i| matches!(i.fields, Fields::Sop { .. }))
+        .filter_map(|i| {
+            let mut words = i.writes.iter().filter(|w| w.0 != Reg::Scc);
+            match (words.next(), words.next()) {
+                (Some(&(Reg::S(k), v)), None) if k == VCC || k == VCC + 1 => Some(v),
+                _ => None,
+            }
+        })
+        .filter(|v| !st.masks.contains_key(v) && !st.highs.contains_key(v) && !st.other.contains_key(v))
+        .collect()
+}
+
+/// One full console wave whose host halves already own the console lane IDs.
+/// Outside these loops, codegen uses the original convergence result.
+pub(super) struct WaveReads<'a> {
+    pub(super) plan: &'a predicate::PredicatePlan,
+    pub(super) per_lane: &'a Set<Value>,
+    pub(super) immutable: &'a Set<Site>,
+    pub(super) loop_blocks: &'a Set<usize>,
+    pub(super) base_step: &'a [bool],
 }
 
 /// [`step_and_cap`] evaluated over `exits` (either `st.exits` or exits after
@@ -181,12 +226,13 @@ pub(crate) fn step_and_cap(
 /// both group-uniform SGPRs and group-uniform VGPRs, so a uniform loop bound
 /// loaded via `buffer_load` / `global_load` / `image_load` / `ds_read` and
 /// moved through `v_readfirstlane_b32` stays group-uniform.
-pub(crate) fn step_and_cap_with(
+pub(super) fn step_and_cap_with(
     p: &Program,
     st: &Structured,
     exits: &[LaneExit],
     uniform_branches: &Set<usize>,
     need_step: bool,
+    one_wave: Option<WaveReads<'_>>,
 ) -> (Vec<bool>, Vec<bool>, Set<Value>) {
     let n = p.blocks.len();
     // Reverse postorder ranks, as lowering numbers them: a Jump to a block at
@@ -272,7 +318,7 @@ pub(crate) fn step_and_cap_with(
     let mask = |r: Reg| matches!(r, Reg::S(k) if [EXEC, EXEC + 1, VCC, VCC + 1].contains(&k));
     // Scalar writes no host wave can compute alike: other lanes' values,
     // hardware state, atomics, coherent loads (the group may write them).
-    let own = |inst: &Inst| {
+    let own = |inst: &Inst, site: Site| {
         let name = inst.name();
         match &inst.fields {
             Fields::Sop { .. } => {
@@ -281,7 +327,11 @@ pub(crate) fn step_and_cap_with(
                     || name.contains("waveid")
             }
             Fields::Smem { cache, .. } => {
-                !(name.starts_with("s_load") || name.starts_with("s_buffer_load")) || cache.glc
+                !(name.starts_with("s_load") || name.starts_with("s_buffer_load"))
+                    || cache.glc
+                    // The two host waves may load an ordinary buffer on
+                    // opposite sides of a store, even at a uniform address.
+                    || one_wave.as_ref().is_some_and(|wave| !wave.immutable.contains(&site))
             }
             _ => true,
         }
@@ -321,42 +371,7 @@ pub(crate) fn step_and_cap_with(
                 || st.highs.contains_key(&v)
                 || st.scc_votes.contains_key(&v))
     };
-    // A plain number the compiler keeps in VCC_LO or VCC_HI as a spare
-    // scalar register, not a lane mask: written alone (besides
-    // SCC) by a scalar ALU instruction, and not a mask the structure knows
-    // (`masks`, `highs`, `other`). Such a value may be read as data like any
-    // SGPR; `from_scalar` below still needs every value it is computed from
-    // to be alike, so this admits no lane mask:
-    // - EXEC on entry, and any phi, is no instruction's write;
-    // - `v_cmp`/`v_cmpx` and other VALU results are never alike (`own`), so
-    //   neither is anything a scalar instruction computes from them;
-    // - a saved copy of either (`s_mov_b64 s[10:11], exec`,
-    //   `s_and_saveexec_b64`) reads the mask and so is not alike, and nor is
-    //   a later move of the copy back into VCC; a spill through
-    //   `v_writelane`/`v_readlane` goes by `st.restored`;
-    // - a 64-bit write (`s_and_b64 vcc, …`, `s_mov_b64 vcc, …`) is left out
-    //   whatever it reads: in wave64 halves VCC_HI is the upper 32 lanes'
-    //   bits, which differ between the host waves;
-    // - EXEC is never scratch: a write to it changes which lanes run.
-    let scratch_defs: Set<Value> = p
-        .blocks
-        .iter()
-        .flat_map(|b| b.insts.iter())
-        .filter(|i| matches!(i.fields, Fields::Sop { .. }))
-        .filter_map(|i| {
-            let mut words = i.writes.iter().filter(|w| w.0 != Reg::Scc);
-            match (words.next(), words.next()) {
-                (Some(&(Reg::S(k), v)), None) if k == VCC || k == VCC + 1 => Some(v),
-                _ => None,
-            }
-        })
-        .collect();
-    let scratch = |v: Value| {
-        scratch_defs.contains(&v)
-            && !st.masks.contains_key(&v)
-            && !st.highs.contains_key(&v)
-            && !st.other.contains_key(&v)
-    };
+    let scratch = scalar_scratch(p, st);
     // Group-uniform VGPRs: optimistically all non-entry VGPRs, narrowed with
     // `alike` in lockstep. Entry VGPRs (`v0`/`v1`/`v2` thread ids) are never
     // group-uniform.
@@ -518,7 +533,11 @@ pub(crate) fn step_and_cap_with(
         let mut next_v: Set<Value> = Set::default();
         for (b, block) in p.blocks.iter().enumerate() {
             // Every host wave enters by the same edge.
-            let entered = step[b] && block.preds.iter().all(|&q| step[q]);
+            let entered = step[b]
+                && block.preds.iter().all(|&q| step[q])
+                && one_wave.as_ref().is_none_or(|wave| {
+                    !wave.plan.linear_merges.contains(&b) && !wave.plan.skip_joins.contains_key(&b)
+                });
             for phi in &block.phis {
                 if scalar(phi.reg)
                     && (tracked(phi.value) || entered && phi.args.iter().all(|a| alike.contains(a)))
@@ -529,13 +548,37 @@ pub(crate) fn step_and_cap_with(
                     next_v.insert(phi.value);
                 }
             }
+            let mapped = one_wave
+                .as_ref()
+                .filter(|wave| step[b] && (wave.base_step[b] || wave.loop_blocks.contains(&b)));
             for (i, inst) in block.insts.iter().enumerate() {
                 let name = inst.name();
                 // Group-uniform scalar ops.
                 let from_scalar = inst.reads.iter().all(|&(r, v)| {
-                    scalar(r) && (!mask(r) || tracked(v) || scratch(v)) && alike.contains(&v)
+                    scalar(r) && (!mask(r) || tracked(v) || scratch.contains(&v)) && alike.contains(&v)
                 });
-                let lane_read = st.literal
+                // A tracked, active AND-mask has no numeric scalar form:
+                // reading its dwords ballots it at its definition. In a
+                // converged, single-wave group both halves get the same pair.
+                if mapped.is_some()
+                    && name == "s_and_b64"
+                    && let Fields::Sop {
+                        dst: Some(Operand::Scalar { code, .. }),
+                        ..
+                    } = &inst.fields
+                    && let (Some(lo), Some(hi)) =
+                        (inst.write(Reg::S(*code)), inst.write(Reg::S(code + 1)))
+                    && st.active.contains(&lo)
+                    && st.mask_bits(lo, Some(hi)).is_some()
+                    && st.highs.get(&hi) == Some(&lo)
+                {
+                    next.extend([lo, hi]);
+                }
+                let wave_read = mapped.is_some_and(|wave| {
+                    matches!(&inst.fields, Fields::Valu(v) if matches!(v.src.first(), Some(Operand::Vector { .. })))
+                        && inst.writes.first().is_some_and(|w| !wave.per_lane.contains(&w.1))
+                });
+                let lane_read = (st.literal || wave_read)
                     && step[b]
                     && match name {
                         "v_readfirstlane_b32" => true,
@@ -549,12 +592,17 @@ pub(crate) fn step_and_cap_with(
                         }
                         _ => false,
                     };
-                if from_scalar && !own(inst) || lane_read || st.literal {
-                    next.extend(inst.writes.iter().filter_map(|&(r, v)| {
-                        (scalar(r) && (tracked(v) || from_scalar && !own(inst) || lane_read))
-                            .then_some(v)
-                    }));
-                    if from_scalar && !own(inst) || lane_read {
+                let published = one_wave
+                    .as_ref()
+                    .is_some_and(|wave| wave.plan.scalar_publications.contains(&(b, i)));
+                let common = from_scalar && !own(inst, (b, i)) || lane_read || published;
+                if common || st.literal {
+                    next.extend(
+                        inst.writes.iter().filter_map(|&(r, v)| {
+                            (scalar(r) && (tracked(v) || common)).then_some(v)
+                        }),
+                    );
+                    if common {
                         continue;
                     }
                 }
@@ -570,7 +618,10 @@ pub(crate) fn step_and_cap_with(
                 }
                 // Guarded VGPR writes only stay group-uniform when the guard
                 // itself is group-uniform (for simplicity, require no guard).
-                if st.guards[b][i].is_some() {
+                // This additional proof starts from scalar operations and
+                // real broadcasts. A predicated vector write can retain a
+                // different old value even without an instruction-level guard.
+                if one_wave.is_some() || st.guards[b][i].is_some() {
                     continue;
                 }
                 // Buffer / global / LDS loads at group-uniform addresses.
@@ -723,7 +774,7 @@ pub(crate) fn in_step_with(
     exits: &[LaneExit],
     uniform_branches: &Set<usize>,
 ) -> Vec<bool> {
-    step_and_cap_with(p, st, exits, uniform_branches, true).0
+    step_and_cap_with(p, st, exits, uniform_branches, true, None).0
 }
 
 /// Per block, whether each lane of the group runs it exactly once: no cycle
@@ -755,4 +806,17 @@ pub(crate) fn once_per_lane(p: &Program) -> Vec<bool> {
             !reach(b, false, None)[b] && !ends_around
         })
         .collect()
+}
+
+impl Lower<'_> {
+    /// Thread-group sync with a shared-memory fence, and a UAV fence when
+    /// the program writes UAVs (the waits before an s_barrier make those
+    /// writes visible on the console).
+    pub(super) fn group_barrier(&mut self) {
+        let mode = if self.writes_uavs { 1 | 2 | 8 } else { 1 | 8 };
+        let mode = self.s.m.i32(mode);
+        let void = self.s.t.void;
+        self.s
+            .op(self.cur, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
+    }
 }

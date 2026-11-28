@@ -24,6 +24,48 @@ stamp() {
 }
 build_stamp="$(stamp)"
 if [[ ${1-} == --stamp ]]; then print -r -- "$build_stamp"; exit 0; fi
+
+# The sorted paths the patches touch.
+patch_paths() { grep -h '^+++ ' "$@" /dev/null | awk '{sub(/^b\//, "", $2); print $2}' | sort -u; }
+
+# An installed Wine has D3DMetal's DLLs copied over Wine's own, and make
+# install would put Wine's back. So it gets only its server, ntdll's Unix
+# library and the HID bus's (winebus.so, where SDL2 support lives) rebuilt,
+# which D3DMetal does not replace. That is enough only while neither the
+# patches baked into the installed Wine nor the current ones change anything
+# but the server and ntdll, and the installed release matches. The paths of
+# the applied patches are recorded next to the install stamp.
+prefix="$ROOT/target/wine-cx"
+installed=0
+release_changed=0
+outside=
+if [[ -x $prefix/bin/wine && -f $prefix/.victory-patches && -r $prefix/.victory-patches &&
+      -f $prefix/.victory-patch-paths && -r $prefix/.victory-patch-paths ]]; then
+  if [[ "$(< "$prefix/.victory-patches")" == "$VERSION:"* ]]; then
+    outside=$( { patch_paths "${PATCHES[@]}"; cat "$prefix/.victory-patch-paths"; } |
+      grep -v -e '^server/' -e '^dlls/ntdll/unix/' -e '^$' | sort -u)
+    [[ -n $outside ]] || installed=1
+  else
+    release_changed=1
+  fi
+fi
+
+if [[ ${1-} == --can-update-in-place ]]; then
+  (( installed )) && exit 0
+  exit 1
+fi
+if (( ! installed )) && [[ ${1-} == --incremental-only ]]; then
+  echo "Wine needs a full rebuild. See docs/macos.md to back up the existing build first." >&2
+  exit 1
+fi
+if [[ -n $outside ]]; then
+  echo "the patches change ${outside//$'\n'/ }: reinstalling Wine fully"
+elif (( release_changed )); then
+  echo "the installed CrossOver release changed or was not recorded: reinstalling Wine fully"
+elif (( ! installed )) && [[ -x $prefix/bin/wine ]]; then
+  echo "the installed Wine metadata is incomplete: reinstalling it fully"
+fi
+
 DEPS_REAL="${DEPS:?set DEPS to an x86_64 prefix with FreeType, GnuTLS and SDL2}"
 # Wine's build splits flags at spaces, and both the project and the deps
 # can live under folders with spaces in their names. Space-free links to
@@ -120,32 +162,7 @@ if ! grep -q 'victory-macos fallback' "$VK"; then
   mv "$VK.new" "$VK"
 fi
 
-# The sorted paths the patches touch.
-patch_paths() { grep -h '^+++ ' "$@" /dev/null | awk '{sub(/^b\//, "", $2); print $2}' | sort -u; }
-
-# An installed Wine has D3DMetal's DLLs copied over Wine's own, and make
-# install would put Wine's back. So it gets only its server, ntdll's Unix
-# library and the HID bus's (winebus.so, where SDL2 support lives) rebuilt,
-# which D3DMetal does not replace. That is enough only while neither the
-# patches baked into the installed Wine nor the current ones change anything
-# but the server and ntdll, and the installed release matches. The paths of
-# the applied patches are recorded next to the install stamp.
-installed=0
 PATCH_PATHS="$PREFIX/.victory-patch-paths"
-if [[ -x $PREFIX/bin/wine && -f $PREFIX/.victory-patches && -f $PATCH_PATHS ]]; then
-  if [[ "$(< "$PREFIX/.victory-patches")" != "$VERSION:"* ]]; then
-    echo "the installed CrossOver release changed or was not recorded: reinstalling Wine fully"
-  else
-    outside=($( { patch_paths "${PATCHES[@]}"; cat "$PATCH_PATHS"; } | grep -v -e '^server/' -e '^dlls/ntdll/unix/' -e '^$' | sort -u || true))
-    if (( ${#outside} > 0 )); then
-      echo "the patches change ${outside[*]}: reinstalling Wine fully"
-    else
-      installed=1
-    fi
-  fi
-elif [[ -x $PREFIX/bin/wine ]]; then
-  echo "the installed Wine metadata is incomplete: reinstalling it fully"
-fi
 
 # Each patch goes in once: one that already reverses cleanly is in. A patch
 # is applied only after a dry run shows all of it applies, and one that

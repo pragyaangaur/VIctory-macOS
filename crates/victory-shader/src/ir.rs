@@ -42,6 +42,8 @@ pub struct Value(pub u32);
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Program {
     pub wave64: bool,
+    /// Allocated VGPR dwords per lane.
+    pub vgprs: u16,
     /// In code order, then copies made to give every loop one entry; block 0
     /// is the entry.
     pub blocks: Vec<Block>,
@@ -99,6 +101,8 @@ pub struct Phi {
 pub struct Inst {
     pub machine: Instruction,
     pub fields: Fields,
+    /// Upper bound supplied to this SSA build, before any VGPR-file truncation.
+    pub(crate) m0_max: Option<u8>,
     /// Every register dword read, with the value it holds.
     pub reads: Vec<(Reg, Value)>,
     /// Every register dword written, with the value it receives.
@@ -108,6 +112,23 @@ pub struct Inst {
 impl Inst {
     pub fn name(&self) -> &'static str {
         self.machine.name().unwrap_or("")
+    }
+
+    /// Whether every M0-relative operand has a proved endpoint inside the file.
+    pub(crate) fn relative_in_file(&self, vgprs: u16) -> bool {
+        let (source, destination) = relative_operands(self.name());
+        if !source && !destination {
+            return true;
+        }
+        let (Some(bound), Fields::Valu(v)) = (self.m0_max, &self.fields) else {
+            return false;
+        };
+        let fits = |operand: Option<&Operand>, indexed| {
+            let Some(Operand::Vector { reg, dwords }) = operand else { return false };
+            let hi = if indexed { bound } else { 0 };
+            u16::from(*reg) + u16::from(hi) + u16::from(*dwords) <= vgprs
+        };
+        fits(v.src.first(), source) && fits(v.dst.as_ref(), destination)
     }
 
     /// The value `reg` holds when this instruction reads it.
@@ -264,6 +285,7 @@ pub fn build_bounded(
             blocks[b].insts.push(Inst {
                 machine,
                 fields,
+                m0_max: m0,
                 reads,
                 writes,
             });
@@ -276,6 +298,67 @@ pub fn build_bounded(
             what: "a branch to the program entry",
         });
     }
+    assign_ssa(blocks, wave64, vgprs)
+}
+
+/// Rebuild from the reachable machine instructions after dropping proven
+/// branch edges. Node copies retain their identity until dead blocks are removed.
+pub(crate) fn folded(
+    p: &Program,
+    jumps: &[(usize, usize)],
+) -> Result<Option<Program>, ShaderError> {
+    let mut blocks = p.blocks.clone();
+    for &(b, to) in jumps {
+        blocks[b].insts.pop();
+        blocks[b].exit = Exit::Jump(to);
+    }
+    let mut remap = vec![usize::MAX; blocks.len()];
+    let mut order = reverse_postorder(&blocks);
+    // A proof includes the forward exit forced by a conditional backedge's
+    // cap. Keep the same counted edges on every surviving path.
+    let rank = |order: &[usize]| {
+        let mut ranks = vec![usize::MAX; blocks.len()];
+        for (n, &b) in order.iter().enumerate() {
+            ranks[b] = n;
+        }
+        ranks
+    };
+    let old = rank(&reverse_postorder(&p.blocks));
+    let new = rank(&order);
+    if order.iter().any(|&b| {
+        blocks[b]
+            .exit
+            .successors()
+            .iter()
+            .any(|&t| (old[t] <= old[b]) != (new[t] <= new[b]))
+    }) {
+        return Ok(None);
+    }
+    order.sort_unstable();
+    for (new, &old) in order.iter().enumerate() {
+        remap[old] = new;
+    }
+    let mut live = Vec::with_capacity(order.len());
+    for (b, mut block) in blocks.into_iter().enumerate() {
+        if remap[b] == usize::MAX {
+            continue;
+        }
+        match &mut block.exit {
+            Exit::Jump(t) => *t = remap[*t],
+            Exit::Branch { taken, not_taken } => {
+                *taken = remap[*taken];
+                *not_taken = remap[*not_taken];
+            }
+            _ => {}
+        }
+        block.phis.clear();
+        live.push(block);
+    }
+    link(&mut live);
+    assign_ssa(live, p.wave64, p.vgprs).map(Some)
+}
+
+fn assign_ssa(mut blocks: Vec<Block>, wave64: bool, vgprs: u16) -> Result<Program, ShaderError> {
     split_irreducible(&mut blocks)?;
 
     let order = reverse_postorder(&blocks);
@@ -338,6 +421,7 @@ pub fn build_bounded(
     remove_trivial_phis_steps(&mut blocks, values);
     Ok(Program {
         wave64,
+        vgprs,
         blocks,
         inputs,
     })
@@ -812,6 +896,16 @@ pub(crate) fn operand_reads(p: &Program, vgprs: u16, inst: &Inst) -> Vec<Reg> {
     .map_or_else(Vec::new, |e| e.0.into_iter().map(|(reg, _)| reg).collect())
 }
 
+/// The source and destination operands indexed by M0.
+pub(crate) fn relative_operands(name: &str) -> (bool, bool) {
+    match name {
+        "v_movrels_b32" => (true, false),
+        "v_movreld_b32" => (false, true),
+        "v_movrelsd_b32" | "v_movrelsd_2_b32" | "v_swaprel_b32" => (true, true),
+        _ => (false, false),
+    }
+}
+
 /// Registers an instruction reads and writes, one per dword, or `None` if
 /// the IR drops it.
 fn effects(
@@ -920,12 +1014,7 @@ fn effects(
             _ => return Err(unsupported()),
         },
         Fields::Valu(v) => {
-            let (src_indexed, dst_indexed) = match name {
-                "v_movrels_b32" => (true, false),
-                "v_movreld_b32" => (false, true),
-                "v_movrelsd_b32" | "v_movrelsd_2_b32" | "v_swaprel_b32" => (true, true),
-                _ => (false, false),
-            };
+            let (src_indexed, dst_indexed) = relative_operands(name);
             // v[reg + M0] for any M0 that stays inside the program's VGPRs
             // (and below the proven bound).
             let indexed = |op: &Operand, out: &mut Vec<(Reg, Value)>| match *op {

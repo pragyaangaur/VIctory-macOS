@@ -34,6 +34,59 @@ pub(crate) enum V {
     Inst(u32),
 }
 
+/// A fenced raw-data scratch write, including writes to unused guest SGPRs.
+#[cfg(test)]
+#[derive(Debug)]
+pub(crate) struct ScalarExchange {
+    pub source: (Option<i64>, u32),
+    pub lower_read: bool,
+    pub addend: Option<i64>,
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct ScalarExchangeTrace {
+    fenced: bool,
+    pending: Option<(V, (Option<i64>, u32))>,
+    reading: Option<(V, usize)>,
+    exchanges: Vec<ScalarExchange>,
+}
+
+#[cfg(test)]
+impl ScalarExchangeTrace {
+    fn store(&mut self, slot: V, source: Option<(Option<i64>, u32)>) {
+        self.pending = if self.fenced {
+            source.map(|s| (slot, s))
+        } else {
+            None
+        };
+        self.fenced = false;
+        self.reading = None;
+    }
+
+    fn barrier(&mut self) {
+        self.reading = self.pending.take().map(|(slot, source)| {
+            self.exchanges.push(ScalarExchange {
+                source,
+                lower_read: false,
+                addend: None,
+            });
+            (slot, self.exchanges.len() - 1)
+        });
+        self.fenced = true;
+    }
+
+    fn scratch_read(&mut self, lower_of: Option<V>, addend: Option<i64>) {
+        self.fenced = false;
+        if let Some((slot, i)) = self.reading
+            && lower_of == Some(slot)
+        {
+            self.exchanges[i].lower_read = true;
+            self.exchanges[i].addend = addend;
+        }
+    }
+}
+
 /// A global variable declaration (thread-group shared memory).
 struct Global {
     name: String,
@@ -606,6 +659,101 @@ impl Module {
         }
     }
 
+    /// Trace each raw byte address and extract through its scratch write and
+    /// two fences. Record any live lower-slot read and its immediate add consumer.
+    #[cfg(test)]
+    pub fn live_scalar_exchanges(&self) -> Vec<ScalarExchange> {
+        let op = |v| match v {
+            V::Inst(i) => Some(&self.insts[i as usize].op),
+            _ => None,
+        };
+        let call = |v, name| match op(v)? {
+            Op::Call(f, args) if self.funcs[*f as usize].name == name => Some(args),
+            _ => None,
+        };
+        let component = |v| {
+            let own = call(v, "dx.op.waveReadLaneFirst.i32")?;
+            let Op::Cast(Cast::Bitcast, raw) = op(own[1])? else {
+                return None;
+            };
+            let Op::Extract(load, k) = op(*raw)? else {
+                return None;
+            };
+            let args = call(*load, "dx.op.rawBufferLoad.f32")?;
+            let mask = self.int_value(args[4])?;
+            (self.int_value(args[5]) == Some(4) && mask & (1 << k) != 0)
+                .then(|| (self.constant_sum(args[2]), *k))
+        };
+        let slot = |v| match op(v)? {
+            Op::Gep(_, V::Global(g), index) if self.globals[*g as usize].name == "half_words" => {
+                index.last().copied()
+            }
+            _ => None,
+        };
+        let plan = self.plan();
+        let mut adds = Map::default();
+        for &b in &plan.layout {
+            for &i in &self.blocks[b].body {
+                if plan.live[i as usize]
+                    && let Op::Bin(Bin::Add, a, b) = self.insts[i as usize].op
+                {
+                    for (value, constant) in [(a, b), (b, a)] {
+                        if let Some(n) = self.int_value(constant) {
+                            adds.entry(value)
+                                .and_modify(|add| *add = None)
+                                .or_insert(Some(n));
+                        }
+                    }
+                }
+            }
+        }
+        let mut results = Vec::new();
+        for b in plan.layout {
+            let mut trace = ScalarExchangeTrace::default();
+            for &i in self.blocks[b]
+                .body
+                .iter()
+                .filter(|&&i| plan.live[i as usize])
+            {
+                match self.insts[i as usize].op {
+                    Op::Store(ptr, value) if let Some(index) = slot(ptr) => {
+                        trace.store(index, component(value));
+                    }
+                    Op::Load(ptr) if let Some(index) = slot(ptr) => {
+                        let lower_of = match op(index) {
+                            Some(Op::Bin(Bin::And, a, mask))
+                                if self.int_value(*mask).map(|n| n as u32) == Some(!1) =>
+                            {
+                                Some(*a)
+                            }
+                            _ => None,
+                        };
+                        trace.scratch_read(lower_of, adds.get(&V::Inst(i)).copied().flatten());
+                    }
+                    _ if call(V::Inst(i), "dx.op.barrier")
+                        .is_some_and(|args| self.int_value(args[1]) == Some(9)) =>
+                    {
+                        trace.barrier();
+                    }
+                    _ => {}
+                }
+            }
+            results.extend(trace.exchanges);
+        }
+        results
+    }
+
+    /// Written branch targets and the surviving block of each requested site.
+    #[cfg(test)]
+    pub fn written_cfg(&self, sites: &[usize]) -> (Vec<Vec<usize>>, Vec<usize>) {
+        let plan = self.plan();
+        let mut edges = vec![Vec::new(); self.blocks.len()];
+        for &b in &plan.layout {
+            edges[b] = successors(self.term(b)).iter().map(|&s| plan.to(s)).collect();
+        }
+        (edges, sites.iter().map(|&b| plan.to(b)).collect())
+    }
+
     /// Calls of functions named `name` that [`Module::write`] writes, and the
     /// blocks holding them.
     #[cfg(test)]
@@ -715,22 +863,23 @@ impl Module {
         shape
     }
 
+    #[cfg(test)]
+    fn constant_sum(&self, v: V) -> Option<i64> {
+        if let V::Inst(i) = v
+            && let Op::Bin(Bin::Add, a, b) = self.insts[i as usize].op
+        {
+            return Some(i64::from(
+                (self.constant_sum(a)? as i32).wrapping_add(self.constant_sum(b)? as i32),
+            ));
+        }
+        self.int_value(v)
+    }
+
     /// The arguments of each call of a function named `name` that
     /// [`Module::write`] writes, as integers where they are constants or
     /// sums of constants (lowering adds offsets up unfolded), else `None`.
     #[cfg(test)]
     pub fn written_call_args(&self, name: &str) -> Vec<Vec<Option<i64>>> {
-        fn sum(m: &Module, v: V) -> Option<i64> {
-            match v {
-                V::Inst(i) => match m.insts[i as usize].op {
-                    Op::Bin(Bin::Add, a, b) => Some(i64::from(
-                        (sum(m, a)? as i32).wrapping_add(sum(m, b)? as i32),
-                    )),
-                    _ => None,
-                },
-                v => m.int_value(v),
-            }
-        }
         let plan = self.plan();
         let mut calls = Vec::new();
         for &b in &plan.layout {
@@ -739,7 +888,7 @@ impl Module {
                     && plan.live[i as usize]
                     && self.funcs[*f as usize].name == name
                 {
-                    calls.push(args.iter().map(|&a| sum(self, a)).collect());
+                    calls.push(args.iter().map(|&a| self.constant_sum(a)).collect());
                 }
             }
         }
@@ -1357,8 +1506,32 @@ impl Writer {
 }
 
 #[cfg(test)]
+pub(crate) mod lds_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scalar_exchange_trace_requires_fence_after_scratch_read() {
+        let slot = V::Inst(0);
+        for lower in [None, Some(slot)] {
+            for refenced in [false, true] {
+                let mut trace = ScalarExchangeTrace::default();
+                trace.barrier();
+                trace.store(slot, Some((Some(4), 0)));
+                trace.barrier();
+                trace.scratch_read(lower, Some(1));
+                if refenced {
+                    trace.barrier();
+                }
+                trace.store(slot, Some((Some(4), 1)));
+                trace.barrier();
+                assert_eq!(trace.exchanges[0].lower_read, lower.is_some());
+                assert_eq!(trace.exchanges.len(), 1 + usize::from(refenced));
+            }
+        }
+    }
 
     #[test]
     fn vbr_and_blocks() {

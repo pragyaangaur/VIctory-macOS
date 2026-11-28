@@ -10,7 +10,8 @@
 //! into title memory: on fxceless/victory-fork, garbage bounds that crashed
 //! the title. So the builder's dispatches run only in frames where every
 //! pipeline it has created has its host pipeline; otherwise none of them
-//! run (the structures keep what they held).
+//! run (the structures keep what they held). Its host pipelines are made
+//! whether or not the builder is asked to run.
 //!
 //! With every pipeline made it still runs only when asked to
 //! (`VICTORY_BVH_BUILDER=1`): its lists address title memory that no host
@@ -30,6 +31,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
 use super::make::{self, Pending};
+use crate::ray_settings;
 
 /// The builder's image, `[start, end)`, once mapped.
 static IMAGE: Mutex<Option<(usize, usize)>> = Mutex::new(None);
@@ -101,22 +103,10 @@ pub(crate) fn note(p: &Arc<Pending>) {
     make::begin(p);
 }
 
-/// The frame [`runs`] last decided for, and its decision.
+/// The frame [`runs`] last decided for, and its pipeline readiness.
 static DECIDED: Mutex<(u64, bool)> = Mutex::new((u64::MAX, true));
 
-/// Whether the builder is asked to run (`VICTORY_BVH_BUILDER=1`); read
-/// once.
-fn asked() -> bool {
-    static ASKED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ASKED.get_or_init(|| asked_value(std::env::var_os("VICTORY_BVH_BUILDER").as_deref()))
-}
-
-fn asked_value(value: Option<&std::ffi::OsStr>) -> bool {
-    value == Some(std::ffi::OsStr::new("1"))
-}
-
-/// Why the builder is held back, if it is: `made` (every pipeline has its
-/// host pipeline) and `asked` ([`asked`]).
+/// Why the builder is held back given its pipeline readiness and opt-in.
 fn held(made: bool, asked: bool) -> Option<&'static str> {
     if !made {
         Some("not all its pipelines are made")
@@ -131,10 +121,11 @@ fn held(made: bool, asked: bool) -> Option<&'static str> {
 /// per frame, so that a frame never runs part of the builder.
 pub(crate) fn runs() -> bool {
     static SAID: AtomicBool = AtomicBool::new(false);
+    let enabled = ray_settings::builder_enabled();
     let frame = crate::frame::current();
     let mut decided = DECIDED.lock().unwrap_or_else(|e| e.into_inner());
     if decided.0 == frame {
-        return decided.1;
+        return ray_settings::builder_runs(enabled, decided.1);
     }
     let states: Vec<Option<bool>> = {
         let mut pipelines = PIPELINES.lock().unwrap_or_else(|e| e.into_inner());
@@ -145,9 +136,8 @@ pub(crate) fn runs() -> bool {
             .map(|p| make::state(&p))
             .collect()
     };
-    let why = held(all_made(&states), asked());
-    let open = why.is_none();
-    if open != decided.1 || !SAID.swap(true, Ordering::Relaxed) {
+    let ready = all_made(&states);
+    if ready != decided.1 || !SAID.swap(true, Ordering::Relaxed) {
         let (made, refused) = (
             states.iter().filter(|s| **s == Some(true)).count(),
             states.iter().filter(|s| **s == Some(false)).count(),
@@ -158,14 +148,14 @@ pub(crate) fn runs() -> bool {
             made,
             refused,
             "BVH builder {}",
-            match why {
+            match held(ready, enabled) {
                 None => "runs".to_owned(),
                 Some(why) => format!("held back: {why}"),
             }
         );
     }
-    *decided = (frame, open);
-    open
+    *decided = (frame, ready);
+    ray_settings::builder_runs(enabled, ready)
 }
 
 /// Whether every pipeline is made (`Some(true)`); refused ones are
@@ -198,16 +188,8 @@ mod tests {
         assert!(!all_made(&[Some(true), None]), "one still being made");
     }
 
-    /// With every pipeline made the builder still runs only when asked to:
-    /// `VICTORY_BVH_BUILDER=1`, nothing else.
     #[test]
-    fn the_builder_runs_only_when_asked_to() {
-        let os = std::ffi::OsStr::new;
-        assert!(!asked_value(None));
-        assert!(asked_value(Some(os("1"))));
-        for other in ["", "0", "on", "true", " 1"] {
-            assert!(!asked_value(Some(os(other))), "{other:?}");
-        }
+    fn the_builder_reports_why_it_is_held_back() {
         assert_eq!(held(true, true), None);
         assert!(held(true, false).unwrap().contains("no host copy"));
         assert!(held(false, true).unwrap().contains("not all its pipelines"));

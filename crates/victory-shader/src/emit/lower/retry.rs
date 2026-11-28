@@ -4,6 +4,8 @@
 
 use super::*;
 
+pub(super) mod immutable;
+
 #[cfg(any(test, all(windows, feature = "host")))]
 pub(crate) fn lower(parts: &Parts) -> Result<Lowered, ShaderError> {
     lower_pruned(parts, None, false, false)
@@ -66,9 +68,24 @@ pub(crate) fn lower_literal(
     let native = parts.native;
     // Register-relative move bounds and resource paths must use the same
     // control flow as lowering. The per-lane move bounds do not apply here.
-    let p = crate::ir::build(&native.patched_code(), true, native.vgprs)?;
-    let st = crate::structure::split_literal(&p)?;
-    let res = crate::resource::track(&p, &native.layout, native.stage, Some(&st))?;
+    let mut p = crate::ir::build(&native.patched_code(), true, native.vgprs)?;
+    let mut simplified = false;
+    let (st, res, carries) = loop {
+        let st = crate::structure::split_literal(&p)?;
+        let res = crate::resource::track(&p, &native.layout, native.stage, Some(&st))?;
+        let facts = immutable::prove(&p, &st, &res, native);
+        if !facts.jumps.is_empty()
+            && let Some(folded) = crate::ir::folded(&p, &facts.jumps)?
+        {
+            p = folded;
+            simplified = true;
+            continue;
+        }
+        if simplified || !facts.carries.is_empty() {
+            literal_publish::folded_code(&p, &res, native, &facts.reads)?;
+        }
+        break (st, res, facts.carries);
+    };
     if !res.waterfall.reads.is_empty() {
         return Err(ShaderError::Unsupported {
             offset: 0,
@@ -76,20 +93,19 @@ pub(crate) fn lower_literal(
         });
     }
     let io = crate::io::raise(&p, native)?;
-    lower_with_structure(
-        &Parts {
-            p: &p,
-            st: &st,
-            res: &res,
-            io: &io,
-            ..parts.clone()
-        },
-        keep,
-        per_vertex_center,
-        // A group in literal halves takes one path: its lanes never leave
-        // past a count of threads (`Lower::can_leave_past_a_count`).
-        false,
-    )
+    let x = Parts {
+        p: &p,
+        st: &st,
+        res: &res,
+        io: &io,
+        ..parts.clone()
+    };
+    if simplified || !carries.is_empty() {
+        literal_publish::folded_roles(&x, &carries)?;
+    }
+    // A group in literal halves takes one path and cannot drop lanes
+    // past a dispatch's thread count.
+    lower_with_structure(&x, keep, per_vertex_center, false)
 }
 
 fn lower_with_structure(
@@ -104,7 +120,8 @@ fn lower_with_structure(
     let mut plan: Set<MeetSite> = Set::default();
     loop {
         let found = std::cell::RefCell::new(Set::default());
-        let r = Lower::new(parts, &bad, keep, per_vertex_center, &plan, &found).run(limits);
+        let r =
+            Lower::new(parts, &bad, keep, per_vertex_center, &plan, &found).and_then(|l| l.run(limits));
         let found = found.into_inner();
         if !found.is_empty() {
             plan.extend(found);
@@ -124,3 +141,6 @@ fn lower_with_structure(
         }
     }
 }
+
+#[cfg(test)]
+mod tests;

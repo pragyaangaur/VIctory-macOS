@@ -95,7 +95,11 @@ fn console(l: u32) -> [u32; 8] {
     ]
 }
 
-fn native(words: &[u32], wave64: bool, threads: u32, lds_bytes: u32) -> NativeProgram {
+pub(super) fn native(words: &[u32], wave64: bool, threads: u32, lds_bytes: u32) -> NativeProgram {
+    native_for_groups(words, wave64, threads, lds_bytes, 1)
+}
+
+fn native_for_groups(words: &[u32], wave64: bool, threads: u32, lds_bytes: u32, groups: u32) -> NativeProgram {
     let range = |kind, table_offset_dwords, dwords| UsedResource {
         kind,
         root: RootType::Table,
@@ -124,12 +128,19 @@ fn native(words: &[u32], wave64: bool, threads: u32, lds_bytes: u32) -> NativePr
             range(ResourceType::Uav, 16, 4),
         ],
         io: StageIo::Cs(ComputeIo {
-            // One user-data SGPR; LDS in blocks of 512 bytes (bits 15-23).
-            rsrc2: 1 << 1 | lds_bytes.div_ceil(512) << 15,
+            // One user SGPR, optional group X, LDS in blocks of 512 bytes.
+            rsrc2: 1 << 1 | u32::from(groups > 1) << 7 | lds_bytes.div_ceil(512) << 15,
             threads: [threads, 1, 1],
         }),
         code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
     }
+}
+
+pub(super) fn live_sources(out: &lower::Lowered) -> Vec<(Option<i64>, u32)> {
+    out.live_scalar_exchanges
+        .iter()
+        .filter_map(|x| x.lower_read.then_some(x.source))
+        .collect()
 }
 
 fn lowered(
@@ -170,43 +181,73 @@ fn lower_halves_limited(
     literal: bool,
     limits: bool,
 ) -> Result<lower::Lowered, crate::ShaderError> {
-    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
-    let st = structure::structure(&p).expect("structure");
-    let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("track");
+    lower_with_resources_limited(native, host_wave32, narrow_waves, literal, limits, |_, _| {})
+}
+
+fn lower_with_resources(
+    native: &NativeProgram,
+    host_wave32: bool,
+    narrow_waves: bool,
+    literal: bool,
+    adjust: impl FnOnce(&ir::Program, &mut resource::Resources),
+) -> Result<lower::Lowered, crate::ShaderError> {
+    lower_with_resources_limited(native, host_wave32, narrow_waves, literal, false, adjust)
+}
+
+fn lower_with_resources_limited(
+    native: &NativeProgram,
+    host_wave32: bool,
+    narrow_waves: bool,
+    literal: bool,
+    limits: bool,
+    adjust: impl FnOnce(&ir::Program, &mut resource::Resources),
+) -> Result<lower::Lowered, crate::ShaderError> {
+    let (p, st) = crate::range::build(&native.code, native.wave64, native.vgprs)?;
+    let st = st?;
+    let mut res = resource::track(&p, &native.layout, native.stage, Some(&st))?;
+    adjust(&p, &mut res);
     let io = io::raise(&p, native).expect("io::raise");
-    let parts = lower::Parts {
-            native,
-            p: &p,
-            st: &st,
-            io: &io,
-            res: &res,
-            inputs: Vec::new(),
-            outputs: Vec::new(),
-            prims: Vec::new(),
-            mesh_stride: 0,
-            view_marks: false,
-            atomic_locks: false,
-            atomic_lock_rounds: false,
-            atomic_umax: false,
-            bias_as_gradients: false,
-            narrow_waves,
-            uav_size_level0: false,
-            halves_rendezvous: true,
-            host_wave32,
-    };
-    let threads = match &native.io {
-        StageIo::Cs(cs) => cs.threads.iter().product::<u32>(),
-        _ => 0,
-    };
-    if literal && !limits && threads == 64 {
+    let parts = parts(native, &p, &st, &res, &io, host_wave32, narrow_waves);
+    if literal && !limits && matches!(&native.io, crate::native::StageIo::Cs(cs) if cs.threads.iter().product::<u32>() == 64) {
         lower::lower_literal(&parts, None, false)
     } else {
         lower::lower_limited(&parts, None, false, literal, limits)
     }
 }
 
+pub(super) fn parts<'a>(
+    native: &'a NativeProgram,
+    p: &'a ir::Program,
+    st: &'a structure::Structured,
+    res: &'a resource::Resources,
+    io: &'a io::Io,
+    host_wave32: bool,
+    narrow_waves: bool,
+) -> lower::Parts<'a> {
+    lower::Parts {
+        native,
+        p,
+        st,
+        io,
+        res,
+        inputs: Vec::new(),
+        outputs: Vec::new(),
+        prims: Vec::new(),
+        mesh_stride: 0,
+        view_marks: false,
+        atomic_locks: false,
+        atomic_lock_rounds: false,
+        atomic_umax: false,
+        bias_as_gradients: false,
+        narrow_waves,
+        uav_size_level0: false,
+        halves_rendezvous: true,
+        host_wave32,
+    }
+}
+
 #[cfg(windows)]
-fn shader(l: lower::Lowered) -> super::HostShader {
+pub(super) fn shader(l: lower::Lowered) -> super::HostShader {
     super::HostShader {
         stage: HwStage::Cs,
         dxil: l.dxil,
@@ -1035,6 +1076,7 @@ fn differences_in(
         literal,
         &[0; 4],
     )
+    .0
 }
 
 /// [`differences_in`] with custom contents for the structured SRV buffer at
@@ -1051,8 +1093,46 @@ fn differences_with_buffer(
     narrow_waves: bool,
     literal: bool,
     buf_data: &[u32],
-) -> Vec<String> {
-    let n = native(words, wave64, threads, lds_bytes);
+) -> (Vec<String>, usize) {
+    let views = [
+        View::Texture(1, 1, &[[0.0; 4]]),
+        View::Buffer {
+            data: buf_data,
+            stride: Stride::Structured(16),
+        },
+        View::RawUav((want.len() / per_lane * 8) as u32),
+    ];
+    differences_with_views(
+        wave64,
+        words,
+        threads,
+        per_lane,
+        want,
+        lds_bytes,
+        narrow_waves,
+        literal,
+        &views,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+#[cfg(windows)]
+fn differences_with_views(
+    wave64: bool,
+    words: &[u32],
+    threads: u32,
+    per_lane: usize,
+    want: &[u32],
+    lds_bytes: u32,
+    narrow_waves: bool,
+    literal: bool,
+    views: &[View<'_>],
+) -> (Vec<String>, usize) {
+    let lanes = want.len() / per_lane;
+    assert_eq!(lanes * per_lane, want.len());
+    let groups = u32::try_from(lanes).unwrap() / threads;
+    assert_eq!(groups * threads, lanes as u32);
+    let n = native_for_groups(words, wave64, threads, lds_bytes, groups);
     let forms = if literal {
         vec![(
             "literal halves",
@@ -1075,14 +1155,20 @@ fn differences_with_buffer(
             shader(lowered_with(&n, false, narrow_waves).expect("one wave32")),
         )]
     };
-    let views = [
-        View::Texture(1, 1, &[[0.0; 4]]),
-        View::Buffer {
-            data: buf_data,
-            stride: Stride::Structured(16),
-        },
-        View::RawUav(threads * 8),
-    ];
+    compare_dispatches(&forms, groups, per_lane, want, views)
+}
+
+#[cfg(windows)]
+pub(super) fn compare_dispatches(
+    forms: &[(&str, super::HostShader)],
+    groups: u32,
+    per_lane: usize,
+    want: &[u32],
+    views: &[View<'_>],
+) -> (Vec<String>, usize) {
+    let lanes = want.len() / per_lane;
+    assert_eq!(want.len(), lanes * per_lane, "incomplete expected row");
+    let stride = per_lane.max(8); // Older fixtures reserve eight dwords even for a shorter row.
     let _one = super::valu_tests::ONE_AT_A_TIME
         .lock()
         .unwrap_or_else(|e| e.into_inner());
@@ -1091,13 +1177,17 @@ fn differences_with_buffer(
         eprintln!("no SM 6.6 hardware device; skipped");
     }
     let mut failed = Vec::new();
+    let mut dispatches = 0;
     for (adapter, host) in &hosts {
         let wave32 = host.wave32().unwrap_or(false);
-        for (form, shader) in &forms {
+        for (form, shader) in forms {
             let label = format!("{adapter} ({form})");
             // A host of 32-lane waves only ever runs the halves. NVIDIA
             // refuses the console's own form; D3DMetal makes its pipeline
             // and then runs nothing.
+            if matches!(*form, "publication wave32" | "owner wave32") && !wave32 {
+                continue;
+            }
             if *form == "wave64" && wave32 {
                 eprintln!("{label}: one wave64 on a host of 32-lane waves; skipped");
                 continue;
@@ -1112,14 +1202,16 @@ fn differences_with_buffer(
                     &pso,
                     &Dispatch {
                         roots: vec![(0, Root::Constants(ud))],
-                        views: &views,
+                        views,
                         samplers: &[],
-                        groups: [1, 1, 1],
+                        groups: [groups, 1, 1],
                     },
                 )
                 .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
+            assert_eq!(out[0].len(), lanes * stride, "{label}: incomplete readback");
+            dispatches += 1;
             let wrong: Vec<String> = out[0]
-                .chunks(8)
+                .chunks(stride)
                 .zip(want.chunks(per_lane))
                 .enumerate()
                 .filter(|(_, (got, want))| got[..per_lane] != **want)
@@ -1131,13 +1223,13 @@ fn differences_with_buffer(
                 })
                 .collect();
             eprintln!(
-                "{label}: {} lanes of {threads} differ from the console",
+                "{label}: {} lanes of {lanes} differ from the console",
                 wrong.len()
             );
             failed.extend(wrong);
         }
     }
-    failed
+    (failed, dispatches)
 }
 
 /// A DPP row mask names the console's rows 0-3: with `row_mask:0xc` only
@@ -1885,7 +1977,7 @@ fn literal_wave64_vcc_hi_offset_matches_the_console_on_every_gpu() {
         true,
         true,
         &[0, 0, 0, 0, 7, 0, 0, 0],
-    );
+    ).0;
     assert!(failed.is_empty(), "{}", failed.join("\n"));
 }
 
@@ -2222,6 +2314,7 @@ fn early_out_program(keep_below: bool, limit: u32) -> Vec<u32> {
     w
 }
 
+#[cfg(windows)]
 fn console_early_out(keep_below: bool, limit: u32, l: u32) -> [u32; 8] {
     let active = |t: u32| if keep_below { t < limit } else { t >= limit };
     if !active(l) {
@@ -2318,6 +2411,7 @@ fn diamond_program() -> Vec<u32> {
     w
 }
 
+#[cfg(windows)]
 fn console_diamond(l: u32) -> [u32; 3] {
     if l < 36 {
         let sum: u32 = (0..36).sum();
@@ -2353,6 +2447,7 @@ fn half_add_reduction() -> Vec<u32> {
 }
 
 /// Exact IEEE-754 f16 encoding of an exact non-negative integer `n` in `0..=65504`.
+#[cfg(windows)]
 fn u32_to_f16_bits(n: u32) -> u32 {
     if n == 0 {
         return 0;
@@ -2578,7 +2673,8 @@ fn uniform_buffer_load_loop_across_halves_matches_the_console_on_every_gpu() {
             true,
             false,
             &[trips, 0, 0, 0],
-        ));
+        )
+        .0);
     }
     assert!(failed.is_empty(), "{}", failed.join("\n"));
 }
@@ -3059,6 +3155,7 @@ impl Side {
         }
     }
 
+    #[cfg(windows)]
     fn takes(self, l: u32) -> bool {
         match self {
             Side::Even => l.is_multiple_of(2),
@@ -3193,6 +3290,7 @@ fn ballot_in_a_loop_in_an_if(side: Side, limit: u32) -> Vec<u32> {
 /// The console's [`ballot_below`]`(limit)` in lane `l` of a group of
 /// `threads` where the lanes `active` runs it: the count of its console
 /// wave's active lanes below `limit`, and their high dword.
+#[cfg(windows)]
 fn console_ballot(threads: u32, l: u32, active: impl Fn(u32) -> bool, limit: u32) -> [u32; 2] {
     let wave = l & !63;
     let on = |t: u32| t < threads && active(t) && t < limit;
@@ -3264,6 +3362,7 @@ fn lane_masks_in_divergent_code_meet_between_halves() {
         }
         let halves = lowered(&native(words, true, 128, 0), true).expect("halves");
         assert_eq!(halves.wave_size, Some(32));
+        #[cfg(windows)]
         if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref())
         {
             v.validate(&mut halves.dxil.clone())
@@ -3319,6 +3418,7 @@ fn lane_masks_in_divergent_code_meet_between_halves() {
 /// console wave with no upper half (96), and the branch in a loop run
 /// twice (the epochs).
 #[test]
+#[cfg(windows)]
 fn lane_masks_in_divergent_code_match_the_console_on_every_gpu() {
     let mut failed = Vec::new();
     let cases = [
@@ -4115,7 +4215,7 @@ fn a_first_lane_read_only_active_lanes_see_matches_the_console_on_every_gpu() {
                 false,
                 false,
                 &[41, 0, 0, 0],
-            );
+            ).0;
             failed.extend(
                 found
                     .into_iter()
@@ -4250,7 +4350,7 @@ fn a_first_lane_read_of_a_multiply_accumulate_matches_the_console_on_every_gpu()
                     .collect();
                 let found = differences_with_buffer(
                     true, &words, threads, 1, &want, 0, false, false, &[41, 0, 0, 0],
-                );
+                ).0;
                 failed.extend(
                     found
                         .into_iter()
@@ -4385,7 +4485,7 @@ fn a_first_lane_read_of_an_alike_value_in_a_region_matches_the_console_on_every_
                         .collect();
                     let found = differences_with_buffer(
                         true, &words, threads, 2, &want, 0, false, false, &[0; 4],
-                    );
+                    ).0;
                     failed.extend(found.into_iter().map(|m| {
                         format!("{label}(mbcnt={with_mbcnt}, inside={inside}) {threads} threads: {m}")
                     }));
@@ -4745,7 +4845,6 @@ const PERM_PAYLOAD: u32 = 0xDEAD_BE00;
 /// combination. The same-row form also checks full EXEC with BOUND_CTRL
 /// set. Each masked or potentially out-of-bounds read starts with `v1`
 /// holding [`PERM_OLD`]. EXEC is whole again for every store.
-#[cfg(windows)]
 fn permlane16_program(lanes: u32, other_row: bool) -> Vec<u32> {
     let wave64 = lanes > 32;
     let full = |w: &mut Vec<u32>| {
@@ -6023,3 +6122,797 @@ fn a_register_index_waterfall_matches_the_console_on_every_gpu() {
     }
     assert!(failed.is_empty(), "{}", failed.join("\n"));
 }
+
+#[derive(Clone, Copy, Debug)]
+enum Prefix {
+    Stable,
+    TwoGroups,
+    Unfenced,
+    LoopStore,
+    LateStore,
+    LaneCarry,
+    SplitLimit,
+}
+
+/// Each lane publishes one dword, then waves read unequal-length prefixes.
+/// The XOR carry crosses a back edge as a first-lane scalar. Wave zero skips
+/// the loop entirely, and a partial last wave consumes only its own prefix.
+fn bvh_prefix(case: Prefix) -> Vec<u32> {
+    let mut w = PROLOGUE.to_vec();
+    // Two 512-thread groups publish different data and write disjoint outputs.
+    if matches!(case, Prefix::TwoGroups) {
+        w.extend([
+            0x8F0F_8901, // s_lshl_b32 s15, s1, 9 (group base)
+            0x4A20_000F, // v_add_nc_u32 v16, s15, v0
+            0x3420_2085, // v_lshlrev_b32 v16, 5, v16
+        ]);
+    } else {
+        w.push(0x3420_0085); // v_lshlrev_b32 v16, 5, v0
+    }
+    let shift = if matches!(case, Prefix::SplitLimit) {
+        5
+    } else {
+        6
+    };
+    w.extend([
+        0x3404_0082, // v_lshlrev_b32 v2, 2, v0 (LDS offset)
+        0x4A06_008B, // v_add_nc_u32 v3, 11, v0
+    ]);
+    if matches!(case, Prefix::TwoGroups) {
+        w.push(0x4A06_060F); // v_add_nc_u32 v3, s15, v3
+    }
+    w.extend([
+        0xD834_0000,
+        0x0000_0302, // ds_write_b32 v2, v3
+        S_WAITCNT_LGKM,
+    ]);
+    if !matches!(case, Prefix::Unfenced) {
+        w.push(0xBF8A_0000); // s_barrier
+    }
+    w.extend([
+        0x2C08_0080 | shift, // v_lshrrev_b32 v4, shift, v0 (prefix length)
+        0x7E12_0289,         // v_mov_b32 v9, 9
+        0xBE92_0389,         // s_mov_b32 s18, 9 (carry)
+        0xBE93_0380,         // s_mov_b32 s19, 0 (cursor)
+        0xBE98_047E,         // s_mov_b64 s[24:25], exec
+        0x7DA2_0880,         // v_cmpx_lt_u32 exec, 0, v4
+    ]);
+    let skip = w.len();
+    w.extend([0, 0xBF82_0001]); // skip empty prefixes; enter after the feedback
+    let feedback = w.len();
+    w.extend([
+        0x7E24_0509, // v_readfirstlane_b32 s18, v9
+        0x7E0A_0213, // v_mov_b32 v5, s19
+        0x340A_0A82, // v_lshlrev_b32 v5, 2, v5
+        0xD8D8_0000,
+        0x0600_0005, // ds_read_b32 v6, v5
+        S_WAITCNT_LGKM,
+    ]);
+    if matches!(case, Prefix::LoopStore) {
+        w.extend([0xD834_0000, 0x0000_0302]); // the next read can race this write
+    }
+    w.push(0x3A12_0C12); // v_xor_b32 v9, s18, v6
+    if matches!(case, Prefix::LaneCarry) {
+        w.push(0x3A12_1300); // v_xor_b32 v9, v0, v9
+    }
+    w.extend([
+        0x8013_8113, // s_add_u32 s19, s19, 1
+        0x7DA2_0813, // v_cmpx_lt_u32 exec, s19, v4
+    ]);
+    w.push(0xBF89_0000 | ((feedback as i32 - w.len() as i32 - 1) as u32 & 0xffff));
+    w[skip] = s_cbranch_execz(w.len() - skip - 1);
+    w.push(0xBEFE_0418); // s_mov_b64 exec, s[24:25]
+    if matches!(case, Prefix::LateStore) {
+        w.extend([0xD834_0000, 0x0000_0902]); // alias a slower wave's reads
+    }
+    w.extend(store(9, 0));
+    w.push(S_ENDPGM);
+    w
+}
+
+/// A value can be identical across one console wave and different in the next.
+fn bvh_wave_owner() -> Vec<u32> {
+    let mut words = PROLOGUE.to_vec();
+    words.extend([
+        0x3420_0085, // v16 = x * 32 (output byte address)
+        0x3404_0082, // v2 = x * 4
+        0xD834_0000, 0x0000_0002, // LDS[x] = x
+        S_WAITCNT_LGKM, 0xBF8A_0000, // publish all group-local words
+        0x2C08_0086, // v4 = x >> 6
+        0x340A_0882, // v5 = v4 * 4
+        0xD8D8_0000, 0x0600_0005, // v6 = LDS[x >> 6]
+        S_WAITCNT_LGKM,
+        0x7E24_0506, // s18 = firstlane(v6)
+        0x7E12_0212, // v9 = s18
+    ]);
+    words.extend(store(9, 0));
+    words.push(S_ENDPGM);
+    words
+}
+
+#[test]
+fn bvh_first_lane_preserves_console_wave_ownership() {
+    for (words, threads) in [(bvh_wave_owner(), 128), (bvh_prefix(Prefix::Stable), 256)] {
+        let n = native(&words, true, threads, threads * 4);
+        let lower = |ticket| {
+            super::with_thread_ticket(ticket, || lowered_with(&n, true, true).unwrap())
+        };
+        let ticket = lower(true);
+        assert_eq!(ticket.wave_size, Some(32), "{threads} threads");
+        // Each local thread ID must come from the chosen lane mapping. A raw
+        // threadIdInGroup broadcast would be identical with tickets disabled.
+        assert_ne!(ticket.dxil, lower(false).dxil, "{threads} threads");
+    }
+}
+
+#[test]
+fn bvh_first_lane_shapes_lower() {
+    for threads in [512, 256, 128, 96, 64, 32] {
+        let (groups, case) = if threads == 512 { (2, Prefix::TwoGroups) } else { (1, Prefix::Stable) };
+        let n = native_for_groups(&bvh_prefix(case), true, threads, 4 * threads, groups);
+        lower_halves(&n, true, false, threads == 64)
+            .unwrap_or_else(|e| panic!("{threads} threads: {e}"));
+    }
+    for case in [
+        Prefix::SplitLimit,
+        Prefix::Unfenced,
+        Prefix::LoopStore,
+        Prefix::LateStore,
+        Prefix::LaneCarry,
+    ] {
+        // Lockstep predication can exchange these reads. The recurrence proof
+        // itself must not elide the exchange when any premise fails.
+        let why = lower::NO_PREDICATION.with(|off| {
+            let previous = off.replace(true);
+            let why = refusal(&bvh_prefix(case), 512, 2048);
+            off.set(previous);
+            why
+        });
+        assert!(why.contains("first-lane read"), "{case:?}: {why}");
+    }
+}
+
+#[cfg(windows)]
+pub(super) fn in_bounded_gpu_child(test: &str) -> bool {
+    use std::process::Command;
+    use std::time::{Duration, Instant};
+
+    const CHILD: &str = "VICTORY_WAVE_GPU_TEST_CHILD";
+    if std::env::var(CHILD).as_deref() == Ok(test) {
+        return true;
+    }
+    let mut child = Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", test, "--nocapture"])
+        .env(CHILD, test)
+        .spawn()
+        .expect("start GPU child");
+    let start = Instant::now();
+    loop {
+        if let Some(status) = child.try_wait().expect("poll GPU child") {
+            assert!(status.success(), "{test} exited {status}");
+            return false;
+        }
+        if start.elapsed() > Duration::from_secs(45) {
+            child.kill().expect("terminate stalled GPU child");
+            child.wait().expect("reap GPU child");
+            panic!("{test} exceeded 45 seconds");
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+#[test]
+#[cfg(windows)]
+fn bvh_first_lane_shapes_match_console_on_gpu() {
+    if !in_bounded_gpu_child("emit::halves_tests::bvh_first_lane_shapes_match_console_on_gpu") {
+        return;
+    }
+    let compare = |words: &[u32], threads, lds, literal, want: &[u32]| {
+        let (failed, dispatches) =
+            differences_with_buffer(true, words, threads, 1, want, lds, true, literal, &[0; 4]);
+        assert!(dispatches > 0, "no hardware dispatch for {threads} threads");
+        assert!(failed.is_empty(), "{}", failed.join("\n"));
+    };
+    for threads in [32, 64, 96, 128, 256, 512] {
+        let (groups, case) = if threads == 512 {
+            (2, Prefix::TwoGroups)
+        } else {
+            (1, Prefix::Stable)
+        };
+        let want: Vec<_> = (0..groups * threads)
+            .map(|id| {
+                let wave = (id % threads) / 64;
+                (0..wave).fold(9, |carry, i| carry ^ (id / threads * 512 + i + 11))
+            })
+            .collect();
+        compare(
+            &bvh_prefix(case),
+            threads,
+            4 * threads,
+            threads == 64,
+            &want,
+        );
+    }
+    let wave_ids: Vec<_> = (0..128).map(|id| id / 64).collect();
+    compare(&bvh_wave_owner(), 128, 512, false, &wave_ids);
+    // Select single boundary lanes, both half-end lanes, and the empty mask.
+    // Empty EXEC selects console lane zero, including in a partial tail wave.
+    for (mask, index) in [(63, 0), (63, 31), (63, 32), (63, 63), (31, 31), (63, 64)] {
+        let mask_words = [
+            0x3606_0080 | mask,  // v_and_b32 v3, mask, v0
+            0x7D84_0680 | index, // v_cmp_eq_u32 vcc, index, v3
+        ];
+        let words = readfirstlane_in_branch(&mask_words, true, false);
+        let threads = 96;
+        let want: Vec<_> = (0..threads)
+            .map(|id| {
+                let base = id & !63;
+                (base..threads.min(base + 64))
+                    .find(|l| l & mask == index)
+                    .unwrap_or(base)
+            })
+            .collect();
+        compare(&words, threads, 0, false, &want);
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum VoteExit {
+    Straight,
+    Drain,
+    Join,
+    ReplacedExec,
+}
+
+/// Save EXEC, write both EXEC and SCC from a mask, then restore EXEC before
+/// using the original SCC to choose a mask. Each selected lane writes 29.
+fn wave32_restored_vote(candidate: u32, exit: VoteExit, partial: bool) -> Vec<u32> {
+    let mut w = PROLOGUE.to_vec();
+    w.extend([
+        0x3420_0085, // v16 = local x * 32
+        0x7e0a_02ab, // v5 = 43 (inactive lanes retain this)
+        0xbe98_037e, // save full EXEC in s24
+    ]);
+    if partial {
+        w.extend([0xbefe_03ff, 0x0000_ffff]); // low 16 lanes
+    }
+    w.extend([
+        0xbe92_037e,                              // save caller's EXEC in s18
+        0x7d84_0080 | candidate.trailing_zeros(), // VCC = candidate lane
+        0xbe96_036a,                              // save the comparison mask in s22
+        0x7da4_0080,                              // EXEC now contains only lane zero
+        0xbe96_4716,                              // s22 = EXEC = s22 & ~EXEC; SCC = EXEC != 0
+    ]);
+    let branch = w.len();
+    match exit {
+        VoteExit::Straight => {}
+        VoteExit::Drain => w.push(0xbf89_fffe), // repeat the update while EXEC != 0
+        VoteExit::Join => w.push(0xbf89_0000), // empty EXEC falls directly into the select block
+        VoteExit::ReplacedExec => w.extend([
+            0xbefe_0380, // overwrite EXEC without changing SCC
+            0xbf89_fffd, // tests the overwritten EXEC, not the SCC producer's
+        ]),
+    }
+    w.extend([
+        0xbefe_0312, // restore caller's EXEC without changing SCC
+        0x7d84_0080, // VCC = (x == 0)
+        0x8513_807e, // s19 = SCC ? EXEC : 0
+        0x8814_6a13, // s20 = s19 | VCC
+        0xd501_0005,
+        (128 + 17) | ((128 + 29) << 9) | (20 << 18), // v5 = s20[x] ? 29 : 17
+        0xbefe_0318,                                 // restore full EXEC for readback
+    ]);
+    w.extend(store(5, 0));
+    w.push(S_ENDPGM);
+    if matches!(exit, VoteExit::Join) {
+        // Nonempty EXEC takes a detour back to the same select with SCC still set.
+        let detour = w.len();
+        w[branch] |= (detour - branch - 1) as u32;
+        let back = (branch as isize - detour as isize) as u16;
+        w.push(0xbf82_0000 | u32::from(back));
+    }
+    w
+}
+
+#[test]
+fn wave32_drained_exec_scc_lowers_at_its_exit() {
+    for partial in [false, true] {
+        let candidate = if partial { 1 << 7 } else { 1 << 31 };
+        let n = native(
+            &wave32_restored_vote(candidate, VoteExit::Drain, partial),
+            false,
+            32,
+            0,
+        );
+        lower_halves(&n, true, true, false).unwrap();
+    }
+    // A mask update alone cannot prove SCC false. A second incoming edge
+    // or a branch on a different EXEC cannot prove it either.
+    for (candidate, exit) in [
+        (1, VoteExit::Straight),
+        (1 << 31, VoteExit::Straight),
+        (1 << 31, VoteExit::Join),
+        (1 << 31, VoteExit::ReplacedExec),
+    ] {
+        let n = native(&wave32_restored_vote(candidate, exit, false), false, 32, 0);
+        let why = lower_halves(&n, true, true, false)
+            .err()
+            .expect("unproven SCC");
+        assert!(
+            why.to_string().contains("a lane mask read as data"),
+            "{exit:?}: {why}"
+        );
+    }
+}
+
+#[test]
+#[cfg(windows)]
+fn wave32_drained_exec_scc_matches_console_on_gpu() {
+    if !in_bounded_gpu_child("emit::halves_tests::wave32_drained_exec_scc_matches_console_on_gpu") {
+        return;
+    }
+    for partial in [false, true] {
+        let candidate = if partial { 1 << 7 } else { 1 << 31 };
+        let words = wave32_restored_vote(candidate, VoteExit::Drain, partial);
+        let expected: Vec<_> = (0..32)
+            .map(|lane| {
+                if partial && lane >= 16 {
+                    43
+                } else if lane == 0 {
+                    29
+                } else {
+                    17
+                }
+            })
+            .collect();
+        let (failed, dispatches) =
+            differences_with_buffer(false, &words, 32, 1, &expected, 0, true, false, &[0; 4]);
+        assert!(dispatches > 0, "no wave32 device dispatch");
+        assert!(failed.is_empty(), "{}", failed.join("\n"));
+    }
+}
+
+#[derive(Clone, Copy)]
+enum LatchChoice {
+    Scalar(u32),
+    LaneVote,
+    SplitSelector,
+}
+
+/// The first set mask bit selects a lane. Its value and a first-lane
+/// result decide whether the scalar counter advances by one or two.
+fn two_latch_first_lane(mask: &[u32], choice: LatchChoice) -> Vec<u32> {
+    let mut words = PROLOGUE.to_vec();
+    words.extend([
+        0x3420_0085, // v16 = v0 * 32 (output byte offset).
+        0x7E04_0280, // v2 = 0 (result before any iteration).
+        0xBE9C_0380, // s28 = 0 (iteration count).
+    ]);
+    let seed = match choice {
+        LatchChoice::LaneVote => None,
+        LatchChoice::Scalar(value) => Some(value),
+        LatchChoice::SplitSelector => Some(40),
+    };
+    if let Some(seed) = seed {
+        words.extend(MASK_LANES_40_41);
+        words.extend([
+            0x8794_6a7e, // s[20:21] = EXEC & VCC
+            0xbe99_1414, // s25 = first set bit of s[20:21]
+        ]);
+        if matches!(choice, LatchChoice::SplitSelector) {
+            // The per-lane form takes different incoming edges for this
+            // scalar phi. An indexed read with that selector can disagree.
+            words.extend([
+                0x7d88_00a0,
+                0xbf87_0002,
+                0xbe99_0380,
+                0xbf82_0001,
+                0xbe99_03a8,
+            ]);
+        }
+        words.extend([0xd760_0018, 0x0000_3300]); // s24 = v0[s25]
+        words.extend([0x4a0c_0080 | seed, 0x7e34_0506]); // s26 = firstlane(v0 + seed)
+    }
+    let head = words.len();
+    words.extend([0xBF06_821C, 0]); // s_cmp_eq_u32 s28, 2; s_cbranch_scc1 exit.
+    words.extend([
+        0x4A08_0087, // v4 = v0 + 7.
+        0x4A08_081C, // v4 += s28.
+    ]);
+    words.extend_from_slice(mask);
+    words.extend([
+        0xBE96_246A, // s_and_saveexec_b64 s[22:23], vcc.
+        0x7E18_0504, // v_readfirstlane_b32 s12, v4.
+        0xBEFE_0416, // s_mov_b64 exec, s[22:23].
+        0x7E04_020C, // v2 = s12.
+    ]);
+    let (compare, branch) = match choice {
+        LatchChoice::LaneVote => (0x7d88_00a0, 0xbf87_0000), // per-lane VCC
+        _ => (0xbf06_1a18, 0xbf85_0000),                     // s_cmp_eq_u32 s24, s26
+    };
+    words.push(compare);
+    let fork = words.len();
+    words.push(0);
+    words.extend([0x811C_821C, 0]); // s28 += 2; s_branch head.
+    let choose_one = words.len();
+    words.extend([0x811C_811C, 0]); // s28 += 1; s_branch head.
+    let exit = words.len();
+    words.extend(store(2, 0));
+    words.push(S_ENDPGM);
+    for (at, to, opcode) in [
+        (head + 1, exit, 0xBF85_0000),
+        (fork, choose_one, branch),
+        (fork + 2, head, 0xBF82_0000),
+        (choose_one + 1, head, 0xBF82_0000),
+    ] {
+        words[at] = opcode | u32::from((to as isize - at as isize - 1) as i16 as u16);
+    }
+    words
+}
+
+const TWO_LATCH_CASES: [(&[u32], u32); 4] = [
+    (&MASK_LANES_8_9, 16),
+    (&MASK_LANES_40_41, 48),
+    (&MASK_LANES_12_44, 20),
+    (&MASK_EMPTY, 8),
+];
+
+/// Load a dispatch-invariant word from this program's own constant table.
+/// Adding zero or one to the broadcast seed selects a different latch.
+fn two_latch_code_table(value: u32) -> Vec<u32> {
+    let mut words = two_latch_first_lane(&MASK_LANES_8_9, LatchChoice::Scalar(40));
+    let header = words.iter().position(|&w| w == 0xbf06_821c).unwrap();
+    let mut load = [
+        0xbe82_1f00, // s_getpc_b64 s[2:3]
+        0xf400_0781,
+        0xfa00_0000, // s_load_dword s30, s[2:3], table offset
+        S_WAITCNT_LGKM,
+        0x801a_1e1a, // s26 += s30
+    ];
+    load[2] |= ((words.len() + load.len() - header - 1) * 4) as u32;
+    words.splice(header..header, load);
+    words.push(value);
+    words
+}
+
+#[test]
+fn two_latch_code_table_loads_can_choose_the_latch() {
+    for data in [0, 1] {
+        let n = native(&two_latch_code_table(data), true, 64, 0);
+        assert_eq!(lowered_with(&n, true, true).unwrap().wave_size, Some(32));
+    }
+}
+
+#[test]
+fn two_latch_scalar_reads_lower_in_one_full_wave() {
+    for (mask, _) in TWO_LATCH_CASES {
+        for seed in [40, 41] {
+            let words = two_latch_first_lane(mask, LatchChoice::Scalar(seed));
+            let n = native(&words, true, 64, 0);
+            lowered(&n, false).expect("native wave64 control");
+            let split = lowered_with(&n, true, true).expect("one wave in two halves");
+            assert_eq!(split.wave_size, Some(32));
+        }
+    }
+}
+
+#[test]
+fn two_latch_unproved_arrivals_keep_the_first_lane_refusal() {
+    let refused = |mask, choice, threads| {
+        let words = two_latch_first_lane(mask, choice);
+        let n = native(&words, true, threads, 0);
+        let error = lowered_with(&n, true, true)
+            .err()
+            .expect("unproved exchange");
+        assert!(
+            error
+                .to_string()
+                .contains("a first-lane read of a value that may differ"),
+            "{error}"
+        );
+    };
+    for (mask, _) in TWO_LATCH_CASES {
+        refused(mask, LatchChoice::LaneVote, 64);
+    }
+    refused(&MASK_LANES_40_41, LatchChoice::SplitSelector, 64);
+    for threads in [48, 128] {
+        refused(&MASK_LANES_8_9, LatchChoice::Scalar(40), threads);
+    }
+}
+
+#[test]
+fn two_latch_waterfall_read_keeps_its_per_lane_value() {
+    let words = two_latch_first_lane(&MASK_LANES_8_9, LatchChoice::Scalar(40));
+    let n = native(&words, true, 64, 0);
+    // Exercise the resource tracker's contract: it marks descriptor reads
+    // that forward the lane's own VGPR in place of an actual broadcast.
+    let result = lower_with_resources(&n, true, true, false, |p, res| {
+        let value = p
+            .blocks
+            .iter()
+            .flat_map(|b| &b.insts)
+            .filter(|i| i.name() == "v_readfirstlane_b32")
+            .find_map(|i| i.write(ir::Reg::S(26)))
+            .unwrap();
+        res.waterfall.reads.push(value);
+    });
+    let error = result
+        .err()
+        .expect("a lane-local descriptor read cannot choose a uniform latch");
+    assert!(
+        error
+            .to_string()
+            .contains("a first-lane read of a value that may differ"),
+        "{error}"
+    );
+}
+
+#[test]
+#[cfg(windows)]
+fn two_latch_scalar_reads_match_console_on_gpu() {
+    if !in_bounded_gpu_child("emit::halves_tests::two_latch_scalar_reads_match_console_on_gpu") {
+        return;
+    }
+    for (data, expected) in [(0, 16), (1, 15)] {
+        let words = two_latch_code_table(data);
+        let (failed, dispatches) = differences_with_buffer(
+            true,
+            &words,
+            64,
+            1,
+            &[expected; 64],
+            0,
+            true,
+            false,
+            &[0; 4],
+        );
+        assert!(dispatches > 0, "no code-table dispatch");
+        assert!(failed.is_empty(), "{}", failed.join("\n"));
+    }
+    for (mask, at_one) in TWO_LATCH_CASES {
+        // Seed 40 selects the +1 latch and the last iteration is i=1.
+        // Seed 41 selects +2, exiting immediately after iteration i=0.
+        for (seed, result) in [(40, at_one), (41, at_one - 1)] {
+            let words = two_latch_first_lane(mask, LatchChoice::Scalar(seed));
+            let (failed, dispatches) = differences_with_buffer(
+                true,
+                &words,
+                64,
+                1,
+                &[result; 64],
+                0,
+                true,
+                false,
+                &[0; 4],
+            );
+            assert!(dispatches > 0, "no hardware dispatch");
+            assert!(failed.is_empty(), "{}", failed.join("\n"));
+        }
+    }
+}
+
+#[test]
+fn two_latch_mutable_scalar_load_cannot_prove_convergence() {
+    let mut words = two_latch_first_lane(&MASK_LANES_8_9, LatchChoice::Scalar(40));
+    let head = words.iter().position(|&w| w == 0xBF06_821C).unwrap();
+    // Read a root pointer's word, then write 1 to a distinct word per lane.
+    // Lane zero writes the one the scalar load just read. The two host
+    // waves can read different values before arriving at the next exchange.
+    let add = [
+        0xF400_0781,
+        0xFA00_0040,
+        S_WAITCNT_LGKM, // s30 = *(s[2:3]+0x40)
+        0x7e0e_0281,    // v7 = 1
+        0x37 << 26 | 0x1C << 18 | 2 << 14 | 0x40,
+        (2 << 16) | (7 << 8) | 16,
+        0x801a_1e1a, // s26 = broadcast_seed + s30
+    ];
+    words.splice(head..head, add);
+    let mut n = native(&words, true, 64, 0);
+    n.layout.push(RootParam {
+        root: RootType::Constants,
+        user_data: 2,
+        slot: 1,
+        sgprs: 2,
+        table_offset_dwords: 0,
+        base_register: 0,
+    });
+    if let StageIo::Cs(cs) = &mut n.io {
+        cs.rsrc2 = 4 << 1;
+    }
+    let result = lowered_with(&n, true, true);
+    let error = result.err().expect("accepted mutable scalar latch");
+    assert!(
+        error
+            .to_string()
+            .contains("a first-lane read of a value that may differ"),
+        "{error}"
+    );
+}
+
+/// The scalar read ignores EXEC. Its dynamic byte offset is lane 40's ID
+/// minus 32. Lane zero then overwrites both words at that same address.
+fn two_latch_buffer(mask: &[u32]) -> Vec<u32> {
+    let mut words = two_latch_first_lane(mask, LatchChoice::Scalar(40));
+    let header = words.iter().position(|&w| w == 0xbf06_821c).unwrap();
+    let mut input = vec![0xf408_0b02, 0xfa00_0020, S_WAITCNT_LGKM]; // table SRV s[44:47]
+    input.extend_from_slice(mask);
+    input.extend([
+        0xbe96_246a, // save EXEC in s[22:23] and intersect it with VCC
+        0xf424_0796,
+        0x301f_ffe0, // s_buffer_load_dwordx2 s[30:31], s[44:47], s24-32
+        S_WAITCNT_LGKM,
+        0xbefe_0416, // restore EXEC
+        0x801a_1e1a, // s26 += s30 (latch choice)
+        0x7e10_021f, // v8 = s31 (second captured word)
+        0x7e0e_0287, // v7 = 7
+    ]);
+    input.extend(store(7, 8));
+    input.extend(store(0, 12));
+    input.extend(store(8, 4));
+    words.splice(header..header, input);
+    words
+}
+
+#[test]
+fn two_latch_buffer_publishes_every_dword() {
+    for (mask, _) in TWO_LATCH_CASES {
+        let words = two_latch_buffer(mask);
+        let n = native(&words, true, 64, 0);
+        lowered_with(&n, false, true).expect("native wave64 control");
+        let split = lowered_with(&n, true, true).expect("published scalar-buffer result");
+        let mut constants = words.clone();
+        let at = constants.iter().position(|&w| w == 0xf424_0796).unwrap();
+        constants[at..at + 2].copy_from_slice(&[0xbe9e_0380, 0xbe9f_0381]);
+        let control = lowered_with(&native(&constants, true, 64, 0), true, true).unwrap();
+        assert_eq!(split.wave_size, Some(32));
+        assert_eq!(split.barriers, control.barriers + 4, "two exchanges");
+    }
+}
+
+#[test]
+fn lockstep_while_preserves_two_latch_scalar_publication() {
+    let mut words = while_loop_first_lane(true);
+    words.pop();
+    let store_at = words.len() - 2;
+    words[store_at..].copy_from_slice(&store(2, 16));
+    words.extend(&two_latch_buffer(&MASK_LANES_40_41)[PROLOGUE.len()..]);
+    let split = lowered_with(&native(&words, true, 64, 0), true, true)
+        .expect("lockstep while and published two-latch loop lower together");
+    assert_eq!(split.wave_size, Some(32));
+    assert_eq!(live_sources(&split).len(), 2, "both published words stay live");
+}
+
+#[test]
+#[cfg(windows)]
+fn two_latch_buffer_matches_pre_store_words_on_gpu() {
+    if !in_bounded_gpu_child("emit::halves_tests::two_latch_buffer_matches_pre_store_words_on_gpu")
+    {
+        return;
+    }
+    for (mask, at_one) in TWO_LATCH_CASES {
+        let words = two_latch_buffer(mask);
+        for choice in [0, 1] {
+            let mut input = vec![0x1357_9bdf; 64 * 8];
+            input[2] = choice;
+            input[3] = 0x2468_ace1;
+            let mut expected = input.clone();
+            for (lane, row) in expected.as_chunks_mut::<8>().0.iter_mut().enumerate() {
+                row[..4].copy_from_slice(&[at_one - choice, input[3], 7, lane as u32]);
+            }
+            let views = [
+                View::Texture(1, 1, &[[0.0; 4]]),
+                View::Buffer {
+                    data: &input,
+                    stride: Stride::Raw,
+                },
+                View::RawUavData(&input),
+            ];
+            let (failed, dispatches) =
+                differences_with_views(true, &words, 64, 8, &expected, 0, true, false, &views);
+            assert!(dispatches > 0, "no scalar-buffer dispatch");
+            assert!(failed.is_empty(), "{}", failed.join("\n"));
+        }
+    }
+}
+
+#[test]
+fn two_latch_buffer_requires_proved_arrival_and_source() {
+    let words = two_latch_buffer(&MASK_LANES_8_9);
+    let refused = |n: &NativeProgram| {
+        let why = lowered_with(n, true, true)
+            .err()
+            .expect("unproved scalar-buffer exchange");
+        assert!(
+            why.to_string()
+                .contains("a first-lane read of a value that may differ"),
+            "{why}"
+        );
+    };
+    for threads in [48, 128] {
+        refused(&native(&words, true, threads, 0));
+    }
+    let at = words.iter().position(|&w| w == 0xf424_0796).unwrap();
+    for cache_bit in [14, 16] {
+        let mut coherent = words.clone();
+        coherent[at] |= 1 << cache_bit;
+        refused(&native(&coherent, true, 64, 0));
+    }
+    let n = native(&words, true, 64, 0);
+    for descriptor in [false, true] {
+        let error = lower_with_resources(&n, true, true, false, |p, res| {
+            let read = res
+                .descriptors
+                .iter()
+                .find(|d| p.blocks[d.site.0].insts[d.site.1].name() == "s_buffer_load_dwordx2")
+                .unwrap();
+            if descriptor {
+                let resource::Source::Loaded { load, .. } = read.source else {
+                    unreachable!()
+                };
+                res.waterfall.loads.push(load);
+            } else {
+                let offset = p.blocks[read.site.0].insts[read.site.1]
+                    .read(ir::Reg::S(24))
+                    .unwrap();
+                res.waterfall.reads.push(offset);
+            }
+        })
+        .err()
+        .expect("waterfall input to a scalar-buffer read");
+        assert!(
+            error
+                .to_string()
+                .contains("a first-lane read of a value that may differ"),
+            "{error}"
+        );
+    }
+    let mut cbv = native(&words, true, 64, 0);
+    cbv.used[1].kind = ResourceType::Cbv;
+    refused(&cbv);
+    let mut wide = n.clone();
+    wide.used[1].dwords = 8;
+    refused(&wide);
+    let mut interior = n.clone();
+    interior.used[1].table_offset_dwords -= 1;
+    refused(&interior);
+
+    // The additional read in the loop supplies the latch choice itself.
+    let mut inside = words.clone();
+    let head = inside.iter().position(|&w| w == 0xbf06_821c).unwrap();
+    inside[head + 2..head + 4].copy_from_slice(&words[at..at + 2]);
+    let first = inside.iter_mut().find(|w| **w == 0x7e18_0504).unwrap();
+    *first = 0x7e18_0500; // firstlane(v0), independent of the replaced v4
+    let compare = inside.iter_mut().find(|w| **w == 0xbf06_1a18).unwrap();
+    *compare = 0xbf06_1a1e; // s_cmp_eq_u32 s30, s26
+    refused(&native(&inside, true, 64, 0));
+}
+
+#[test]
+fn two_latch_buffer_requires_bijective_half_ids() {
+    let mut words = two_latch_buffer(&MASK_LANES_8_9);
+    let at = words.iter().position(|&w| w == 0x3420_0085).unwrap();
+    words.splice(at..at, [0x3406_0285, 0x4a00_0103]); // v0 = y * 32 + x
+    let mut n = native(&words, true, 64, 0);
+    n.io = StageIo::Cs(ComputeIo {
+        rsrc2: 1 << 1 | 1 << 11,
+        threads: [32, 2, 1],
+    });
+    let lower = |ticket| super::with_thread_ticket(ticket, || lowered_with(&n, true, true));
+    assert_eq!(lower(true).unwrap().wave_size, Some(32));
+    let why = lower(false)
+        .err()
+        .expect("two 16x2 host tiles can round to the same half");
+    assert!(
+        why.to_string()
+            .contains("a first-lane read of a value that may differ"),
+        "{why}"
+    );
+}
+
+mod indexed;
+
+pub(super) mod literal_lds;
+pub(super) mod literal_publish;
+mod terminal_owner;
+mod normal_publication;
