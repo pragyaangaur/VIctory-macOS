@@ -149,8 +149,8 @@ fn gpu_reads_record_counts_from_tables_and_heaps_after_both_sync_modes() {
         crate::descriptor::create_placed_srv(null, &placed_buffer, &placed, at(4));
         crate::descriptor::create_uav(null, source, null, &[39, 1, 4, 0, 3, 0, 0, 0, 1, 0], at(5));
         crate::descriptor::create_uav(null, result, null, &output, at(7));
-        let dispatch = |index: u32, table: [u32; 3], view: [u32; 3]| {
-            let args = [32, 7 * 32, 0, index]; // input table starts at slot 1
+        let dispatch = |table_start: u32, index: u32, table: [u32; 3], view: [u32; 3]| {
+            let args = [table_start * 32, 7 * 32, 0, index];
             assert_eq!(dwords, args.len() as u32);
             let list = host.new_list().expect("open list");
             // SAFETY: open list with live descriptor heaps, root signature and PSO.
@@ -178,6 +178,11 @@ fn gpu_reads_record_counts_from_tables_and_heaps_after_both_sync_modes() {
 
         heap.sync_slots_bytes_mode(0..SLOTS, start, 32, (start, &title), true, quick);
         let table = fields(address + 64, 9);
+        let dynamic = heap
+            .dynamic(1)
+            .expect("dynamic descriptor for a remapped table");
+        let original = crate::descriptor::view(at(0)).expect("recorded raw SRV");
+        heap.make_at(dynamic, &original);
         for (slot, view) in [
             (0, fields(address + 16, 52)),  // raw: bytes
             (2, table),                     // structured: elements
@@ -187,22 +192,24 @@ fn gpu_reads_record_counts_from_tables_and_heaps_after_both_sync_modes() {
             (6, [0; 3]),
             (1 << 21, [0; 3]), // null
         ] {
-            dispatch(slot, table, view);
+            dispatch(1, slot, table, view);
         }
+        // The same dynamic slot is readable only through the remapped table.
+        dispatch(dynamic - 1, dynamic, fields(address + 16, 52), [0; 3]);
 
         // Replace an SRV with the same base address and only a different count.
         crate::descriptor::create_srv(null, source, &raw(4, 1), at(0));
         title[2 * 32..3 * 32].fill(0);
         title[4 * 32..5 * 32].fill(0);
         heap.sync_slots_bytes_mode(0..SLOTS, start, 32, (start, &title), true, quick);
-        dispatch(0, [0; 3], fields(address + 16, 4));
-        dispatch(4, [0; 3], [0; 3]);
+        dispatch(1, 0, [0; 3], fields(address + 16, 4));
+        dispatch(1, 4, [0; 3], [0; 3]);
     }
     // SAFETY: plain device health query.
     assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
     crate::object::release_ref(result);
     crate::object::release_ref(source);
-    eprintln!("executed 18 descriptor metadata GPU dispatches, checked 126 dwords");
+    eprintln!("executed 20 descriptor metadata GPU dispatches, checked 140 dwords");
 }
 
 #[test]

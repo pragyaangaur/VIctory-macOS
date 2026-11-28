@@ -156,8 +156,8 @@
 //!   a copy holding each such address.
 //! * **View addresses** ([`HostShader::view_addresses`]): words a program
 //!   reads as numbers from a buffer or image descriptor come from the root
-//!   SRV `t1` in [`MEMORY_SPACE`]. A 16-byte header contains the slot
-//!   count in dword 3, followed by four dwords per resource-heap index.
+//!   SRV `t1` in [`MEMORY_SPACE`]. A 16-byte header contains the title and
+//!   total slot counts in dwords 2 and 3, followed by four dwords per slot.
 //!   A buffer view holds its title address (high dword bits 0-15, stride
 //!   bits 0) and record count (dword 2, bytes for raw views and elements
 //!   for typed and structured views). A texture view holds width and

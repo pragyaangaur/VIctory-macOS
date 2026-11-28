@@ -1365,8 +1365,8 @@ impl HostHeap {
     }
 
     /// The slots' view addresses and the host buffer holding them, made on
-    /// first use. The 16-byte header is a null entry with the slot count in
-    /// dword 3, so shader loads can check indices against the actual table.
+    /// first use. The 16-byte header is a null entry with the title and total
+    /// slot counts in dwords 2 and 3, so shader loads can check their indices.
     pub(crate) fn view_addresses(&self) -> Option<(&ID3D12Resource, u64)> {
         let made = if let Some(made) = self.addresses.get() {
             made
@@ -1380,7 +1380,7 @@ impl HostHeap {
                 let (buffer, header) = host()?.upload_buffer((u64::from(slots) + 1) * 16)?;
                 crate::host::name(&buffer, || "view addresses".into());
                 // SAFETY: our live buffer starts with a 16-byte header.
-                unsafe { header.cast::<[u32; 4]>().write_unaligned([0, 0, 0, slots]) };
+                unsafe { header.cast::<[u32; 4]>().write_unaligned([0, 0, self.count, slots]) };
                 let data = header as usize + 16;
                 for (i, &key) in made.iter().enumerate() {
                     let view = (key != 0).then(|| view_at(key as u32, (key >> 32) as u32)).flatten();
@@ -2044,7 +2044,9 @@ impl HostHeap {
                     && index < addr_slots
                 {
                     if let Some(resolved_buf) = resolved_buf {
-                        write_buffer_address(data, index as usize, resolved_buf.address, resolved_buf.records);
+                        write_buffer_address(
+                            data, index as usize, resolved_buf.address, resolved_buf.records,
+                        );
                     } else {
                         write_address(data, index as usize, Some(view));
                     }
@@ -3128,8 +3130,8 @@ fn write_address(data: usize, index: usize, view: Option<&View>) {
         // SAFETY: the mapped view addresses hold 16 bytes per slot.
         unsafe { ((data + 16 * index) as *mut [u32; 4]).write_unaligned(words) };
     } else {
-        let address = view.and_then(buffer_range).map_or(0, |(address, _)| address);
-        let records = view.and_then(buffer_records).unwrap_or(0);
+        let (address, len) = view.and_then(buffer_range).unwrap_or_default();
+        let records = if len == 0 { 0 } else { view.and_then(buffer_records).unwrap_or(0) };
         write_buffer_address(data, index, address, records);
     }
 }
