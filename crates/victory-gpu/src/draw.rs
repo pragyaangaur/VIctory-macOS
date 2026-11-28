@@ -452,6 +452,14 @@ pub(crate) fn take_dropped() -> u64 {
 }
 static DROPPED: AtomicU64 = AtomicU64::new(0);
 
+/// Dispatches of the BVH builder held back on purpose (`pipeline::builder`)
+/// since the last call. They are not missing a host pipeline, so the frame
+/// line counts them apart from [`take_dropped`].
+pub(crate) fn take_held() -> u64 {
+    HELD.swap(0, Ordering::Relaxed)
+}
+static HELD: AtomicU64 = AtomicU64::new(0);
+
 /// Marks the last traced draw as not run on the host, counts it by why
 /// (the reason [`not_run`] gave, if its pipeline has a host one) and notes
 /// it in the list (diagnostics).
@@ -1571,7 +1579,7 @@ impl State {
         // (`pipeline::builder`).
         if crate::pipeline::held_back(self.pipeline as This) {
             once!("a dispatch of the BVH builder held back");
-            DROPPED.fetch_add(1, Ordering::Relaxed);
+            HELD.fetch_add(1, Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
             dropped(list, self.pipeline, "dispatch");
             return;
