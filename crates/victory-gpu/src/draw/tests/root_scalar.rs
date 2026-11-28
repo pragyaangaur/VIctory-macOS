@@ -144,10 +144,11 @@ fn scalar_loads_read_root_memory_across_copies_and_after_rebinding() {
         eprintln!("no D3D12 device; skipped");
         return;
     };
+    let _one = crate::memory::tests::gpu_test_lock();
     let pipeline = pipeline();
     let page = crate::watch::PAGE;
-    let source = crate::watch::tests::pool(2);
-    let output = crate::watch::tests::pool(1);
+    let source = crate::memory::tests::pool(2);
+    let output = crate::memory::tests::pool(1);
     let make_word = |word| 0xA514_0000u32 ^ word as u32;
     // SAFETY: one committed two-page source and one committed output page.
     unsafe {

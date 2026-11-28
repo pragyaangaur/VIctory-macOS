@@ -853,7 +853,7 @@ pub(crate) fn bind(list: &HostList, key: usize) -> Option<Map> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::backend::HostGpu;
     use victory_formats::pagetable::table;
@@ -1289,7 +1289,7 @@ void main() {
         assert!(has_missed(&marks, &l), "page 0 of a region that is not the first");
     }
 
-    fn gpu_test_lock() -> std::sync::MutexGuard<'static, ()> {
+    pub(crate) fn gpu_test_lock() -> std::sync::MutexGuard<'static, ()> {
         static LOCK: Mutex<()> = Mutex::new(());
         LOCK.lock().unwrap_or_else(|e| e.into_inner())
     }
@@ -1427,7 +1427,7 @@ void main(uint3 id : SV_DispatchThreadID) {
 
     /// A pool of title memory (below 2^40, as the runtime places it),
     /// `pages` 64 KiB pages, write-watched as its pools.
-    fn pool(pages: usize) -> usize {
+    pub(crate) fn pool(pages: usize) -> usize {
         use crate::watch::PAGE;
         use windows_sys::Win32::System::Memory::{
             MEM_ADDRESS_REQUIREMENTS, MEM_COMMIT, MEM_EXTENDED_PARAMETER, MEM_RESERVE, MemExtendedParameterAddressRequirements,
