@@ -2706,7 +2706,9 @@ mod tests {
             ));
         }
         // Where the hardware has mesh shaders: the shapes within the limit
-        // draw; D3DMetal makes no-op pipelines of the others.
+        // draw; D3DMetal makes no-op pipelines of the others, which are
+        // made but not drawn: a draw with one never finished on an M3 Pro
+        // (macOS 26.2, D3DMetal 4.0 beta 3), and the queue stayed blocked.
         #[cfg(windows)]
         {
             use super::host::{Draw, Host, Root};
@@ -2739,29 +2741,28 @@ mod tests {
                 let root = host
                     .root_signature_for(&[(ms, D3D12_SHADER_VISIBILITY_MESH)])
                     .unwrap();
-                let drawn = host
-                    .mesh_pipeline_with(&root, &ms.dxil, &ps)
-                    .and_then(|pso| {
-                        host.draw(
-                            &root,
-                            &pso,
-                            &Draw {
-                                roots: vec![(0, Root::Constants(vec![0]))],
-                                textures: &[],
-                                samplers: &[],
-                                vertices: &[],
-                                stride: 0,
-                                size: (16, 16),
-                                mesh_groups: 1,
-                            },
-                        )
-                    });
-                let drawn = drawn.map(|t| t.iter().all(|t| *t == [1.0, 0.5, 0.25, 1.0]));
-                if bytes <= METAL_MESH_OUTPUT_BYTES {
-                    assert_eq!(drawn, Ok(true), "{label}: {bytes} bytes");
-                } else {
-                    eprintln!("{label}: {bytes} bytes, drawn {drawn:?}");
+                let pso = host.mesh_pipeline_with(&root, &ms.dxil, &ps);
+                if bytes > METAL_MESH_OUTPUT_BYTES {
+                    eprintln!("{label}: {bytes} bytes, pipeline made {}", pso.is_ok());
+                    continue;
                 }
+                let drawn = pso.and_then(|pso| {
+                    host.draw(
+                        &root,
+                        &pso,
+                        &Draw {
+                            roots: vec![(0, Root::Constants(vec![0]))],
+                            textures: &[],
+                            samplers: &[],
+                            vertices: &[],
+                            stride: 0,
+                            size: (16, 16),
+                            mesh_groups: 1,
+                        },
+                    )
+                });
+                let drawn = drawn.map(|t| t.iter().all(|t| *t == [1.0, 0.5, 0.25, 1.0]));
+                assert_eq!(drawn, Ok(true), "{label}: {bytes} bytes");
             }
         }
     }
@@ -4291,13 +4292,22 @@ mod tests {
                         )
                     };
                     let expected = [1.0, 0.5, 0.25, 1.0];
-                    // D3DMetal draws nothing with the standalone pair.
+                    // D3DMetal makes a no-op pipeline of the standalone pair. It
+                    // is made, not drawn: a draw with it never finished on an
+                    // M3 Pro, and the linked draw below queued behind it.
                     let full_ps = emit_pruned(&ps_in, Options::default(), None).unwrap();
-                    let standalone_drawn = draw(&standalone, &full_ps)
-                        .map(|t| t.iter().filter(|t| **t == expected).count());
+                    let standalone_made = host
+                        .root_signature_for(&[
+                            (&standalone, D3D12_SHADER_VISIBILITY_MESH),
+                            (&full_ps, D3D12_SHADER_VISIBILITY_PIXEL),
+                        ])
+                        .and_then(|root| {
+                            host.mesh_pipeline_with(&root, &standalone.dxil, &full_ps.dxil)
+                        })
+                        .is_ok();
                     eprintln!(
                         "{label}, scalar first {scalar_first}: {refused} bytes, \
-                         {standalone_drawn:?} of 256 texels drawn"
+                         standalone pipeline made {standalone_made}"
                     );
                     let texels = draw(&linked_ms, &linked_ps)
                         .unwrap_or_else(|e| panic!("{label}: linked mesh draw: {e}"));
