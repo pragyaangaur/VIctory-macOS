@@ -6799,3 +6799,73 @@ fn lanes_past_a_count_stay_out_of_exec_in_halves_on_every_gpu() {
     }
     assert!(failed.is_empty(), "{}", failed.join("\n"));
 }
+
+#[cfg(windows)]
+#[test]
+#[ignore = "explicit matched D3DMetal completion benchmark"]
+fn narrower_exec_completion() {
+    let host = Host::new(false).expect("D3D12 hardware");
+    assert!(host.wave32().expect("query hardware lane width"));
+    let mut words = readfirstlane_of_a_scalar_in_branch(&MASK_LANES_12_44, false, true, true);
+    let output = words
+        .iter()
+        .position(|&word| word == 0x3420_0085)
+        .expect("output address");
+    words.splice(
+        output..output + 1,
+        [
+            0x8F02_8601, // s_lshl_b32 s2, s1, 6: group X ID * 64
+            0x4A22_0002, // v_add_nc_u32 v17, s2, v0: global thread index
+            0x3420_2282, // v_lshlrev_b32 v16, 2, v17: compact output dword address
+        ],
+    );
+    let mut program = native(&words, true, 64, 0);
+    let StageIo::Cs(cs) = &mut program.io else {
+        unreachable!("compute fixture")
+    };
+    cs.rsrc2 |= 1 << 7;
+    let lowered = lowered(&program, true).expect("production shader lowering");
+    eprintln!(
+        "NARROW_EXEC_SHAPE wave_size={:?} barriers={}",
+        lowered.wave_size, lowered.barriers
+    );
+    let shader = shader(lowered);
+    let (root, pipeline) = host
+        .compute_pipeline(&shader)
+        .expect("D3DMetal compute pipeline");
+    for groups in [1, 8192] {
+        let views = [
+            View::Texture(1, 1, &[[0.0; 4]]),
+            View::Buffer {
+                data: &[41, 0, 0, 0],
+                stride: Stride::Structured(16),
+            },
+            View::RawUav(groups * 64),
+        ];
+        let constants = vec![0u32; shader.user_data_dwords().max(1) as usize];
+        let request = Dispatch {
+            roots: vec![(0, Root::Constants(constants))],
+            views: &views,
+            samplers: &[],
+            groups: [groups, 1, 1],
+        };
+        for iteration in 0..15 {
+            eprintln!("NARROW_EXEC_BEGIN groups={groups} iteration={iteration}");
+            let out = host
+                .dispatch(&root, &pipeline, &request)
+                .expect("dispatch and readback");
+            assert_eq!(out[0].len(), (groups * 64) as usize);
+            for (thread, &got) in out[0].iter().enumerate() {
+                let want = if thread & 31 == 12 {
+                    42.0f32.to_bits()
+                } else {
+                    0
+                };
+                assert_eq!(
+                    got, want,
+                    "groups {groups}, dispatch {iteration}, thread {thread}"
+                );
+            }
+        }
+    }
+}
