@@ -4173,7 +4173,8 @@ fn a_first_lane_read_under_narrower_exec_matches_the_console_on_every_gpu() {
         assert!(!Host::each_hardware().is_empty(), "required hardware GPU");
     }
     let value = (41.0f32 + 1.0).to_bits();
-    let cases: [(&[u32], fn(u32) -> bool); 4] = [
+    type MaskCase = (&'static [u32], fn(u32) -> bool);
+    let cases: [MaskCase; 4] = [
         (&MASK_LANES_8_9, |lane| lane >> 1 == 4),
         (&MASK_LANES_40_41, |lane| lane >> 1 == 20),
         (&MASK_LANES_12_44, |lane| lane & 31 == 12),
