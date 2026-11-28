@@ -24,7 +24,7 @@ use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 
 use super::{
-    HeldSource, element_size, in_buffer, raw_structured, srv_desc, view_kind, view_stride,
+    HeldSource, element_size, in_buffer, raw_structured, record_count, srv_desc, view_kind, view_stride,
     widened_format, widened_w,
 };
 use crate::bindless::Seen;
@@ -46,6 +46,8 @@ pub(super) struct ResolvedBuffer {
     own: bool,
     widened: Option<Arc<Widened>>,
     pub(super) stride: u32,
+    /// The original view's count, before converting its host format.
+    pub(super) records: u32,
     /// Title address stored in `HostHeap::addresses` (`0` for `View::Constant`,
     /// matching `write_address` / `buffer_range`).
     pub(super) address: u64,
@@ -149,12 +151,13 @@ pub(super) fn resolve(view: &View) -> Option<ResolvedBuffer> {
         return None;
     }
     // SAFETY: `desc.ViewDimension == D3D12_SRV_DIMENSION_BUFFER` verified above.
-    let (first_elem, count, struct_stride) = unsafe {
+    let (first_elem, count, struct_stride, raw) = unsafe {
         let b = desc.Anonymous.Buffer;
         (
             b.FirstElement,
             b.NumElements,
             u64::from(b.StructureByteStride),
+            b.Flags.0 & D3D12_BUFFER_SRV_FLAG_RAW.0 != 0,
         )
     };
     let start = address.checked_add(first_elem.checked_mul(element)?)?;
@@ -221,6 +224,11 @@ pub(super) fn resolve(view: &View) -> Option<ResolvedBuffer> {
         widened,
         stride: view_stride(view) | view_kind(view),
         address: if has_view_address { start } else { 0 },
+        records: if has_view_address {
+            record_count(count, raw).unwrap_or(0)
+        } else {
+            0
+        },
         seen,
         epoch,
     })
@@ -228,6 +236,8 @@ pub(super) fn resolve(view: &View) -> Option<ResolvedBuffer> {
 
 #[cfg(test)]
 mod tests {
+    mod records;
+
     use std::sync::atomic::Ordering;
 
     use super::*;

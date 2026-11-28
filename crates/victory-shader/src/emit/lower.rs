@@ -5507,41 +5507,45 @@ impl<'a> Lower<'a> {
     }
 
     /// A descriptor load from a table or heap whose dwords the program only
-    /// reads as numbers: the base address of a buffer view (dwords 0 and 1,
-    /// as a pointer to title memory: the BVH's address in its SRV) or, for
-    /// a whole image descriptor (eight dwords), also the size fields of
+    /// reads as numbers: a buffer view's address and record count (dwords
+    /// 0-2), or, for a whole image descriptor (eight dwords), also the size fields of
     /// dwords 1-3 (width, height, first and last level, type: size queries
     /// of a texture the program never samples). They come from the host's
-    /// view addresses, `t1` in [`super::shader::MEMORY_SPACE`]: four dwords
-    /// per heap index.
+    /// view addresses, `t1` in [`super::shader::MEMORY_SPACE`]: a null
+    /// header with title and total slot counts, followed by four
+    /// dwords per heap index.
     // shortcut: dword 1 holds the address bits only (stride and swizzle read
     // 0) or a texture's width bits, dword 3 a texture's size fields (format,
-    // tiling and swizzle choice read 0 or the identity); dword 4 on and a
-    // buffer's dwords 2-3 (record count, format) stop the program when read;
-    // the table offset's computed part is taken as whole descriptors
-    // (32-byte multiples).
+    // tiling and swizzle choice read 0 or the identity). A buffer's format
+    // and image dwords 4-7 still stop the program when read. The record
+    // count requires a descriptor-aligned computed offset.
     fn view_addresses(&mut self, inst: &Inst, site: Site, code: u8, count: u32) -> Result<(), Why> {
         const OTHER: Why = "a descriptor read only as data";
         let a = *self.scalar.get(&site).ok_or("a descriptor read only as data")?;
-        if !matches!(
-            self.x.native.layout.get(a.param).map(|p| p.root),
-            Some(RootType::Table | RootType::ResourceHeap)
-        ) {
-            return Err("a descriptor read only as data");
-        }
+        let slot_count = match self.x.native.layout.get(a.param).map(|p| p.root) {
+            Some(RootType::ResourceHeap) => 8, // title slots only
+            Some(RootType::Table) => 12, // includes remapped dynamic tables
+            _ => return Err("a descriptor read only as data"),
+        };
         // The compiler loads image descriptors whole, buffer ones as four
         // dwords.
         let known = if count == 8 && a.offset.is_multiple_of(32) { 4 } else { 2 };
+        let records = self.record_word_aligned(a);
         let views = self.s.view_addresses_handle();
+        let slot_count_offset = self.s.m.i32(slot_count);
+        let slots = self.raw_dword(views, slot_count_offset);
         for k in 0..count {
             let word = (a.offset / 4 + k) % 8;
-            let val = if word < known {
+            let val = if word < known || (word == 2 && records) {
                 let index = self.heap_index(site, k as u8, false)?;
                 let c = self.cur;
+                let valid = self.s.m.cmp(c, pred::IULT, index, slots);
                 let four = self.s.m.i32(4);
                 let at = self.s.m.bin(c, Bin::Shl, index, four);
-                let w = self.s.m.i32(4 * word);
+                let w = self.s.m.i32(16 + 4 * word);
                 let at = self.s.m.bin(c, Bin::Add, at, w);
+                let null = self.s.m.i32(0);
+                let at = self.s.m.select(c, valid, at, null);
                 Val::I32(self.raw_dword(views, at))
             } else {
                 Val::Missing(OTHER)

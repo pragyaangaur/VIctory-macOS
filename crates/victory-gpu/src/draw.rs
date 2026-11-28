@@ -1402,12 +1402,13 @@ impl State {
                     .then(|| crate::descriptor::heap(self.heaps[0] as This).host())
                     .flatten()
                     .and_then(|h| h.view_addresses());
-                let Some(gpu) = gpu else {
+                let Some((buffer, gpu)) = gpu else {
                     once!("a shader reading a view's address dropped: no view heap");
                     not_run("view addresses without a view heap");
                     return false;
                 };
-                // SAFETY: an open list; the heap's buffer lives with the heap.
+                list.keep(buffer);
+                // SAFETY: an open list; the list retains the metadata buffer.
                 unsafe {
                     if compute {
                         l.SetComputeRootShaderResourceView(param, gpu);
@@ -2377,6 +2378,10 @@ impl State {
                 use std::hash::{Hash, Hasher};
                 let mut h = std::collections::hash_map::DefaultHasher::new();
                 n.hash(&mut h);
+                // A table made before the metadata buffer existed has no
+                // entry there. Build a new table on the first use of those
+                // words instead of reusing slots with empty metadata.
+                host.has_view_addresses().hash(&mut h);
                 for k in 0..n {
                     let at = table + u64::from(k) * 32;
                     // SAFETY: a descriptor slot in title memory.

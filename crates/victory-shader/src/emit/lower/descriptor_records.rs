@@ -6,6 +6,26 @@
 use super::*;
 
 impl Lower<'_> {
+    /// Whether the byte offset's low bits are known to select the same
+    /// descriptor word in every slot. Accept an immediate offset, or an
+    /// index scaled to whole slots by a constant scalar shift.
+    pub(super) fn record_word_aligned(&self, a: Address) -> bool {
+        a.offset.is_multiple_of(4)
+            && a.dynamic.is_none_or(|v| {
+                let Some(inst) = self.def_inst(v) else {
+                    return false;
+                };
+                match &inst.fields {
+                    Fields::Sop { src, .. } if inst.name() == "s_lshl_b32" => src
+                        .get(1)
+                        .copied()
+                        .and_then(scalar_constant)
+                        .is_some_and(|shift| (shift & 31) >= 5),
+                    _ => false,
+                }
+            })
+    }
+
     /// The handle properties of the buffer descriptor that `site` loads
     /// whole from a table slot, when the program never accesses it: by its
     /// used-resource entry's stride, structured (the record count in

@@ -1364,33 +1364,43 @@ impl HostHeap {
             .collect()
     }
 
-    /// The host address of the slots' view addresses (see the field), made
-    /// on first use from the slots made so far.
-    pub(crate) fn view_addresses(&self) -> Option<u64> {
-        let made = self.addresses.get_or_init(|| {
-            // The view is a root view, which has no bounds: an entry for
-            // every slot a table can lie in, the dynamic ones too (a table
-            // made afresh on a host whose heap is smaller than the title's
-            // read past the title slots' entries: whatever followed the
-            // buffer, or a GPU fault).
-            let (buffer, data) = host()?.upload_buffer(u64::from(self.address_slots()) * 16)?;
-            crate::host::name(&buffer, || "view addresses".into());
-            let data = data as usize;
+    /// The slots' view addresses and the host buffer holding them, made on
+    /// first use. The 16-byte header is a null entry with the title and total
+    /// slot counts in dwords 2 and 3, so shader loads can check their indices.
+    pub(crate) fn view_addresses(&self) -> Option<(&ID3D12Resource, u64)> {
+        let made = if let Some(made) = self.addresses.get() {
+            made
+        } else {
+            // Keep publication under the same lock as title-slot updates.
+            // A mirror between the snapshot and publication would see no
+            // table to update and leave stale metadata in the new buffer.
             let made = self.made.lock().unwrap_or_else(|e| e.into_inner());
-            for (i, &key) in made.iter().enumerate() {
-                let view = (key != 0).then(|| view_at(key as u32, (key >> 32) as u32)).flatten();
-                write_address(data, i, view.as_deref());
-            }
-            // Dynamic slots are entered as they are made ([`Self::make_at`],
-            // [`Self::make_null`], raw views).
-            for i in self.count..self.address_slots() {
-                write_address(data, i as usize, None);
-            }
-            // SAFETY: a live buffer.
-            let gpu = unsafe { buffer.GetGPUVirtualAddress() };
-            Some((buffer, data, gpu))
-        });
-        made.as_ref().map(|m| m.2)
+            self.addresses.get_or_init(|| {
+                let slots = self.address_slots();
+                let (buffer, header) = host()?.upload_buffer((u64::from(slots) + 1) * 16)?;
+                crate::host::name(&buffer, || "view addresses".into());
+                // SAFETY: our live buffer starts with a 16-byte header.
+                unsafe { header.cast::<[u32; 4]>().write_unaligned([0, 0, self.count, slots]) };
+                let data = header as usize + 16;
+                for (i, &key) in made.iter().enumerate() {
+                    let view = (key != 0).then(|| view_at(key as u32, (key >> 32) as u32)).flatten();
+                    write_address(data, i, view.as_deref());
+                }
+                // Dynamic slots are entered as they are made ([`Self::make_at`]).
+                for i in self.count..slots {
+                    write_address(data, i as usize, None);
+                }
+                // SAFETY: a live buffer.
+                let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+                Some((buffer, data, gpu))
+            })
+        };
+        made.as_ref().map(|(buffer, _, gpu)| (buffer, *gpu))
+    }
+
+    /// Whether dynamic tables made now can also publish their metadata.
+    pub(crate) fn has_view_addresses(&self) -> bool {
+        matches!(self.addresses.get(), Some(Some(_)))
     }
 
     /// The slots the view addresses have an entry for: the title's and the
@@ -1412,9 +1422,8 @@ impl HostHeap {
     /// view addresses' buffer (tests).
     #[cfg(test)]
     fn address_at(&self, index: u32) -> Option<u64> {
-        let (buffer, data, _) = self.addresses.get()?.as_ref()?;
-        // SAFETY: a live buffer.
-        if 16 * u64::from(index) + 16 > unsafe { buffer.GetDesc() }.Width {
+        let (_, data, _) = self.addresses.get()?.as_ref()?;
+        if index >= self.address_slots() {
             return None;
         }
         // SAFETY: an entry of the mapped view addresses (checked).
@@ -2035,7 +2044,9 @@ impl HostHeap {
                     && index < addr_slots
                 {
                     if let Some(resolved_buf) = resolved_buf {
-                        write_buffer_address(data, index as usize, resolved_buf.address);
+                        write_buffer_address(
+                            data, index as usize, resolved_buf.address, resolved_buf.records,
+                        );
                     } else {
                         write_address(data, index as usize, Some(view));
                     }
@@ -3112,23 +3123,54 @@ fn element_size(desc: &D3D12_SHADER_RESOURCE_VIEW_DESC) -> u64 {
 
 /// Writes slot `index`'s words into the view addresses at `data` (the
 /// caller keeps `index` below [`HostHeap::address_slots`]), 16 bytes a
-/// slot: a buffer view's title address (dword 0 low, dword 1 bits 0-15
-/// high), a texture view's size fields ([`texture_words`]), zeros for
-/// anything else.
+/// slot: a buffer view's title address and record count, a texture view's
+/// size fields ([`texture_words`]), or zeros for anything else.
 fn write_address(data: usize, index: usize, view: Option<&View>) {
-    let address = view.and_then(buffer_range).map_or(0, |(a, _)| a);
-    let words = match view.and_then(texture_words) {
-        Some(words) => words,
-        None => [address as u32, (address >> 32) as u32 & 0xFFFF, 0, 0],
+    if let Some(words) = view.and_then(texture_words) {
+        // SAFETY: the mapped view addresses hold 16 bytes per slot.
+        unsafe { ((data + 16 * index) as *mut [u32; 4]).write_unaligned(words) };
+    } else {
+        let (address, len) = view.and_then(buffer_range).unwrap_or_default();
+        let records = if len == 0 { 0 } else { view.and_then(buffer_records).unwrap_or(0) };
+        write_buffer_address(data, index, address, records);
+    }
+}
+
+/// A buffer descriptor's dword 2: bytes for a raw view, elements for
+/// structured and typed views. Counts outside the field cannot describe
+/// a valid buffer view.
+fn record_count(elements: u32, raw: bool) -> Option<u32> {
+    if raw { elements.checked_mul(4) } else { Some(elements) }
+}
+
+fn buffer_records(view: &View) -> Option<u32> {
+    let (unordered, words): (bool, &[u32; 10]) = match view {
+        View::Shader(_, Some(desc)) => (false, desc),
+        View::Unordered(_, _, Some(desc)) => (true, desc),
+        View::Placed(unordered, resource, desc) if resource[0] == 1 => {
+            (*unordered, desc[..10].try_into().ok()?)
+        }
+        _ => return None,
     };
-    // SAFETY: the mapped view addresses hold 16 bytes per title and dynamic
-    // slot (below `address_slots`).
-    unsafe { ((data + 16 * index) as *mut [u32; 4]).write_unaligned(words) };
+    if words[1] != 1 {
+        return None;
+    }
+    if unordered {
+        // SAFETY: a buffer view's union member.
+        let b = unsafe { uav_desc(words).Anonymous.Buffer };
+        let raw = b.Flags.0 & D3D12_BUFFER_UAV_FLAG_RAW.0 != 0;
+        record_count(b.NumElements, raw)
+    } else {
+        // SAFETY: a buffer view's union member.
+        let b = unsafe { srv_desc(words).Anonymous.Buffer };
+        let raw = b.Flags.0 & D3D12_BUFFER_SRV_FLAG_RAW.0 != 0;
+        record_count(b.NumElements, raw)
+    }
 }
 
 /// Fast path of [`write_address`] for pre-resolved buffer views (never a texture).
-fn write_buffer_address(data: usize, index: usize, address: u64) {
-    let words = [address as u32, (address >> 32) as u32 & 0xFFFF, 0, 0];
+fn write_buffer_address(data: usize, index: usize, address: u64, records: u32) {
+    let words = [address as u32, (address >> 32) as u32 & 0xFFFF, records, 0];
     // SAFETY: the mapped view addresses hold 16 bytes per title and dynamic
     // slot (below `address_slots`).
     unsafe { ((data + 16 * index) as *mut [u32; 4]).write_unaligned(words) };
@@ -4828,7 +4870,7 @@ mod tests {
             let info = host.device.GetResourceAllocationInfo(0, &[desc]);
             (desc, info.SizeInBytes)
         };
-        assert_eq!(desc.Width, 16 * u64::from(end));
+        assert_eq!(desc.Width, 16 * (u64::from(end) + 1));
         assert!(size >= desc.Width + 8, "room for the mark");
         let past = (data + 16 * end as usize) as *mut u64;
         let mark = 0x5a5a_5a5a_5a5a_5a5a;
