@@ -329,7 +329,7 @@ Single game runs vary by about 20 % (where the camera looks, streaming, heat), m
 tools/macos/bench-ab.sh --exe <game executable> --a "VICTORY_TWIN_UAV_READS=0" --b "VICTORY_TWIN_UAV_READS=1" --runs 4
 ```
 
-It ends with `cargo xtask bench-compare <dir>`: each run's median frame time, each side's median, B - A, and a bootstrap 95 % interval of it. An interval that holds 0 means those runs cannot tell A from B; add runs. Reports and logs are in `target/bench/<date>`.
+It ends with `cargo xtask bench-compare <dir>`: each run's median frame time, each side's median, B - A, and a bootstrap 95 % interval of it. An interval that holds 0 means those runs cannot tell A from B; add runs. Reports and logs are in `~/Library/Caches/victory-bench/<date>`, outside the repository, where the game refuses to write them; `--out` must be outside it too. If the warm-up run writes no report, the script stops there instead of running the rest for nothing.
 
 ## Optional switches for slow storage, low memory and speed
 

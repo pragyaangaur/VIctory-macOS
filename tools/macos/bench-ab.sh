@@ -18,7 +18,9 @@ cd "$(dirname "$0")/../.."
 root="$PWD"
 exe="" a="" b="" runs=4 frames=300 warmup=120
 replay="$root/tools/macos/bench/stand-still.json"
-out="$root/target/bench/$(date +%Y%m%d-%H%M%S)"
+# The game refuses to write VICTORY_BENCH_OUT inside the repository
+# (victory_gpu::bench::ensure_outside_repo), so the reports go to the cache.
+out="$HOME/Library/Caches/victory-bench/$(date +%Y%m%d-%H%M%S)"
 while [ $# -gt 0 ]; do
     case "$1" in
         --exe) exe="$2"; shift 2 ;;
@@ -35,6 +37,13 @@ done
 [ -n "$exe" ] || { echo "--exe <game executable> is needed" >&2; exit 2; }
 [ -f "$replay" ] || { echo "no replay script $replay" >&2; exit 2; }
 mkdir -p "$out"
+out="$(cd "$out" && pwd -P)"
+case "$out/" in
+    "$(pwd -P)"/*)
+        echo "--out $out is inside the repository, where the game refuses to write its reports; pick a folder outside it" >&2
+        exit 2
+        ;;
+esac
 echo "A: $a" > "$out/sets.txt"
 echo "B: $b" >> "$out/sets.txt"
 
@@ -53,6 +62,9 @@ run() {
 }
 
 run warm "$a"
+# A warm run without a report means none of the others would write one
+# either (a refused path, a run that never reached the world): stop here.
+[ -f "$out/warm.json" ] || { echo "the warm-up run wrote no report; see $out/warm.log" >&2; exit 1; }
 i=1
 while [ "$i" -le "$runs" ]; do
     run "A$i" "$a"
