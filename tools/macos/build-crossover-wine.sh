@@ -42,6 +42,18 @@ BUILD="$ALIAS/target-$BUILD"
 # The deps are copied, and each library's recorded path is pointed at the
 # copy, because a prefix built elsewhere may record a folder that is gone.
 DEPS="$BUILD/deps"
+# install_name_tool warns on every call that the code signature is now
+# invalid (each library is signed again below). Its output is shown only when
+# it fails, so a new path that does not fit in a library's header stops the
+# script with the reason instead of without a word.
+rename_in() {
+  local out
+  out="$(install_name_tool "$@" 2>&1)" || {
+    print -r -- "$out" >&2
+    echo "could not relink ${@[-1]:t}: libraries built before -headerpad_max_install_names must be built again (empty ${DEPS_REAL} and run tools/macos/build-deps.sh)" >&2
+    exit 1
+  }
+}
 # A copy from before SDL2 was in the deps is made again.
 if [[ ! -f $DEPS/.relinked || ! -f $DEPS/lib/libSDL2-2.0.0.dylib ]]; then
   rm -rf "$DEPS"
@@ -49,9 +61,9 @@ if [[ ! -f $DEPS/.relinked || ! -f $DEPS/lib/libSDL2-2.0.0.dylib ]]; then
   for lib in "$DEPS"/lib/*.dylib(.N); do
     old_dir="$(otool -D "$lib" | sed -n 2p)"
     old_dir="${old_dir:h}"
-    install_name_tool -id "$DEPS/lib/${lib:t}" "$lib" 2> /dev/null
+    rename_in -id "$DEPS/lib/${lib:t}" "$lib"
     for ref in $(otool -L "$lib" | awk 'NR > 2 {print $1}' | grep -F "$old_dir/" || true); do
-      install_name_tool -change "$ref" "$DEPS/lib/${ref:t}" "$lib" 2> /dev/null
+      rename_in -change "$ref" "$DEPS/lib/${ref:t}" "$lib"
     done
     codesign -f -s - "$lib" 2> /dev/null || true
   done
