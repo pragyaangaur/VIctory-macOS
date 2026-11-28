@@ -654,6 +654,7 @@ fn track_as(start: usize, len: usize, views: bool, copy: bool) -> Option<Tracked
     ));
     let mut g = guards();
     for &page in &pages {
+        note_may_notify(page);
         g.holders.entry(page).or_default().push(changed.clone());
     }
     drop(g);
@@ -1810,6 +1811,30 @@ fn remapped(g: &mut Held, first: usize, last: usize) {
     }
 }
 
+/// Pages below this (64 KiB each, title addresses below 1 TiB) have a bit in
+/// [`MAY_NOTIFY`]; past it [`may_notify`] always answers yes.
+const MAY_PAGES: usize = 1 << 24;
+
+/// Per page, set once a tracker holds it or it is shown at another address
+/// (`Guards::holders`, `Guards::alias_of`), never cleared: where none is
+/// set, [`notify_written`] has nothing to tell. Set before the entry is made
+/// under the guard lock.
+static MAY_NOTIFY: [AtomicU64; MAY_PAGES / 64] = [const { AtomicU64::new(0) }; MAY_PAGES / 64];
+
+fn note_may_notify(page: usize) {
+    if page < MAY_PAGES {
+        MAY_NOTIFY[page / 64].fetch_or(1 << (page % 64), Ordering::Release);
+    }
+}
+
+/// Whether any page of `[first, last)` may have a tracker or an alias.
+fn may_notify(first: usize, last: usize) -> bool {
+    if last > MAY_PAGES {
+        return true;
+    }
+    (first..last).any(|page| MAY_NOTIFY[page / 64].load(Ordering::Acquire) >> (page % 64) & 1 != 0)
+}
+
 /// Reports GPU shader writes into aliased title memory `[at, at + len)` so
 /// any other trackers over those pages (such as textures' staging) know they
 /// changed and re-upload on next use. Fast-paths out when no tracker or alias
@@ -1819,6 +1844,12 @@ pub(crate) fn notify_written(at: usize, len: usize) {
         return;
     }
     let (first, last) = (at / PAGE, at.saturating_add(len).div_ceil(PAGE));
+    // Most ranges have neither: told without the guard lock, which this
+    // took ~3.5 ms a frame on an M1 Max in GTA VI's world (copy-back of
+    // copies on physical pages), the title's write faults waiting on it.
+    if !may_notify(first, last) {
+        return;
+    }
     let mut g = guards();
     if g.holders.range(first..last).next().is_none()
         && g.alias_of.range(first..last).next().is_none()
@@ -1895,6 +1926,7 @@ pub fn title_memory_aliased(at: usize, others: &[usize]) {
     let page = at / PAGE;
     for &other in others {
         for (x, y) in [(other / PAGE, page), (page, other / PAGE)] {
+            note_may_notify(x);
             let links = g.alias_of.entry(x).or_default();
             if !links.contains(&y) {
                 links.push(y);
