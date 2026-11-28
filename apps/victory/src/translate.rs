@@ -645,7 +645,7 @@ fn translate_programs(
                     *counter(t, p.stage, 0) += 1;
                     let marks =
                         emit_options(checks.wave32, victory_gpu::shader_cache::narrow_waves());
-                    match emit::emit_with(&container, &p, &program, &s, &i, &r, marks) {
+                    match emit::emit_with(container, &p, &program, &s, &i, &r, marks) {
                         Ok(shader) => {
                             *counter(t, p.stage, 1) += 1;
                             check(shader, t, checks, label);
