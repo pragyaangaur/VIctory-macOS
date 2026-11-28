@@ -892,6 +892,82 @@ pub(crate) mod tests {
         out
     }
 
+    /// DXIL part carrying an original compute program for end-to-end translator tests.
+    #[cfg(windows)]
+    pub(crate) fn compute_part(program: &NativeProgram) -> Vec<u8> {
+        assert_eq!(program.stage, HwStage::Cs);
+        let StageIo::Cs(io) = &program.io else {
+            panic!("expected compute inputs");
+        };
+        let mut blob = fssm(&[(HwStage::Cs, &program.code)]);
+        let stage = stage_data_at(&blob, HwStage::Cs);
+        let record = stage - RECORD_SIZE as usize;
+        let set_u32 = |blob: &mut [u8], at: usize, value: u32| {
+            blob[at..at + 4].copy_from_slice(&value.to_le_bytes());
+        };
+        let set_u64 = |blob: &mut [u8], at: usize, value: u64| {
+            blob[at..at + 8].copy_from_slice(&value.to_le_bytes());
+        };
+        set_u32(&mut blob, record + RECORD_REGS, u32::from(program.vgprs));
+        set_u32(
+            &mut blob,
+            record + RECORD_FLAGS,
+            if program.wave64 { 0 } else { FLAG_WAVE32 },
+        );
+        set_u32(&mut blob, stage + CS_RSRC2, io.rsrc2);
+        for (i, &n) in io.threads.iter().enumerate() {
+            set_u32(&mut blob, stage + CS_THREADS + 4 * i, n);
+        }
+        let root_kind = |kind: RootType| match kind {
+            RootType::Constants => 0,
+            RootType::Descriptor => 1,
+            RootType::Table => 3,
+            _ => panic!("unsupported test root kind {kind:?}"),
+        };
+        let layout = (blob.len() - FSSM_HEADER) as u64;
+        for entry in &program.layout {
+            for word in [
+                u32::from(root_kind(entry.root)),
+                entry.table_offset_dwords,
+                entry.sgprs,
+                entry.base_register,
+            ] {
+                blob.extend(word.to_le_bytes());
+            }
+            blob.extend([entry.user_data, entry.slot, 0, 0]);
+        }
+        let used = (blob.len() - FSSM_HEADER) as u64;
+        for entry in &program.used {
+            let kind = match entry.kind {
+                ResourceType::Srv => 0,
+                ResourceType::Sampler => 1,
+                ResourceType::Cbv => 2,
+                ResourceType::Uav => 3,
+                ResourceType::Other(n) => n,
+            };
+            blob.extend([kind, root_kind(entry.root), 0, 0]);
+            for word in [entry.table_offset_dwords, entry.lower_bound, entry.stride] {
+                blob.extend(word.to_le_bytes());
+            }
+            blob.extend([entry.dwords, entry.user_data, entry.slot, 0]);
+        }
+        let payload = (blob.len() - FSSM_HEADER) as u64;
+        set_u64(&mut blob, 8, payload);
+        set_u64(&mut blob, record + RECORD_LAYOUT, layout);
+        set_u64(&mut blob, record + RECORD_USED, used);
+        set_u32(
+            &mut blob,
+            record + RECORD_COUNTS,
+            program.layout.len() as u32,
+        );
+        set_u32(
+            &mut blob,
+            record + RECORD_COUNTS + 4,
+            program.used.len() as u32,
+        );
+        part(&[(KIND_NATIVE, &xbch(&blob))])
+    }
+
     #[test]
     fn finds_graphics_programs() {
         let native = xbch(&fssm(&[(HwStage::Vs, &VS_CODE), (HwStage::Ps, &PS_CODE)]));
