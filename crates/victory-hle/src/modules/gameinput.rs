@@ -2142,6 +2142,34 @@ mod tests {
     }
 
     #[test]
+    fn a_gamepad_reading_survives_255_changes_and_expires_on_the_next() {
+        let (hub, host) = fake();
+        host.lock().unwrap().pads[1] = Some(PadState { left_x: -1.0, ..Default::default() });
+        hub.poll();
+        let first = current(hub, GAMEPAD_KIND, 1).unwrap();
+
+        // One device changes between frames while the title keeps its last reading.
+        for i in 0..255 {
+            let x = if i % 2 == 0 { 1.0 } else { -1.0 };
+            host.lock().unwrap().pads[1].as_mut().unwrap().left_x = x;
+            hub.poll();
+        }
+        let second = walk(hub, 0x28, first).unwrap();
+        assert_eq!(stamp(second).1, stamp(first).1 + 1);
+        assert_eq!(pad(second).left_x, 1.0);
+
+        host.lock().unwrap().pads[1].as_mut().unwrap().left_x = -1.0;
+        hub.poll();
+        assert_eq!(walk(hub, 0x28, first), Err(REFERENCE_TOO_OLD));
+        let third = walk(hub, 0x28, second).unwrap();
+        assert_eq!(stamp(third).1, stamp(second).1 + 1);
+        assert_eq!(pad(third).left_x, -1.0);
+        for r in [first, second, third] {
+            release(r);
+        }
+    }
+
+    #[test]
     fn with_no_device_readings_are_walked_across_devices_in_time_order() {
         type Walk = extern "system" fn(This, *const Reading, u32, *const Device, Out) -> HRESULT;
         let any = |hub: &Hub, offset, from, kind| {
