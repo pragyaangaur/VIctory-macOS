@@ -71,6 +71,17 @@ impl Scratch {
         let owners = &mut out.owners;
         owners.clear();
         owners.resize(BLOCK, None);
+        // Initialize missing entries by block. Write pairs with their owners
+        // so populated pages need no second pass over the owner table.
+        let null_entry = [null, 0];
+        let null_end = LEVEL1 + 2 * BLOCK;
+        if self.dwords.len() < null_end {
+            self.dwords.resize(null_end, 0);
+        }
+        self.dwords[LEVEL1..null_end]
+            .as_chunks_mut::<2>()
+            .0
+            .fill(null_entry);
         let mut full = false;
         for &k in &self.order {
             let (start, len) = copies[k];
@@ -80,6 +91,7 @@ impl Scratch {
             if len == 0 || end > 1 << 40 {
                 continue;
             }
+            let entry = [pairs[k], start as u32];
             let (first, last) = (start >> 16, (end - 1) >> 16);
             // Larger copies come first: a copy holding the whole page takes
             // it from them; one holding part of it (its first or last page,
@@ -99,39 +111,47 @@ impl Scratch {
                     }
                     self.level1[l1] = out.blocks.len() as u32;
                     out.blocks.push(l1);
+                    let offset = LEVEL1 + 2 * owners.len();
                     owners.resize(owners.len() + BLOCK, None);
+                    let end = offset + 2 * BLOCK;
+                    if self.dwords.len() < end {
+                        self.dwords.resize(end, 0);
+                    }
+                    self.dwords[offset..end]
+                        .as_chunks_mut::<2>()
+                        .0
+                        .fill(null_entry);
                 }
                 let base = self.level1[l1] as usize * BLOCK;
-                let run =
-                    &mut owners[base + (page & 0xFFF) as usize..=base + (upto & 0xFFF) as usize];
+                let start = base + (page & 0xFFF) as usize;
+                let end = base + (upto & 0xFFF) as usize + 1;
+                let run = &mut owners[start..end];
+                let entries = self.dwords[LEVEL1 + 2 * start..LEVEL1 + 2 * end]
+                    .as_chunks_mut::<2>()
+                    .0;
                 let (mut from, mut to) = (0, run.len());
                 if page == first && head {
-                    run[0].get_or_insert(k);
+                    if run[0].is_none() {
+                        run[0] = Some(k);
+                        entries[0] = entry;
+                    }
                     from = 1;
                 }
                 if upto == last && tail && to > from {
-                    run[to - 1].get_or_insert(k);
                     to -= 1;
+                    if run[to].is_none() {
+                        run[to] = Some(k);
+                        entries[to] = entry;
+                    }
                 }
                 run[from..to].fill(Some(k));
+                entries[from..to].fill(entry);
                 page = upto + 1;
             }
         }
-        // The level-1 index, then a pair and an address dword per entry,
-        // written in place: the dwords are most of what a rebuild costs.
-        let len = LEVEL1 + 2 * owners.len();
-        self.dwords.resize(len, 0);
-        let (index, entries) = self.dwords.split_at_mut(LEVEL1);
-        index.copy_from_slice(&self.level1);
-        let (entries, _) = entries.as_chunks_mut::<2>();
-        for (entry, o) in entries.iter_mut().zip(owners.iter()) {
-            *entry = match *o {
-                Some(k) => [pairs[k], copies[k].0 as u32],
-                None => [null, 0],
-            };
-        }
+        self.dwords[..LEVEL1].copy_from_slice(&self.level1);
         Built {
-            dwords: &self.dwords,
+            dwords: &self.dwords[..LEVEL1 + 2 * owners.len()],
             blocks: &out.blocks,
             owners: &out.owners,
             full,
@@ -245,8 +265,9 @@ mod tests {
             copies.push(((1 << 40) - 0x8000, 0x1_0000));
             copies.push((u64::MAX - 4, 16));
             let pairs: Vec<u32> = (0..copies.len() as u32).map(|k| 0x40_000 | k).collect();
-            let built = scratch.build(&copies, &pairs, 7, &mut out);
-            let (dwords, blocks, owners, full) = page_by_page(&copies, &pairs, 7);
+            let null = round as u32 + 7;
+            let built = scratch.build(&copies, &pairs, null, &mut out);
+            let (dwords, blocks, owners, full) = page_by_page(&copies, &pairs, null);
             assert_eq!(built.blocks, blocks.as_slice(), "round {round}");
             assert_eq!(built.owners, owners.as_slice(), "round {round}");
             assert_eq!(built.full, full, "round {round}");
