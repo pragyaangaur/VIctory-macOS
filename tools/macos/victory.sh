@@ -98,6 +98,56 @@ if [ "${1:-}" = run ]; then
     "$(dirname "$WINE")/wineserver" -k 2>/dev/null || true
     "$(dirname "$WINE")/wineserver" -w 2>/dev/null || true
 fi
+# With fault tracking on, Rosetta stops on a 256-bit store that writes across
+# into a guarded page unless the loader splits it, and the loader splits the
+# stores listed in <cache_dir>/wide. Without those lists the run ends in
+# Rosetta's "EmulateForward" with no crash report. Make any that are missing
+# before the title starts: a first run binds without --execute, so the cache
+# holds the images to list (about two minutes for the executable, once).
+# Skipped when the lists are named by hand (VICTORY_PATCH_WIDE or
+# VICTORY_PATCH_WIDE_DIR), when the cache is moved (VICTORY_CACHE_DIR or
+# cache_dir in the config, a Windows path this script does not resolve), and
+# with VICTORY_WIDE_LISTS=0.
+wide_lists() {
+    [ "${VICTORY_FAULT_TRACKING:-}" = 1 ] || return 0
+    [ "${VICTORY_WIDE_LISTS:-1}" != 0 ] || return 0
+    [ -z "${VICTORY_PATCH_WIDE:-}" ] && [ -z "${VICTORY_PATCH_WIDE_DIR:-}" ] || return 0
+    case " $* " in *" --execute "*) ;; *) return 0 ;; esac
+    config="${VICTORY_CONFIG:-$caller/victory.toml}"
+    if [ -n "${VICTORY_CACHE_DIR:-}" ] || { [ -f "$config" ] && grep -Eq '^[[:space:]]*cache_dir[[:space:]]*=' "$config"; }; then
+        echo "wide-store lists: the cache is moved; make them with cargo xtask wide-stores --cache <cache_dir as a Mac path>" >&2
+        return 0
+    fi
+    caches() { ls -d "$WINEPREFIX"/drive_c/users/*/AppData/Local/victory/cache 2>/dev/null; }
+    missing() {
+        caches | while IFS= read -r cache; do
+            for image in "$cache"/images/victory-image-*.dll; do
+                [ -f "$image" ] || continue
+                hash=${image##*/victory-image-}
+                [ -f "$cache/wide/${hash%.dll}.txt" ] || { echo "$cache"; break; }
+            done
+        done
+    }
+    if [ -z "$(caches)" ] || ! ls "$(caches | head -n 1)"/images/victory-image-*.dll > /dev/null 2>&1; then
+        echo "wide-store lists: binding the title once so the cache holds its images" >&2
+        # The same arguments without --execute: map and bind, then stop.
+        prime=
+        for arg in "$@"; do
+            [ "$arg" = --execute ] || prime="$prime '$(printf '%s' "$arg" | sed "s/'/'\\\\''/g")'"
+        done
+        eval "set -- $prime"
+        "$WINE" "$target_dir/$TARGET/release/victory.exe" "$@" > /dev/null 2>&1 || true
+        "$(dirname "$WINE")/wineserver" -w 2>/dev/null || true
+    fi
+    missing | sort -u | while IFS= read -r cache; do
+        echo "wide-store lists: making the missing ones in $cache (about two minutes the first time)" >&2
+        cargo xtask wide-stores --cache "$cache" < /dev/null >&2 ||
+            echo "wide-store lists: cargo xtask wide-stores failed; with fault tracking on, Rosetta may stop on a 256-bit store" >&2
+    done
+}
+if [ "${1:-}" = run ]; then
+    (cd "$ROOT" && wide_lists "$@")
+fi
 # Keep the Mac and its display awake while VIctory runs. Runs left alone
 # stopped on the loading artwork at 0.8 fps, and a --cache pre-build paused
 # for about 16 minutes, while the same builds went on with someone at the Mac
