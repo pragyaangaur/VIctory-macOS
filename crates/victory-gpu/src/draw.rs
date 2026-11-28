@@ -3380,6 +3380,7 @@ const QUAD_STRIP: u32 = 20;
 #[cfg(test)]
 mod tests {
     mod flight;
+    mod root_scalar;
     mod tracked_rows;
 
     use super::*;
