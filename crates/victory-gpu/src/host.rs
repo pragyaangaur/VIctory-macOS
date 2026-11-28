@@ -5765,6 +5765,21 @@ impl HostList {
                 slot_indices.push(*index);
                 continue;
             }
+            // A refresh only adds its range to the batch, as a run's slots
+            // do: it may go before the run's, so the run goes on past it
+            // (a draw's root views come between its table slots, and runs
+            // were ~2.5 slots long in the world).
+            if let &Step::Refresh(ref shadow, address, len) = step {
+                let _step = StepTimer::start(1);
+                #[cfg(feature = "diagnostics")]
+                {
+                    use crate::copystat::{C, add};
+                    add(C::Refreshes, 1);
+                    add(C::RefreshBytes, len as u64);
+                }
+                batch.add(shadow, address, len);
+                continue;
+            }
             flush_slots(&mut slots, &mut slot_indices, batch);
             #[cfg(feature = "diagnostics")]
             let started = std::time::Instant::now();

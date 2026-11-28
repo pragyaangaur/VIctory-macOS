@@ -1709,8 +1709,17 @@ pub(crate) fn refresh_slots(
     // by a scan, with no set made (an allocation each under Wine's heap
     // lock).
     const FEW: usize = 16;
-    let mut asked: HashSet<u32, Hashing> =
-        HashSet::with_capacity_and_hasher(if indices.len() > FEW { indices.len().min(256) } else { 0 }, Hashing::Fold);
+    thread_local! {
+        /// The slots a long run asked, kept from run to run.
+        static ASKED: std::cell::RefCell<HashSet<u32, Hashing>> =
+            const { std::cell::RefCell::new(HashSet::with_hasher(Hashing::Fold)) };
+    }
+    let mut asked = if indices.len() > FEW {
+        ASKED.with(|a| std::mem::replace(&mut *a.borrow_mut(), HashSet::with_hasher(Hashing::Fold)))
+    } else {
+        HashSet::with_hasher(Hashing::Fold)
+    };
+    asked.clear();
     let mut last: (usize, u64, u64) = (0, 0, 0);
     for (n, &index) in indices.iter().enumerate() {
         let again = if indices.len() <= FEW {
@@ -1732,6 +1741,9 @@ pub(crate) fn refresh_slots(
         if !shadow.clean() && !crate::watch::clean_bit(shadow.dirty_bit()) {
             add(shadow, *address as usize, *len as usize);
         }
+    }
+    if indices.len() > FEW {
+        ASKED.with(|a| *a.borrow_mut() = asked);
     }
 }
 
