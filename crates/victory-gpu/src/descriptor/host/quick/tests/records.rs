@@ -146,6 +146,8 @@ fn gpu_reads_record_counts_from_tables_and_heaps_after_both_sync_modes() {
         crate::descriptor::create_srv(null, source, &raw(4, 13), at(0));
         crate::descriptor::create_srv(null, source, &structured(4, 9), at(2));
         crate::descriptor::create_srv(null, source, &typed, at(3));
+        crate::descriptor::create_srv(null, null, &typed, at(6));
+        crate::descriptor::create_uav(null, null, null, &[39, 1, 4, 0, 3, 0, 0, 0, 1, 0], at(1));
         crate::descriptor::create_placed_srv(null, &placed_buffer, &placed, at(4));
         crate::descriptor::create_uav(null, source, null, &[39, 1, 4, 0, 3, 0, 0, 0, 1, 0], at(5));
         crate::descriptor::create_uav(null, result, null, &output, at(7));
@@ -189,8 +191,9 @@ fn gpu_reads_record_counts_from_tables_and_heaps_after_both_sync_modes() {
             (3, fields(address + 24, 257)), // typed: elements
             (4, fields(address + 48, 4)),   // placed raw
             (5, fields(address + 16, 12)),  // raw UAV
-            (6, [0; 3]),
-            (1 << 21, [0; 3]), // null
+            (6, [0; 3]),                    // shaped null SRV
+            (1, [0; 3]),                    // shaped null UAV
+            (1 << 21, [0; 3]),              // null
         ] {
             dispatch(1, slot, table, view);
         }
@@ -209,7 +212,7 @@ fn gpu_reads_record_counts_from_tables_and_heaps_after_both_sync_modes() {
     assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
     crate::object::release_ref(result);
     crate::object::release_ref(source);
-    eprintln!("executed 20 descriptor metadata GPU dispatches, checked 140 dwords");
+    eprintln!("executed 22 descriptor metadata GPU dispatches, checked 154 dwords");
 }
 
 #[test]
