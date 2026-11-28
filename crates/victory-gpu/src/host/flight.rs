@@ -2318,7 +2318,11 @@ void main(uint3 id : SV_DispatchThreadID) {
         };
         let (write_address, texture_address, shadow) = if aliased {
             let (a, b) = crate::watch::tests::twin_views(1);
-            (a, b, crate::shadow::find(a as u64, crate::watch::PAGE as u64).unwrap())
+            (
+                a,
+                b,
+                crate::shadow::find(a as u64, crate::watch::PAGE as u64).unwrap(),
+            )
         } else {
             let (page, address, shadow) = title_page();
             (page as usize, address as usize, shadow)
@@ -2330,17 +2334,27 @@ void main(uint3 id : SV_DispatchThreadID) {
 
         let words = [3u32, 0, 0, 0, 4, 0, 4, 1 | 1 << 16, 42, 1, 0, 0x100, 0, 0];
         let iid = crate::object::guid(
-            0x696442be, 0xa72e, 0x4059, [0xbc, 0x79, 0x5b, 0x5c, 0x98, 0x04, 0x0f, 0xad],
+            0x696442be,
+            0xa72e,
+            0x4059,
+            [0xbc, 0x79, 0x5b, 0x5c, 0x98, 0x04, 0x0f, 0xad],
         );
         let null = std::ptr::null();
         let mut texture = null;
         assert_eq!(
             crate::resource::create_at_address(
-                null, texture_address as u64, words.as_ptr().cast(), 0, null, &iid, &mut texture,
+                null,
+                texture_address as u64,
+                words.as_ptr().cast(),
+                0,
+                null.cast(),
+                &iid,
+                &mut texture,
             ),
             S_OK
         );
-        let native_texture = crate::resource::host_resource(texture).expect("title texture host resource");
+        let native_texture =
+            crate::resource::host_resource(texture).expect("title texture host resource");
         let (out, mapped) = host.shared_buffer(4).expect("texture shader output");
         let (root, pso) = crate::compute::pipeline(
             r#"
@@ -2354,19 +2368,23 @@ void main() {
             s!("sample_title_texture"),
             0,
             &[Param::Table(&[srv(0, 1)]), Param::Uav { register: 0 }],
-        ).unwrap();
+        )
+        .unwrap();
         // SAFETY: a shader-visible heap with one SRV for the live texture.
         let heap: ID3D12DescriptorHeap = unsafe {
-            let heap: ID3D12DescriptorHeap = host.device.CreateDescriptorHeap(
-                &D3D12_DESCRIPTOR_HEAP_DESC {
+            let heap: ID3D12DescriptorHeap = host
+                .device
+                .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
                     Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
                     NumDescriptors: 1,
                     Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
                     NodeMask: 0,
-                },
-            ).unwrap();
+                })
+                .unwrap();
             host.device.CreateShaderResourceView(
-                &native_texture, None, heap.GetCPUDescriptorHandleForHeapStart(),
+                &native_texture,
+                None,
+                heap.GetCPUDescriptorHandleForHeapStart(),
             );
             heap
         };
@@ -2381,12 +2399,20 @@ void main() {
         unsafe {
             upload_ptr.cast::<u32>().write(NEW);
             writer_host.list.CopyBufferRegion(
-                &shadow.buffer, shadow.offset(write_address as u64), &upload, 0, 4,
+                &shadow.buffer,
+                shadow.offset(write_address as u64),
+                &upload,
+                0,
+                4,
             );
             reader_host.list.SetDescriptorHeaps(&[Some(heap.clone())]);
             reader_host.list.SetComputeRootSignature(&root);
-            reader_host.list.SetComputeRootDescriptorTable(0, heap.GetGPUDescriptorHandleForHeapStart());
-            reader_host.list.SetComputeRootUnorderedAccessView(1, out.GetGPUVirtualAddress());
+            reader_host
+                .list
+                .SetComputeRootDescriptorTable(0, heap.GetGPUDescriptorHandleForHeapStart());
+            reader_host
+                .list
+                .SetComputeRootUnorderedAccessView(1, out.GetGPUVirtualAddress());
             reader_host.list.SetPipelineState(&pso);
             reader_host.list.Dispatch(1, 1, 1);
         }
@@ -2410,7 +2436,10 @@ void main() {
         for object in [writer, reader, alloc_n, alloc_next, q, texture] {
             crate::object::release_ref(object);
         }
-        assert_eq!(had_flight, prep_ranges, "submission N was left in flight only in ranges mode");
+        assert_eq!(
+            had_flight, prep_ranges,
+            "submission N was left in flight only in ranges mode"
+        );
         assert_eq!(title_word, NEW, "submission N copied its write back");
         assert_eq!(sampled, NEW, "submission N+1 sampled the wrong texel");
     }
