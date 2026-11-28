@@ -83,6 +83,7 @@ fn lower(
         atomic_lock_rounds: false,
         atomic_umax: false,
         racy_minmax: false,
+        half_loops: false,
         bias_as_gradients: false,
         narrow_waves: false,
         uav_size_level0: false,

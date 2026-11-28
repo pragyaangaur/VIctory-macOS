@@ -3347,7 +3347,7 @@ fn buffer_srv(
         // same bytes; under Wine/D3DMetal any dword-aligned start (`+8B` or
         // `+680B`) works too, while native D3D12 requires 16-byte alignment.
         let (byte, dwords) = (first * stride, u64::from(count) * stride / 4);
-        let align = if crate::shader_cache::under_wine() { 4 } else { 16 };
+        let align = if crate::under_wine() { 4 } else { 16 };
         match u32::try_from(dwords) {
             Ok(dwords) if byte.is_multiple_of(align) && stride.is_multiple_of(4) => {
                 desc.Format = DXGI_FORMAT_R32_TYPELESS;
@@ -3382,7 +3382,7 @@ fn raw_structured() -> bool {
         let on = match std::env::var("VICTORY_RAW_STRUCTURED").as_deref() {
             Ok("0" | "false" | "off") => false,
             Ok("1" | "true" | "on") => true,
-            _ => crate::shader_cache::under_wine() || crate::host::host_vendor() == 0x10DE,
+            _ => crate::under_wine() || crate::host::host_vendor() == 0x10DE,
         };
         tracing::info!(on, "structured buffer views made raw");
         on

@@ -1,6 +1,8 @@
 //! Where every thread is: `VICTORY_STACKS=<seconds>[,<seconds>...]` prints
 //! each thread's unwound stack as `module+rva` that many seconds after
-//! [`dump_stacks_on_schedule`], to find what a title waits on.
+//! [`dump_stacks_on_schedule`], to find what a title waits on. The
+//! sampling profiler (`crate::profile`) reads threads the same way.
+#![cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
 
 use std::ffi::c_void;
 
@@ -73,7 +75,7 @@ fn line(mut file: &std::fs::File, args: std::fmt::Arguments) {
 
 /// Every loaded module's name, base and size, so raw addresses can be
 /// placed later.
-fn modules(file: &std::fs::File) {
+pub(crate) fn modules(file: &std::fs::File) {
     use windows_sys::Win32::System::Diagnostics::ToolHelp::{
         MODULEENTRY32W, Module32FirstW, Module32NextW, TH32CS_SNAPMODULE,
     };
@@ -101,7 +103,7 @@ fn modules(file: &std::fs::File) {
 /// Replaces `ids` with the ids of this process's other threads, at most
 /// `limit` of them. False if no snapshot could be taken. Allocates nothing
 /// itself while `ids` has room for `limit`.
-fn other_threads(ids: &mut Vec<u32>, limit: usize) -> bool {
+pub(crate) fn other_threads(ids: &mut Vec<u32>, limit: usize) -> bool {
     // SAFETY: plain queries and a snapshot of this process's threads.
     let (me, process, snapshot) = unsafe {
         (
@@ -226,7 +228,7 @@ fn dump_stacks() {
 }
 
 /// The thread's frames and its current and base scheduling priority (0-31).
-fn frames_of(thread: HANDLE) -> (Vec<u64>, (i32, i32)) {
+pub(crate) fn frames_of(thread: HANDLE) -> (Vec<u64>, (i32, i32)) {
     let mut frames = Vec::with_capacity(MAX_FRAMES);
     let mut info: BasicInfo = BasicInfo {
         exit_status: 0,
@@ -290,7 +292,7 @@ fn start_of(thread: HANDLE) -> usize {
     start
 }
 
-fn name_of(thread: HANDLE) -> String {
+pub(crate) fn name_of(thread: HANDLE) -> String {
     let mut name = std::ptr::null_mut();
     // SAFETY: the system allocates the string; we free it with LocalFree.
     unsafe {

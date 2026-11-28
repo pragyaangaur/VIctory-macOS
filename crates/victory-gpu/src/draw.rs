@@ -1785,6 +1785,7 @@ impl State {
         #[cfg(feature = "diagnostics")]
         self.probe_written(list);
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
+        list.note_work(true);
         self.ambient(list);
     }
 
@@ -2043,6 +2044,7 @@ impl State {
                     unsafe { l6.DispatchMesh(x, 1, 1) };
                     self.note_hdr_draw();
                     DRAWN.fetch_add(1, Ordering::Relaxed);
+                    list.note_work(false);
                     true
                 }
                 Err(_) => false,
@@ -2677,6 +2679,7 @@ impl State {
             };
             self.note_hdr_draw();
             DRAWN.fetch_add(1, Ordering::Relaxed);
+            list.note_work(false);
         }
         if !ran {
             DROPPED.fetch_add(1, Ordering::Relaxed);
@@ -2776,6 +2779,7 @@ impl State {
             };
             self.note_hdr_draw();
             DRAWN.fetch_add(1, Ordering::Relaxed);
+            list.note_work(false);
         }
         if !ran {
             DROPPED.fetch_add(1, Ordering::Relaxed);
@@ -2937,25 +2941,54 @@ impl State {
         // and before anything of this call is recorded, so a cut leaves
         // nothing of it behind.
         let blocker = if crate::indirect::batch_clamps_enabled() {
-            list.clamp_blocker(arguments, len, count)
+            crate::indirect::blocker(list, (arguments, len), count)
         } else {
             None
         };
         let hoist = crate::indirect::batch_clamps_enabled() && blocker.is_none();
-        if !hoist
+        let in_place = blocker == Some(crate::host::ClampBlock::InPlace);
+        // Held out of the prelude: clamped in a group pass if one can take
+        // it (`crate::indirect::groups_enabled`), a pass recorded here if the
+        // group open in the list cannot; else in a new host list if a cut
+        // pays; else inline. A seat records nothing when there is none.
+        let seat = (!hoist
+            && blocker.is_some()
+            && !in_place
+            && crate::indirect::groups_enabled()
+            && crate::indirect::groupable(kind, stride, max, count.is_some()))
+        .then(|| {
+            crate::indirect::note_source(&args);
+            list.clamp_group_seat(
+                (&args.buffer, args_gpu),
+                (arguments, len),
+                crate::indirect::recent_sources,
+            )
+        })
+        .flatten();
+        if seat.is_none()
+            && !hoist
             && may_cut
             && blocker.is_some()
+            && !in_place
             && crate::indirect::clamp_cuts_enabled()
             && list.clamp_cut_pays()
         {
             return None;
+        }
+        if !hoist {
+            crate::indirect::note_held_out(blocker);
+        }
+        if seat.as_ref().is_some_and(|&(_, opened)| opened) {
+            // The pass binds a compute pipeline of its own.
+            self.host_pipeline = 0;
+            self.host_roots[1] = 0;
         }
         args.refresh(list, arguments, len);
         if let Some((s, at)) = &counter {
             s.refresh(list, *at, 4);
         }
         let counted = counter.as_ref().map(|(s, at)| s.gpu(*at));
-        let inline_clamped = if hoist {
+        let inline_clamped = if hoist || seat.is_some() {
             None
         } else {
             // Bounded first: the inline clamp binds a compute pipeline of its
@@ -3009,11 +3042,21 @@ impl State {
             }
             return Some(false);
         }
-        let (clamped, dst_offset, needs_done) = match inline_clamped {
-            Some((clamped, dst_offset)) => (clamped, dst_offset, true),
-            None => {
+        let (clamped, dst_offset, needs_done) = match (inline_clamped, seat) {
+            (Some((clamped, dst_offset)), _) => (clamped, dst_offset, true),
+            (None, Some((seat, _))) => {
                 let Some((clamped, dst_offset)) =
-                    crate::indirect::enqueue(list, args_gpu, (kind, stride, max), counted)
+                    list.clamp_group_join(&seat, args_gpu, (kind, stride))
+                else {
+                    why("not bounded (no place in its clamp group)");
+                    return Some(false);
+                };
+                (clamped, dst_offset, false)
+            }
+            (None, None) => {
+                let record = (Some(&args.buffer), args_gpu);
+                let Some((clamped, dst_offset)) =
+                    crate::indirect::enqueue_from(list, record, (kind, stride, max), counted)
                 else {
                     why("not bounded (no hoisted argument buffer)");
                     return Some(false);
@@ -3071,10 +3114,12 @@ impl State {
         if kind == DISPATCH {
             self.probe_hdr_compute(list);
             DISPATCHED.fetch_add(1, Ordering::Relaxed);
+            list.note_work(true);
             self.ambient(list);
         } else {
             self.note_hdr_draw();
             DRAWN.fetch_add(1, Ordering::Relaxed);
+            list.note_work(false);
         }
         Some(true)
     }
@@ -6794,6 +6839,73 @@ void main() {
         assert_eq!(release(tex, 0x10)(tex), 0);
         assert_eq!(release(buf, 0x10)(buf), 0);
         assert_eq!(release(heap_raw, 0x10)(heap_raw), 0);
+    }
+
+    /// A culling dispatch writes the records of the indirect executions after
+    /// it through a table's unordered view, then again before the next
+    /// ones: the second write ends the clamp group the first executions
+    /// opened (`VICTORY_CLAMP_GROUPS`), as its preparation declares it, with
+    /// the table memo off and on (`VICTORY_TABLE_MEMO=1`: it remembers no
+    /// buffer's unordered view, so every such write is declared again).
+    #[test]
+    fn a_culling_write_through_a_table_ends_the_clamp_group_memo_or_not() {
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        assert!(
+            crate::indirect::group_available(),
+            "the group pass compiles"
+        );
+        let p = crate::watch::tests::pool(1);
+        let buf = buffer_at_address(p as u64, crate::watch::PAGE as u64);
+        let (heap_raw, title_heap, _heap_host) = view_heap(8);
+        // A raw view of 64 words at 4 KiB into the buffer: the records.
+        let uav_desc: [u32; 10] = [39, 1, 1024, 0, 64, 0, 0, 0, 1, 0];
+        crate::descriptor::create_uav(
+            std::ptr::null(),
+            buf,
+            std::ptr::null(),
+            &uav_desc,
+            title_heap.start,
+        );
+        let record = p as u64 + 4096;
+        let shadow = crate::shadow::find(record, 16).expect("the buffer's copy");
+        let u_uav = used(ResourceType::Uav);
+        for memo in [0, 1] {
+            let _guard = TableMemoGuard::set(memo);
+            let list = host.new_list().unwrap();
+            let mut state = State::default();
+            state.set_heaps(&[heap_raw]);
+            state.set_table(true, 0, title_heap.start);
+            let seat = |list: &HostList| {
+                let at = shadow.gpu(record);
+                let (seat, opened) = list
+                    .clamp_group_seat((&shadow.buffer, at), (record, 16), Vec::new)
+                    .expect("a seat");
+                list.clamp_group_join(&seat, at, (0, 16)).expect("a place");
+                opened
+            };
+            // The culling dispatch, then two draws.
+            state.table_entry(&list, &u_uav, true, true);
+            assert!(
+                list.clamp_blocker(record, 16, None).is_some(),
+                "memo {memo}: out of the prelude"
+            );
+            assert!(seat(&list), "memo {memo}: the first draw opens a pass");
+            assert!(!seat(&list), "memo {memo}: the next joins it");
+            // The culling dispatch again over the same records, then a draw.
+            state.table_entry(&list, &u_uav, true, true);
+            assert!(
+                seat(&list),
+                "memo {memo}: a draw after the second write gets a pass of its own"
+            );
+            list.close();
+        }
+        crate::shadow::unregister(buf as usize, p as u64);
+        let release = crate::object::slot::<extern "system" fn(This) -> u32>;
+        assert_eq!(release(buf, 0x10)(buf), 0);
+        assert_eq!(release(heap_raw, 0x10)(heap_raw), 0);
+        assert_eq!(host.log_messages(), None);
     }
 
     #[test]

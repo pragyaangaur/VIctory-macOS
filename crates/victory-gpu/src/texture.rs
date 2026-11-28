@@ -618,14 +618,27 @@ pub(crate) type Upload = (ID3D12Resource, u64, Vec<Sub>);
 pub(crate) type Sub = (u32, Option<std::ops::Range<u32>>);
 
 /// The texture workers: up to a quarter of the CPUs (four at most), none
-/// where that is fewer than two.
+/// where that is fewer than two; `VICTORY_WORKERS=<n>` sets the count (at
+/// most 16). They also refresh host copies, copy back and make placed
+/// textures. While they run the submit thread waits on them, and the
+/// title's threads mostly wait for the GPU (on a 10-core M1 Max the
+/// default is two workers, and a frame's refreshes and texture uploads
+/// reached 150-180 ms at a streaming burst).
 fn workers() -> Option<&'static rayon::ThreadPool> {
     static WORKERS: OnceLock<Option<rayon::ThreadPool>> = OnceLock::new();
     WORKERS
         .get_or_init(|| {
-            let threads = std::thread::available_parallelism()
+            let default = std::thread::available_parallelism()
                 .map_or(4, |n| n.get() / 4)
                 .clamp(1, 4);
+            let threads = std::env::var("VICTORY_WORKERS")
+                .ok()
+                .and_then(|v| v.trim().parse::<usize>().ok())
+                .filter(|&n| n >= 1)
+                .map_or(default, |n| n.min(16));
+            if threads != default {
+                tracing::info!(threads, default, "texture and copy workers (VICTORY_WORKERS)");
+            }
             if threads < 2 {
                 return None;
             }

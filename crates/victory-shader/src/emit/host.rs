@@ -939,6 +939,7 @@ fn fmad_probe() -> Result<HostShader, crate::ShaderError> {
         atomic_lock_rounds: false,
         atomic_umax: false,
         racy_minmax: false,
+        half_loops: false,
         bias_as_gradients: false,
         host_wave32: false,
         narrow_waves: false,

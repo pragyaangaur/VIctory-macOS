@@ -1645,7 +1645,7 @@ fn make_texture(d: &ResourceDesc, state: u32, clear: *const c_void) -> Option<Ho
     let mut texture: Option<ID3D12Resource> = None;
     let mut castable_formats = match () {
         () if d.flags & DEPTH != 0 => Vec::new(),
-        () if crate::shader_cache::under_wine() => castable_metal(d.format),
+        () if crate::under_wine() => castable_metal(d.format),
         () => castable(d.format),
     };
     let mut initial = crate::host::legal_for(d.flags, crate::host::texture_state(state));

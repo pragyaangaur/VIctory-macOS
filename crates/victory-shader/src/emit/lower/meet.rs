@@ -635,6 +635,9 @@ impl Lower<'_> {
             "a rendezvous between 32-lane halves with no words (wave64 on a 32-lane host)";
         let slot = *self.meet_layout.slots.get(&site).ok_or(UNLAID)?;
         let e = *self.meet_epoch.get(&slot.region).ok_or(UNLAID)?;
+        // The halves wait for each other here: a loop around it keeps
+        // its group-wide exit test (`Options::half_loops`).
+        self.s.syncs += 1;
         let count = self.meet_layout.region_base[slot.region] + 1;
         let w = slot.word;
         let i32t = self.s.t.i32;

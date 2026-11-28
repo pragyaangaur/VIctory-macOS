@@ -214,6 +214,8 @@ pub(crate) struct Parts<'a> {
     /// min or max is a plain read, compare and write
     /// ([`Options::racy_minmax`](super::Options)).
     pub racy_minmax: bool,
+    /// [`Options::half_loops`](super::Options).
+    pub half_loops: bool,
     /// Compute-stage biased samples run as gradient samples scaled by
     /// `2^bias` ([`Options::bias_as_gradients`](super::Options)).
     pub bias_as_gradients: bool,
@@ -403,6 +405,9 @@ struct Lower<'a> {
     loop_outer_active: Map<usize, Option<V>>,
     /// Lockstep loop active-lane phis `(phi, header, latch)` filled in `fill_phis`.
     loop_act_phis: Vec<(V, usize, usize)>,
+    /// [`Shader::syncs`](super::shader::Shader) when each lockstep loop
+    /// header was entered (`Options::half_loops`).
+    loop_syncs: Map<usize, u32>,
     /// [`Lower::relabelled_flat`], once made.
     relabelled: Option<V>,
     /// [`Lower::dispatched`], once made.
@@ -746,7 +751,7 @@ impl<'a> Lower<'a> {
             // Code reading other lanes needs the console's wave size and
             // lane order; so do lane masks read as numbers, and LDS shared
             // within one wave, where the console compiler leaves out barriers.
-            console_lanes = x.st.literal || insts().any(|i| {
+            let lanes_other = x.st.literal || insts().any(|i| {
                 let n = i.name();
                 n.starts_with("ds_swizzle")
                     || n.contains("permute")
@@ -783,7 +788,15 @@ impl<'a> Lower<'a> {
                         .iter()
                         .any(|a| matches!(a, Atom::Opaque(_) | Atom::Constant(_)))
                 })
-            } || halves::needs_first_lane(x, &mut alike_cache, &first_alone);
+            };
+            // `VICTORY_FIRST_LANE_PER_HALF=enter` (measurement only): a
+            // first-lane read alone no longer puts the program in halves.
+            let first_needed =
+                !lanes_other && halves::needs_first_lane(x, &mut alike_cache, &first_alone);
+            if first_needed && super::first_lane_enter_alone() {
+                super::note_kept_out_of_halves();
+            }
+            console_lanes = lanes_other || first_needed && !super::first_lane_enter_alone();
             let wave = if x.native.wave64 { 64 } else { 32 };
             let group = cs.threads.iter().product::<u32>();
             let one_wave = group <= wave;
@@ -961,6 +974,7 @@ impl<'a> Lower<'a> {
             pred_edge_active: Map::default(),
             loop_outer_active: Map::default(),
             loop_act_phis: Vec::new(),
+            loop_syncs: Map::default(),
             relabelled: None,
             dispatched: None,
             per_vertex_center,
@@ -7613,7 +7627,10 @@ impl<'a> Lower<'a> {
                         if inst.read(Reg::V(reg)).is_some_and(|x| self.alike.contains(&x)));
                 // Each half's own first active lane is the console's
                 // (`first_lane`): read it, with no exchange.
-                let alone = inst.writes.first().is_some_and(|w| self.first_alone.contains(&w.1));
+                // `VICTORY_FIRST_LANE_PER_HALF=reads` (measurement only):
+                // every read is taken as its half's own.
+                let alone = super::first_lane_reads_alone()
+                    || inst.writes.first().is_some_and(|w| self.first_alone.contains(&w.1));
                 if self.halves && !self.one_host_wave() && is_vec && !is_alike && !alone {
                     if !self.across_here() {
                         return Err(halves::FIRST_ACROSS);

@@ -262,7 +262,8 @@ impl Shader {
                         && done.0.as_ref().is_ok_and(|t| {
                             self.stage == "pixel"
                                 || (self.stage == "mesh"
-                                    && over_limit_mesh_output_bytes(&t.host.dxil).is_some())
+                                    && (mesh_link() == MeshLink::Every
+                                        || over_limit_mesh_output_bytes(&t.host.dxil).is_some()))
                         }))
                         || (mesh_per_vertex_center()
                             && self.stage == "pixel"
@@ -299,7 +300,7 @@ impl Shader {
                         if let (Some(o), Some(bytes)) =
                             (mesh_outputs(&t.host.dxil), metal_mesh_output_bytes(&t.host.dxil))
                             && bytes > METAL_MESH_OUTPUT_BYTES
-                            && crate::shader_cache::under_wine()
+                            && crate::under_wine()
                         {
                             tracing::warn!(
                                 hash = %self.hash,
@@ -357,14 +358,24 @@ fn thread_cpu_since(then: (u64, u64)) -> (u64, u64) {
 #[cfg(windows)]
 fn translate(container: &[u8]) -> (Result<Translated, String>, bool) {
     let (host, cached) = crate::shader_cache::host_shader(container);
-    (host.and_then(|host| with_resources(container, host)), cached)
+    let translated = host.and_then(|host| {
+        let found = crate::shader_resources::resources(container, analyze)?;
+        Ok(Translated {
+            host,
+            used: found.used,
+            used_written: found.used_written,
+            write_unknown: found.write_unknown,
+            threads: found.threads,
+        })
+    });
+    (translated, cached)
 }
 
+/// The console resources a container's program reads and writes, and a
+/// compute program's group size. Bump `shader_resources::RESOURCES_VERSION`
+/// when this analysis changes independently of the shader translator.
 #[cfg(windows)]
-fn with_resources(
-    container: &[u8],
-    host: victory_shader::emit::HostShader,
-) -> Result<Translated, String> {
+fn analyze(container: &[u8]) -> Result<crate::shader_resources::Resources, String> {
     use victory_shader::native::StageIo;
     use victory_shader::{Container, FourCC, HwStage};
     let c = Container::parse(container).map_err(|e| e.to_string())?;
@@ -390,8 +401,7 @@ fn with_resources(
         // Another stage in the container could store through a shared table.
         write_unknown = true;
     }
-    Ok(Translated {
-        host,
+    Ok(crate::shader_resources::Resources {
         used,
         used_written,
         write_unknown,
@@ -608,15 +618,60 @@ fn make_thread_limited(shader: &Shader) -> Option<&'static host::HostPipeline> {
     Some(Box::leak(Box::new(p)))
 }
 
+/// Which mesh pipelines are translated with their paired pixel shader so
+/// that the mesh shader writes only the outputs the pixel shader reads
+/// (`VICTORY_LINK_MESH_OUTPUTS`).
+#[cfg(any(windows, test))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum MeshLink {
+    /// Every stage keeps its own translation (`0`; the default off Wine).
+    Off,
+    /// Only those whose outputs take more than Metal's 32 KiB (any other
+    /// value; the default under Wine).
+    OverLimit,
+    /// Every mesh pipeline (`every`). One with no pixel shader (depth-only
+    /// passes such as shadow cascades) keeps only its position and clip and
+    /// cull distances. Without it the mesh shader writes every attribute the
+    /// console program exports (up to ~56 components a vertex, 28 KiB a
+    /// group), which an M1, with no mesh shading hardware, writes out and
+    /// nothing reads.
+    Every,
+}
+
+#[cfg(any(windows, test))]
+fn mesh_link_value(value: Option<&std::ffi::OsStr>, wine: bool) -> MeshLink {
+    match value {
+        None if wine => MeshLink::OverLimit,
+        None => MeshLink::Off,
+        Some(v) if v == "0" => MeshLink::Off,
+        Some(v) if v == "every" => MeshLink::Every,
+        Some(_) => MeshLink::OverLimit,
+    }
+}
+
 #[cfg(windows)]
-fn link_mesh_outputs() -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
+pub(crate) fn mesh_link() -> MeshLink {
+    static MODE: OnceLock<MeshLink> = OnceLock::new();
     // On by default under Wine (D3DMetal): an over-limit mesh pipeline there
     // is made, draws nothing and its submission never completes (#172).
-    *ON.get_or_init(|| match std::env::var_os("VICTORY_LINK_MESH_OUTPUTS") {
-        Some(v) => crate::switch::value_is_on(Some(&v)),
-        None => crate::shader_cache::under_wine(),
+    *MODE.get_or_init(|| {
+        let mode = mesh_link_value(
+            std::env::var_os("VICTORY_LINK_MESH_OUTPUTS").as_deref(),
+            crate::under_wine(),
+        );
+        if mode == MeshLink::Every {
+            tracing::info!(
+                "every mesh pipeline's outputs linked to its pixel shader's reads \
+                 (VICTORY_LINK_MESH_OUTPUTS=every)"
+            );
+        }
+        mode
     })
+}
+
+#[cfg(windows)]
+fn link_mesh_outputs() -> bool {
+    mesh_link() != MeshLink::Off
 }
 
 /// Diagnostics (`VICTORY_NAME_PROGRAMS=1`): logs the program name a shader
@@ -699,7 +754,7 @@ pub(crate) fn refuse_over_limit_mesh() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| match std::env::var_os("VICTORY_MESH_OVER_LIMIT") {
         Some(v) => !crate::switch::value_is_on(Some(&v)),
-        None => crate::shader_cache::under_wine(),
+        None => crate::under_wine(),
     })
 }
 
@@ -2037,6 +2092,20 @@ mod tests {
         assert!(mesh_per_vertex_center_value(None));
         assert!(mesh_per_vertex_center_value(Some(OsStr::new("1"))));
         assert!(!mesh_per_vertex_center_value(Some(OsStr::new("0"))));
+    }
+
+    #[test]
+    fn mesh_link_links_over_limit_pipelines_under_wine_and_every_one_when_asked() {
+        use super::{MeshLink, mesh_link_value};
+        use std::ffi::OsStr;
+        assert_eq!(mesh_link_value(None, true), MeshLink::OverLimit);
+        assert_eq!(mesh_link_value(None, false), MeshLink::Off);
+        assert_eq!(mesh_link_value(Some(OsStr::new("0")), true), MeshLink::Off);
+        // `all` was never a mode of its own: it is the default under Wine.
+        assert_eq!(mesh_link_value(Some(OsStr::new("all")), false), MeshLink::OverLimit);
+        assert_eq!(mesh_link_value(Some(OsStr::new("1")), false), MeshLink::OverLimit);
+        assert_eq!(mesh_link_value(Some(OsStr::new("every")), false), MeshLink::Every);
+        assert_eq!(mesh_link_value(Some(OsStr::new("every")), true), MeshLink::Every);
     }
 }
 

@@ -133,7 +133,7 @@ Measured against the frame-time line or a matched baseline, on D3DMetal 3.0 unle
 | `VICTORY_CLAMP_SYNC=1` with title barriers kept to their stages (D3DMetal 4.0 beta 3) | GPU 528 ms against 512 ms |
 | `VICTORY_PREP_AHEAD=1` (#584) | no gain (flights not quiet) |
 | `VICTORY_RAY_SKIP=1` | no gain |
-| `VICTORY_LINK_MESH_OUTPUTS=all` | no gain (cold run) |
+| `VICTORY_LINK_MESH_OUTPUTS=every` (every mesh pipeline linked, 748 of them; mesh-only depth passes keep their position alone) | no gain: 437 ms against 423 ms median, GPU 272 against 273 ms. The `=all` measured before was the default under Wine (any non-zero value), not a mode of its own |
 | the title's `settings.xml` graphics options | ignored by the console build: the same draws |
 | Series S profile | about 3% less CPU only; before #615 it needed `VICTORY_UPSCALER=6` or it divided by zero at `+0x28f03e8` |
 

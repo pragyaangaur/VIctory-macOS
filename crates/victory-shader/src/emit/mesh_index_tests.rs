@@ -705,4 +705,180 @@ mod gpu {
             failures.join("\n")
         );
     }
+
+    /// Timing probe, not a test: what one mesh draw costs the host GPU,
+    /// drawn directly (`DispatchMesh`), as an indirect execution of one
+    /// record each (as VIctory draws the title's indirect mesh draws), and
+    /// as one execution of many. A one-triangle mesh on an 8x8 target, so
+    /// the draws' own work is next to nothing. `PROBE_COUNT` draws
+    /// (default 1024).
+    #[test]
+    #[ignore = "timing probe; run by hand on the GPU"]
+    fn mesh_indirect_cost_timing() {
+        use windows::Win32::Graphics::Direct3D12::*;
+        use windows::Win32::Graphics::Dxgi::Common::*;
+        use windows::core::Interface;
+        let n: u32 = std::env::var("PROBE_COUNT").ok().and_then(|v| v.parse().ok()).unwrap_or(1024);
+        let _one = crate::emit::valu_tests::ONE_AT_A_TIME
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let Ok(host) = Host::new(false) else {
+            eprintln!("no hardware device; skipped");
+            return;
+        };
+        let ps = constant_color_ps();
+        let ms = build_mesh(3, 1, 3, &[PrimSpec::Literal { lane: 0, word: TRIANGLE }], false).unwrap();
+        let root = host.root_signature_for(&[(&ms, D3D12_SHADER_VISIBILITY_MESH)]).expect("root");
+        let pso = host.mesh_pipeline_with(&root, &ms.dxil, &ps).expect("mesh pipeline");
+        let dev = &host.device;
+        // SAFETY: D3D12 calls with descriptions that outlive them; every
+        // resource stays alive until the fence says the GPU is done.
+        unsafe {
+            let buffer = |heap: D3D12_HEAP_TYPE, size: u64, state| -> ID3D12Resource {
+                let mut r: Option<ID3D12Resource> = None;
+                dev.CreateCommittedResource(
+                    &D3D12_HEAP_PROPERTIES { Type: heap, ..Default::default() },
+                    D3D12_HEAP_FLAG_NONE,
+                    &D3D12_RESOURCE_DESC {
+                        Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                        Width: size,
+                        Height: 1,
+                        DepthOrArraySize: 1,
+                        MipLevels: 1,
+                        SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                        Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                        ..Default::default()
+                    },
+                    state,
+                    None,
+                    &mut r,
+                )
+                .expect("buffer");
+                r.expect("buffer")
+            };
+            let target: ID3D12Resource = {
+                let mut r: Option<ID3D12Resource> = None;
+                dev.CreateCommittedResource(
+                    &D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() },
+                    D3D12_HEAP_FLAG_NONE,
+                    &D3D12_RESOURCE_DESC {
+                        Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+                        Width: 8,
+                        Height: 8,
+                        DepthOrArraySize: 1,
+                        MipLevels: 1,
+                        Format: DXGI_FORMAT_R32G32B32A32_FLOAT,
+                        SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                        Flags: D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+                        ..Default::default()
+                    },
+                    D3D12_RESOURCE_STATE_RENDER_TARGET,
+                    None,
+                    &mut r,
+                )
+                .expect("target");
+                r.expect("target")
+            };
+            let rtvs: ID3D12DescriptorHeap = dev
+                .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                    Type: D3D12_DESCRIPTOR_HEAP_TYPE_RTV,
+                    NumDescriptors: 1,
+                    ..Default::default()
+                })
+                .expect("rtv heap");
+            let rtv = rtvs.GetCPUDescriptorHandleForHeapStart();
+            dev.CreateRenderTargetView(&target, None, rtv);
+            let upload = buffer(D3D12_HEAP_TYPE_UPLOAD, u64::from(n) * 12, D3D12_RESOURCE_STATE_GENERIC_READ);
+            let mut p = std::ptr::null_mut();
+            upload.Map(0, None, Some(&mut p)).expect("map");
+            for i in 0..n as usize {
+                p.cast::<[u32; 3]>().add(i).write([1, 1, 1]);
+            }
+            upload.Unmap(0, None);
+            let args = buffer(D3D12_HEAP_TYPE_DEFAULT, u64::from(n) * 12, D3D12_RESOURCE_STATE_COPY_DEST);
+            let signature: ID3D12CommandSignature = {
+                let arg = D3D12_INDIRECT_ARGUMENT_DESC { Type: D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_MESH, ..Default::default() };
+                let mut s: Option<ID3D12CommandSignature> = None;
+                dev.CreateCommandSignature(
+                    &D3D12_COMMAND_SIGNATURE_DESC { ByteStride: 12, NumArgumentDescs: 1, pArgumentDescs: &arg, NodeMask: 0 },
+                    None,
+                    &mut s,
+                )
+                .expect("signature");
+                s.expect("signature")
+            };
+            let queue: ID3D12CommandQueue = dev
+                .CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_DIRECT, ..Default::default() })
+                .expect("queue");
+            let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).expect("fence");
+            let mut value = 0u64;
+            let mut run = |list: &ID3D12CommandList| {
+                let start = std::time::Instant::now();
+                queue.ExecuteCommandLists(&[Some(list.clone())]);
+                value += 1;
+                queue.Signal(&fence, value).expect("signal");
+                while fence.GetCompletedValue() < value {
+                    if let Err(e) = dev.GetDeviceRemovedReason() {
+                        panic!("device removed: {e}");
+                    }
+                    std::thread::yield_now();
+                }
+                start.elapsed()
+            };
+            {
+                let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).expect("allocator");
+                let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None).expect("list");
+                list.CopyBufferRegion(&args, 0, &upload, 0, u64::from(n) * 12);
+                list.ResourceBarrier(&[D3D12_RESOURCE_BARRIER {
+                    Type: D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
+                    Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+                    Anonymous: D3D12_RESOURCE_BARRIER_0 {
+                        Transition: std::mem::ManuallyDrop::new(D3D12_RESOURCE_TRANSITION_BARRIER {
+                            pResource: std::mem::transmute_copy(&args),
+                            Subresource: D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                            StateBefore: D3D12_RESOURCE_STATE_COPY_DEST,
+                            StateAfter: D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+                        }),
+                    },
+                }]);
+                list.Close().expect("close");
+                run(&list.cast().expect("cast"));
+            }
+            // 0: direct, 1: one execution each, 2: one execution of n.
+            let record = |how: u8| {
+                let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).expect("allocator");
+                let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, &pso).expect("list");
+                let list6: ID3D12GraphicsCommandList6 = list.cast().expect("list 6");
+                list.OMSetRenderTargets(1, Some(&rtv), false, None);
+                list.RSSetViewports(&[D3D12_VIEWPORT { Width: 8.0, Height: 8.0, MaxDepth: 1.0, ..Default::default() }]);
+                list.RSSetScissorRects(&[windows::Win32::Foundation::RECT { left: 0, top: 0, right: 8, bottom: 8 }]);
+                list.SetGraphicsRootSignature(&root);
+                match how {
+                    0 => (0..n).for_each(|_| list6.DispatchMesh(1, 1, 1)),
+                    1 => (0..n).for_each(|i| list.ExecuteIndirect(&signature, 1, &args, u64::from(i) * 12, None, 0)),
+                    _ => list.ExecuteIndirect(&signature, n, &args, 0, None, 0),
+                }
+                list.Close().expect("close");
+                (alloc, list)
+            };
+            let ms_of = |d: std::time::Duration| d.as_secs_f64() * 1e3;
+            let mut time = |how: u8| {
+                let l = record(how);
+                let list: ID3D12CommandList = l.1.cast().expect("cast");
+                (0..4).map(|_| run(&list)).skip(1).min().unwrap()
+            };
+            let direct = time(0);
+            eprintln!("{n} direct mesh draws: {:.2} ms", ms_of(direct));
+            let each = time(1);
+            eprintln!("{n} indirect mesh executions of one: {:.2} ms", ms_of(each));
+            let batched = time(2);
+            eprintln!("one indirect mesh execution of {n}: {:.2} ms", ms_of(batched));
+            eprintln!(
+                "per draw: direct {:.1} us, indirect of one {:.1} us, batched {:.1} us",
+                ms_of(direct) * 1e3 / f64::from(n),
+                ms_of(each) * 1e3 / f64::from(n),
+                ms_of(batched) * 1e3 / f64::from(n)
+            );
+        }
+    }
 }

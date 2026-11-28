@@ -2904,10 +2904,12 @@ pub(crate) fn log_refreshed(frames: f64) {
         })
         .collect();
     tracing::info!(
-        "host copies refreshed per frame: {:.0} copies, tracked {:.1} MB, untracked (whole) {:.1} MB; most: {}",
+        "host copies refreshed per frame: {:.0} copies, tracked {:.1} MB, untracked (whole) {:.1} MB \
+         (copies on physical pages with pages unmapped so far: {}); most: {}",
         map.len() as f64 / frames,
         mb(tracked),
         mb(whole),
+        crate::tiled::partial_made(),
         top.join(", ")
     );
 }

@@ -483,10 +483,46 @@ pub fn physical_tiles() -> bool {
     })
 }
 
+/// `VICTORY_PHYSICAL_TILES=partial` (with [`physical_tiles`]): a title buffer
+/// only part of whose pages are mapped physical pages, the rest reserved
+/// and unmapped, also reads them in place (`crate::tiled::make`), its
+/// unmapped pages a tile of zeros until the title maps pages there. The
+/// title maps its streaming buffers' pages a few at a time (in the world,
+/// most of the ~600 copies refreshed a frame are such buffers).
+pub(crate) fn physical_tiles_partial() -> bool {
+    static PARTIAL: OnceLock<bool> = OnceLock::new();
+    *PARTIAL.get_or_init(|| {
+        let partial = physical_tiles_partial_value(std::env::var_os("VICTORY_PHYSICAL_TILES").as_deref())
+            && physical_tiles();
+        if partial {
+            tracing::info!(
+                "title buffers partly on physical pages read them in place too, \
+                 their unmapped pages zeros (VICTORY_PHYSICAL_TILES=partial)"
+            );
+        }
+        partial
+    })
+}
+
+fn physical_tiles_partial_value(value: Option<&std::ffi::OsStr>) -> bool {
+    value == Some(std::ffi::OsStr::new("partial"))
+}
+
 #[cfg(test)]
 thread_local! {
     /// [`physical_tiles`] on this test's thread.
     pub(crate) static TEST_PHYSICAL_TILES: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+#[test]
+fn physical_tiles_partial_is_its_own_value() {
+    use std::ffi::OsStr;
+    assert!(physical_tiles_partial_value(Some(OsStr::new("partial"))));
+    assert!(!physical_tiles_partial_value(Some(OsStr::new("1"))));
+    assert!(!physical_tiles_partial_value(None));
+    // `partial` switches physical tiles on as any other non-zero value does.
+    assert!(crate::switch::value_is_on(Some(OsStr::new("partial"))));
 }
 
 /// One 64 KiB tile of a [`PhysicalHeap`]: a host copy's reserved buffer maps

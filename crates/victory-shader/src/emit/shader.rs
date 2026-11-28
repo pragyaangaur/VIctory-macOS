@@ -164,6 +164,10 @@ pub(crate) struct Shader {
     /// `a` and `b` and when `a` is taken. An operation on `a` runs on both,
     /// and the result is chosen.
     pub sampler_choices: Vec<(V, V, V)>,
+    /// Barriers (`dx.op.barrier`) and rendezvous of halves emitted so far:
+    /// a lockstep loop whose body adds none needs no group-wide exit test
+    /// (`Options::half_loops`).
+    pub syncs: u32,
     /// Root CBVs read, by root parameter index, with their handles.
     pub root_cbvs: Vec<(u8, V)>,
     /// Root SRVs (raw buffers) read, likewise.
@@ -246,6 +250,7 @@ impl Shader {
             samplers: 0,
             cmp_samplers: 0,
             sampler_choices: Vec::new(),
+            syncs: 0,
             root_cbvs: Vec::new(),
             root_srvs: Vec::new(),
             root_uavs: Vec::new(),
@@ -290,6 +295,9 @@ impl Shader {
         opcode: u32,
         args: &[V],
     ) -> V {
+        if name == "barrier" {
+            self.syncs += 1;
+        }
         let mut params = vec![self.t.i32];
         params.extend(args.iter().map(|&a| self.m.type_of(a)));
         let fty = self.m.func_ty(ret, params);
