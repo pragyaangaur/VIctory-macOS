@@ -1,0 +1,26 @@
+# Switches for Macs with 24 GB, as an M5 Pro with 24 GB ran the world in
+# #454: aliasing of title buffers off, since it is on from 20 GiB and took
+# about 3 GB more wired memory than the Mac had to spare, and host textures
+# given up earlier than on a 16 GB Mac. Loose windows are already small on
+# these Macs, so they are not set here.
+#
+# Use it with VICTORY_SET=24gb tools/macos/victory.sh run ... A variable
+# already set in the environment wins over its line here. One NAME=value a
+# line; lines starting with # are skipped.
+
+# Store rewriting and fault tracking, which world runs on main need (README).
+VICTORY_PATCH_MASKED=all
+VICTORY_FAULT_TRACKING=1
+# World loads outlast the title's hang watchdog (#135).
+VICTORY_NO_HANG_WATCHDOG=1
+# The instance lists' pool trap at +0x5149aec, hit after seven and a half
+# minutes in the world (#454).
+VICTORY_STEP_OVER=pool
+# Zero-copy title buffers ended a run at 18.2 GB wired and 9 % free.
+VICTORY_ALIAS_BUFFERS=0
+# Give host textures up below 20 % free memory, until 26 % is free: macOS
+# was already compressing about 800 MB a second at 14 % free.
+VICTORY_RAM_LOW=0.20
+VICTORY_RAM_FREE=0.26
+VICTORY_EVICT_HEAP_UAV=1
+VICTORY_SPILL_SHADERS=1
