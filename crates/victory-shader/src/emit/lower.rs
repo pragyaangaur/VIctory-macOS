@@ -25,6 +25,7 @@ mod back_edges;
 mod pages;
 mod barriers;
 mod bvh;
+pub(super) mod entry_exit;
 mod descriptor_records;
 mod f64;
 mod first_lane;
@@ -184,6 +185,10 @@ pub(crate) struct Lowered {
     /// the operand was denormal-flushed first. For structural tests.
     #[cfg(test)]
     pub unary_f32: Vec<(u32, bool)>,
+    /// Loop exit tests that lanes outside their loop's entry predicate take
+    /// at once (`entry_exit`).
+    #[cfg(test)]
+    pub loop_entry_exits: usize,
 }
 
 #[derive(Clone)]
@@ -223,6 +228,9 @@ pub(crate) struct Parts<'a> {
     /// A size query on a writable image asks for level 0, not an undefined
     /// level ([`Options::uav_size_level0`](super::Options)).
     pub uav_size_level0: bool,
+    /// Lanes outside a loop's entry predicate leave it at its first exit
+    /// test ([`Options::loop_entry_exit`](super::Options), `entry_exit`).
+    pub loop_entry_exit: bool,
 }
 
 enum Stop {
@@ -498,6 +506,13 @@ struct Lower<'a> {
     counters: HashMap<usize, (V, Vec<(V, usize)>)>,
     /// The block a loop stopped by [`LOOP_LIMIT`] leaves the program from.
     abort: Option<usize>,
+    /// Lane operations written for each IR block (`entry_exit`).
+    lane_ops_in: Vec<u32>,
+    /// Loop exit tests lanes outside the loop's entry predicate may take
+    /// at once, if the loop allows (`entry_exit`).
+    entry_exits: Vec<entry_exit::Candidate>,
+    /// Loop exit tests rewritten so (`entry_exit`).
+    loop_entry_exits: usize,
     /// The 16/64-bit round mode (MODE bits 3:2) each block starts with, and
     /// the one in force at the instruction being lowered (see [`round16`]).
     round16: Vec<Option<u8>>,
@@ -1024,6 +1039,9 @@ impl<'a> Lower<'a> {
             one_page: false,
             counters: HashMap::new(),
             abort: None,
+            lane_ops_in: vec![0; p.blocks.len()],
+            entry_exits: Vec::new(),
+            loop_entry_exits: 0,
             round16: round16(p),
             mode16: Some(0),
         };
@@ -1640,6 +1658,7 @@ impl<'a> Lower<'a> {
         }
         for &b in &order {
             let Some(blk) = self.block[b] else { continue };
+            let lane_ops = self.s.lane_ops;
             self.cur = blk;
             self.cur_ir = b;
             let preds: Vec<usize> = p.blocks[b]
@@ -1724,8 +1743,11 @@ impl<'a> Lower<'a> {
             self.tail[b] = Some(self.cur);
             self.level = self.cur;
             self.exit(b)?;
+            self.lane_ops_in[b] = self.s.lane_ops - lane_ops;
         }
+        let lane_ops = self.s.lane_ops;
         self.fill_phis()?;
+        self.leave_loops_at_entry(self.s.lane_ops != lane_ops);
         let user_data = self.user_reads.values().copied().collect();
         self.s.samplers = self.samplers.len() as u32;
         let root_cbvs = self.s.root_cbvs.iter().map(|r| r.0).collect();
@@ -1852,6 +1874,8 @@ impl<'a> Lower<'a> {
             cbuffer_rows: self.s.m.written_calls("dx.op.cbufferLoadLegacy.i32"),
             #[cfg(test)]
             unary_f32: self.s.m.written_unary_f32_flushes(),
+            #[cfg(test)]
+            loop_entry_exits: self.loop_entry_exits,
             dxil: self.s.finish(),
             user_data,
             samplers: self.samplers,
@@ -9569,6 +9593,12 @@ impl<'a> Lower<'a> {
                 // taken where the guard is live — inside, a ballot of the
                 // branch's own condition is not exact under D3DMetal. A
                 // glc-set umax reads its old value, so it cannot reduce.
+                // What these write involves only the lanes of `guard`: the
+                // reduction reads lanes of the guard's ballot and others
+                // offer 0, the identity of `umax`; the lock runs inside
+                // the guarded region (`entry_exit`).
+                let quiet = u32::from(guard.is_some());
+                self.s.quiet += quiet;
                 let (value, not_rep) = if self.x.atomic_umax
                     && self.x.atomic_lock_rounds
                     && op == "umax"
@@ -9586,6 +9616,7 @@ impl<'a> Lower<'a> {
                 let at = self.begin_guarded(guard);
                 let (lo, hi) = self.locked_atomic64(h, &cs, coords, op, value, compare, not_rep);
                 let r = self.end_guarded(at, &[(lo, old[0]), (hi, old[1])]);
+                self.s.quiet -= quiet;
                 if cache.glc {
                     for (k, x) in (0..).zip(r) {
                         self.write(inst, Reg::V(reg + k), x, None);
@@ -11247,6 +11278,9 @@ impl<'a> Lower<'a> {
                         };
                         self.enter_loop(b, to, from);
                     }
+                }
+                if self.x.loop_entry_exit {
+                    self.note_loop_exit(b, cond, (taken, not_taken), (t, f));
                 }
                 Term::CondBr(cond, t, f)
             }

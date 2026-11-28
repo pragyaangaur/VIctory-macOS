@@ -156,6 +156,7 @@ fn lower(native: &NativeProgram) -> Result<HostShader, ShaderError> {
         narrow_waves: false,
         uav_size_level0: false,
         view_marks: false,
+        loop_entry_exit: false,
     })?;
     Ok(HostShader {
         stage: HwStage::Cs,

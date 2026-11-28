@@ -301,6 +301,7 @@ fn lower_program(words: &[u32]) -> Result<HostShader, String> {
         narrow_waves: false,
         uav_size_level0: false,
         view_marks: false,
+        loop_entry_exit: false,
     })
     .map_err(e)?;
     Ok(HostShader {

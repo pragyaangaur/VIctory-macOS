@@ -605,6 +605,16 @@ pub struct Options {
     /// The host asks for it only for programs a dispatch counted in threads
     /// ends in a part of a group of (`victory_gpu::pipeline::thread_limited`).
     pub thread_limits: bool,
+    /// In a wave64 program predicated for 32-lane halves (`lower::predicate`),
+    /// lanes an early exit took out of EXEC before a loop leave that loop at
+    /// its first exit test, where the console runs no pass of it for them:
+    /// kept on with the early exit's predicate false, they followed the
+    /// loop's own test, which the structurisation simplified for lanes in
+    /// EXEC, and could spin to the loop limit holding their whole wave
+    /// (`lower::entry_exit`). Only where that is exact. Off by default
+    /// (`VICTORY_LOOP_ENTRY_EXIT=1`). The translation differs, so the shader
+    /// cache keys on it.
+    pub loop_entry_exit: bool,
 }
 
 /// Metal's limit on a mesh shader's outputs per thread group, in bytes
@@ -1116,6 +1126,7 @@ fn emit_pruned(
         narrow_waves: options.narrow_waves,
         uav_size_level0: options.uav_size_level0,
         halves_rendezvous: options.halves_rendezvous,
+        loop_entry_exit: options.loop_entry_exit,
     };
     let (literal, limits) = (!options.disable_literal_halves, options.thread_limits);
     let (l, heap_index_sources) = match lower::lower_limited(

@@ -85,6 +85,7 @@ fn build_with(words: &[u32], buffers: bool, nonuniform: u32) -> HostShader {
         narrow_waves: false,
         uav_size_level0: false,
         view_marks: false,
+        loop_entry_exit: false,
     })
     .expect("lower");
     // No wave operation.

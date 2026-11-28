@@ -180,6 +180,23 @@ fn halves_rendezvous() -> bool {
     *ON.get_or_init(|| std::env::var("VICTORY_HALVES_RENDEZVOUS").as_deref() != Ok("0"))
 }
 
+/// Whether lanes an early exit took out of EXEC leave a later loop at its
+/// first exit test in programs predicated for 32-lane halves
+/// (`victory_shader::emit::Options::loop_entry_exit`): only with
+/// `VICTORY_LOOP_ENTRY_EXIT=1` while it is measured.
+fn loop_entry_exit() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var("VICTORY_LOOP_ENTRY_EXIT").as_deref() == Ok("1");
+        if on {
+            tracing::info!(
+                "VICTORY_LOOP_ENTRY_EXIT=1: lanes outside a loop's entry predicate leave it at once"
+            );
+        }
+        on
+    })
+}
+
 /// Whether 64-thread wave64 shaders keep only the per-lane translation.
 fn literal_halves_disabled() -> bool {
     static OFF: OnceLock<bool> = OnceLock::new();
@@ -279,6 +296,7 @@ pub(crate) fn translation_build(options: victory_shader::emit::Options) -> &'sta
     let apart = options.host_wave32 && !options.halves_rendezvous;
     let cap_barriers = victory_shader::emit::cap_barriers_refused();
     let limits = options.thread_limits;
+    let entry_exit = options.loop_entry_exit;
     if !locks
         && !bias
         && !narrow
@@ -287,10 +305,11 @@ pub(crate) fn translation_build(options: victory_shader::emit::Options) -> &'sta
         && !apart
         && !cap_barriers
         && !limits
+        && !entry_exit
     {
         return build();
     }
-    static BUILDS: [OnceLock<[u8; 32]>; 1024] = [const { OnceLock::new() }; 1024];
+    static BUILDS: [OnceLock<[u8; 32]>; 2048] = [const { OnceLock::new() }; 2048];
     let n = usize::from(locks)
         | usize::from(bias) << 1
         | usize::from(narrow) << 2
@@ -300,7 +319,8 @@ pub(crate) fn translation_build(options: victory_shader::emit::Options) -> &'sta
         | usize::from(uav_level0) << 6
         | usize::from(apart) << 7
         | usize::from(cap_barriers) << 8
-        | usize::from(limits) << 9;
+        | usize::from(limits) << 9
+        | usize::from(entry_exit) << 10;
     BUILDS[n].get_or_init(|| {
         let mut h = blake3::Hasher::new();
         h.update(build());
@@ -334,6 +354,9 @@ pub(crate) fn translation_build(options: victory_shader::emit::Options) -> &'sta
         if limits {
             h.update(b"thread limits");
         }
+        if entry_exit {
+            h.update(b"loop entry exit");
+        }
         *h.finalize().as_bytes()
     })
 }
@@ -359,6 +382,7 @@ pub(crate) fn runtime_options() -> victory_shader::emit::Options {
         // Only for the pipelines a dispatch counted in threads needs it
         // for (`crate::pipeline::thread_limited`).
         thread_limits: false,
+        loop_entry_exit: loop_entry_exit(),
     }
 }
 
@@ -848,6 +872,31 @@ mod tests {
         );
         // A list with a wrong entry is no list: nothing is turned on.
         assert_eq!(uav_size(Some("07f451a14b13fecb,1")), (false, vec![]));
+    }
+
+    /// Translations whose early-exited lanes leave loops at once have cache
+    /// entries of their own.
+    #[test]
+    fn the_loop_entry_exit_switch_keys_the_cache() {
+        let plain = victory_shader::emit::Options::default();
+        let on = victory_shader::emit::Options {
+            loop_entry_exit: true,
+            ..plain
+        };
+        assert_eq!(translation_build(plain), build());
+        assert_ne!(translation_build(on), build());
+        let rendezvous = victory_shader::emit::Options {
+            host_wave32: true,
+            halves_rendezvous: true,
+            ..plain
+        };
+        assert_ne!(
+            translation_build(rendezvous),
+            translation_build(victory_shader::emit::Options {
+                loop_entry_exit: true,
+                ..rendezvous
+            })
+        );
     }
 
     /// Translations with the level-0 size query have cache entries of

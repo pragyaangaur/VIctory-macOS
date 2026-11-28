@@ -85,6 +85,7 @@ fn lowers(words: &[u32], rsrc2: u32) -> Result<(), crate::ShaderError> {
         narrow_waves: false,
         uav_size_level0: false,
         view_marks: false,
+        loop_entry_exit: false,
     })
     .map(|_| ())
 }
@@ -144,6 +145,7 @@ fn lower_wave(
         narrow_waves: false,
         uav_size_level0: false,
         view_marks: false,
+        loop_entry_exit: false,
     })
 }
 
@@ -454,6 +456,7 @@ fn perm_features(selector: u32) -> u64 {
         narrow_waves: false,
         uav_size_level0: false,
         view_marks: false,
+        loop_entry_exit: false,
     })
     .unwrap();
 
@@ -1436,6 +1439,7 @@ fn lowered_result(
         uav_size_level0: false,
         host_wave32: false,
         view_marks: false,
+        loop_entry_exit: false,
     })
 }
 
@@ -1678,6 +1682,7 @@ fn lowered_halves_lds(
         uav_size_level0: false,
         host_wave32: true,
         view_marks: false,
+        loop_entry_exit: false,
     })
 }
 
@@ -2402,6 +2407,7 @@ fn ds_bpermute_wave64_preserves_32_lane_half() {
             uav_size_level0: false,
             host_wave32: false,
             view_marks: false,
+            loop_entry_exit: false,
         })
         .unwrap();
         assert!(lowered.wave_ops);
@@ -2502,6 +2508,7 @@ fn lower_ps_for_early_z(
         uav_size_level0: false,
         host_wave32: false,
         view_marks,
+        loop_entry_exit: false,
     })
     .expect("lower")
 }
@@ -3307,6 +3314,7 @@ fn lower_halves_io(
             narrow_waves: false,
             uav_size_level0: false,
             view_marks: false,
+            loop_entry_exit: false,
         })
     });
     super::NO_PREDICATION.with(|c| c.set(false));

@@ -87,6 +87,7 @@ fn lower(
         uav_size_level0: false,
         host_wave32: false,
         view_marks,
+        loop_entry_exit: false,
     })
     .expect("lower")
 }

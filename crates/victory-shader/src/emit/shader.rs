@@ -200,6 +200,25 @@ pub(crate) struct Shader {
     lds: Option<V>,
     main: V,
     pub entry: usize,
+    /// Lane operations ([`lane_op`]) written so far, but for those written
+    /// while [`Shader::quiet`] is above 0 (`lower::entry_exit`).
+    pub lane_ops: u32,
+    /// Above 0 while code is written whose lane operations involve only
+    /// lanes of an instruction's guard, or give an identity in others
+    /// (`lower::entry_exit`).
+    pub quiet: u32,
+}
+
+/// A DXIL operation whose result or progress depends on which other lanes
+/// of the wave or the group run it: barriers, wave and quad operations,
+/// and those taking implicit derivatives from the other lanes of the quad
+/// (`Sample`, `SampleBias`, `SampleCmp`, `CalculateLOD`, `Deriv*`);
+/// `waveGetLaneIndex` and `waveGetLaneCount` do not.
+pub(crate) fn lane_op(opcode: u32) -> bool {
+    matches!(
+        opcode,
+        60 | 61 | 64 | 80 | 81 | 83..=86 | 110 | 113..=123 | 135 | 136 | 165..=167 | 222
+    )
 }
 
 impl Shader {
@@ -265,6 +284,8 @@ impl Shader {
             lds: None,
             main,
             entry,
+            lane_ops: 0,
+            quiet: 0,
         }
     }
 
@@ -297,6 +318,9 @@ impl Shader {
         let f = self
             .m
             .function(&format!("dx.op.{name}"), fty, Some(attr), false);
+        if self.quiet == 0 && lane_op(opcode) {
+            self.lane_ops += 1;
+        }
         let mut all = vec![self.m.i32(opcode)];
         all.extend(args);
         let choice = self

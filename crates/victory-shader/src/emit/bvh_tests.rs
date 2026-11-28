@@ -601,6 +601,7 @@ fn build(wide: bool, memory: bool) -> HostShader {
         narrow_waves: false,
         uav_size_level0: false,
         view_marks: false,
+        loop_entry_exit: false,
     })
     .expect("lower");
     let shader = HostShader {

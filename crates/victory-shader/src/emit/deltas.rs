@@ -283,6 +283,7 @@ mod tests {
                 halves_rendezvous: false,
                 host_wave32: false,
                 view_marks: false,
+                loop_entry_exit: false,
             },
             None,
             per_vertex_center,

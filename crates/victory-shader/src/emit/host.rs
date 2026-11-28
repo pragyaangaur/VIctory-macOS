@@ -949,6 +949,7 @@ fn fmad_probe() -> Result<HostShader, crate::ShaderError> {
         uav_size_level0: false,
         halves_rendezvous: false,
         view_marks: false,
+        loop_entry_exit: false,
     })?;
     Ok(HostShader {
         stage: HwStage::Cs,

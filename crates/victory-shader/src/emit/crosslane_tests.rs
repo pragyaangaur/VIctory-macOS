@@ -419,6 +419,7 @@ fn build_wave32_cs(pattern: MaskPattern, div: Divergence, op_words: &[u32]) -> H
         uav_size_level0: false,
         host_wave32: false,
         view_marks: false,
+        loop_entry_exit: false,
     })
     .expect("lower");
 
