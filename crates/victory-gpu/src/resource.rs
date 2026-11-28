@@ -1979,9 +1979,18 @@ pub(crate) fn evict_unused() {
     // evict1 gave up and made again hundreds of textures a frame).
     let read = crate::descriptor::read_textures(&crate::shadow::reads_since());
     part.lap(EvictPart::ReadMarks);
-    let candidates = candidates();
+    let excess = over.max(ram);
+    static IDLE_ONLY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let idle_only = IDLE_ONLY.get_or_init(|| {
+        std::env::var_os("VICTORY_EVICT_IDLE_ONLY").is_some_and(|v| v == "1")
+    });
+    let candidates = if excess == 0 && *idle_only {
+        idle_candidates(&read, frame, now_ms())
+    } else {
+        candidates()
+    };
     part.lap(EvictPart::Candidates);
-    evict_among(&candidates, &read, frame, now_ms(), over.max(ram));
+    evict_among(&candidates, &read, frame, now_ms(), excess);
     drop(candidates);
     part.lap(EvictPart::GiveUp);
     empty_sparse_heap(frame);
@@ -2356,14 +2365,40 @@ pub(crate) fn evict_among(
 /// title textures holding it.
 #[cfg(windows)]
 fn candidates() -> Vec<Owned> {
+    candidates_matching(|_| true)
+}
+
+/// Under budget, only idle textures need an owner list. Record shader reads
+/// even for textures we skip. `evict_among` checks usage again after the walk.
+#[cfg(windows)]
+fn idle_candidates(read: &std::collections::HashSet<usize>, frame: u64, now: u64) -> Vec<Owned> {
+    use std::sync::atomic::Ordering::Relaxed;
+    use windows::core::Interface;
+
+    candidates_matching(|t| {
+        if read.contains(&(t.texture.as_raw() as usize)) {
+            t.stamp_at(frame, now);
+            return false;
+        }
+        idle_at(t.last[0].load(Relaxed), t.last[1].load(Relaxed), frame, now)
+    })
+}
+
+#[cfg(windows)]
+fn candidates_matching(keep: impl Fn(&HostTexture) -> bool) -> Vec<Owned> {
     let at = TEXTURES_AT.lock().unwrap_or_else(|e| e.into_inner());
     let mut by: std::collections::HashMap<usize, Owned> = std::collections::HashMap::new();
     for &r in at.values().flatten() {
-        if let Some(t) = made(resource(r as This)).filter(|t| evictable(t)) {
+        if let Some(t) = made(resource(r as This)).filter(|t| evictable(t) && keep(t)) {
             by.entry(std::sync::Arc::as_ptr(&t) as usize).or_insert_with(|| (t, Vec::new())).1.push(r);
         }
     }
     by.into_values().collect()
+}
+
+#[cfg(windows)]
+fn idle_at(last_frame: u64, last_ms: u64, frame: u64, now: u64) -> bool {
+    frame.saturating_sub(last_frame) >= IDLE_FRAMES && now.saturating_sub(last_ms) >= IDLE_MS
 }
 
 /// Of textures last used at (frame, ms) taking (bytes) each, those to give
@@ -2376,7 +2411,7 @@ fn candidates() -> Vec<Owned> {
 /// picture flickered), and the card's use stays where it was.
 #[cfg(windows)]
 fn choose(uses: &[(u64, u64, u64)], frame: u64, now: u64, over: u64) -> Vec<usize> {
-    let idle = |&(f, ms, _): &(u64, u64, u64)| frame.saturating_sub(f) >= IDLE_FRAMES && now.saturating_sub(ms) >= IDLE_MS;
+    let idle = |&(f, ms, _): &(u64, u64, u64)| idle_at(f, ms, frame, now);
     let (mut gone, mut rest): (Vec<usize>, Vec<usize>) = (0..uses.len()).partition(|&i| idle(&uses[i]));
     let mut over = over.saturating_sub(gone.iter().map(|&i| uses[i].2).sum());
     rest.retain(|&i| frame.saturating_sub(uses[i].0) > SOON_FRAMES);
@@ -3447,6 +3482,58 @@ mod tests {
             assert_eq!(slot::<Release>(r, 0x10)(r), 0);
         }
         assert_eq!(slot::<Release>(h, 0x10)(h), 0);
+    }
+
+    /// A shader read protects the shared host texture. Once both idle limits
+    /// expire, eviction must release it from both title resources.
+    #[cfg(windows)]
+    #[test]
+    fn idle_scan_tracks_shader_reads_and_all_shared_owners() {
+        use std::sync::Arc;
+        use windows::core::Interface;
+
+        if crate::host::host().is_none() {
+            return;
+        }
+        let null = std::ptr::null();
+        let h = heap(1 << 20);
+        let place = || {
+            let mut out = null;
+            let desc = texture(64, 64, 28, 1);
+            assert_eq!(
+                create_placed(null, h, 0, &desc, 0, null.cast(), &RESOURCE_IIDS[0], &mut out),
+                S_OK
+            );
+            out
+        };
+        let (first, second) = (place(), place());
+        let view = host_copy(first).unwrap();
+        assert!(Arc::ptr_eq(&view, &host_copy(second).unwrap()));
+        let ours = |list: Vec<Owned>| list.into_iter().find(|(t, _)| Arc::ptr_eq(t, &view));
+        let reads = [view.texture.as_raw() as usize].into_iter().collect();
+        let (frame, now) = (2 * IDLE_FRAMES, 2 * IDLE_MS);
+        view.stamp_at(0, 0);
+        assert!(ours(idle_candidates(&reads, frame, now)).is_none());
+        assert_eq!(view.last_used(), (frame, now));
+
+        let no_reads = Default::default();
+        let (frame, now) = (frame + IDLE_FRAMES, now + IDLE_MS);
+        assert!(ours(idle_candidates(&no_reads, frame - 1, now)).is_none());
+        assert!(ours(idle_candidates(&no_reads, frame, now - 1)).is_none());
+        let candidate = ours(idle_candidates(&no_reads, frame, now)).unwrap();
+        assert_eq!(candidate.1.len(), 2);
+        assert!(candidate.1.contains(&(first as usize)));
+        assert!(candidate.1.contains(&(second as usize)));
+
+        // A use between the registry walk and selection protects the texture.
+        view.stamp_at(frame, now);
+        assert_eq!(evict_among(std::slice::from_ref(&candidate), &no_reads, frame, now, 0), (0, 0));
+        let (given_up, _) = evict_among(&[candidate], &no_reads, frame + IDLE_FRAMES, now + IDLE_MS, 0);
+        assert_eq!(given_up, 1);
+        assert!(made(resource(first)).is_none() && made(resource(second)).is_none());
+        for object in [first, second, h] {
+            assert_eq!(slot::<Release>(object, 0x10)(object), 0);
+        }
     }
 
     /// Host textures the GPU wrote (a list moved them to a write state) are
