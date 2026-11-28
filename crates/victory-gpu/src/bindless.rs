@@ -1164,15 +1164,12 @@ fn left_kind(view: &View) -> (usize, u64, u64) {
     }
 }
 
-/// At submission, before anything else of it: the textures the heaps of its
+/// At submission, after its leading title copies: the textures the heaps of its
 /// heap-indexing lists view, and `textures` (staging and host texture of
 /// those its lists read through tables, `crate::texture::upload`), are
 /// brought up to date, those whose title memory changed copied into their
 /// host textures by a list of ours, which the submission runs first (and
 /// leaves them readable by shaders): each at most once.
-///
-/// shortcut: a title copy into texture memory recorded in the same
-/// submission shows from the next one on.
 pub(crate) fn uploads(
     heaps: &[Arc<Viewed>],
     textures: &[(Arc<crate::texture::Staging>, Arc<crate::resource::HostTexture>)],

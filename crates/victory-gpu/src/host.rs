@@ -2424,6 +2424,7 @@ struct Deferred {
     /// scanning `copies` for lists that have none.
     has_heaps: bool,
     has_textures: bool,
+    has_title_copy: bool,
     has_gpu_writes: bool,
     /// Work done once the list has run, before the bottom-of-pipe writes
     /// (title memory shaders wrote at addresses they computed goes back).
@@ -2992,6 +2993,25 @@ impl Host {
                 }
             }
         }
+        let mut batch = Batch::take();
+        let has_title_copies = runs.iter().any(|list| list.has_title_copy());
+        let copies_before_uploads = has_title_copies && (!heaps.is_empty() || !textures.is_empty());
+        let mut copy_prefixes = Vec::new();
+        if copies_before_uploads {
+            // The queue has completed earlier GPU work in a separate part.
+            // Apply its ordered CPU copy prefix before staging the textures
+            // these lists read, including cached heap texture walks.
+            clock.lap(Phase::Other);
+            flight::land_ahead(flight::Early::TitleCopy);
+            clock.lap(Phase::LandingEarly);
+            for list in runs {
+                copy_prefixes.push(list.run_title_copy_prefix(&mut batch));
+                if list.needs_completion_before_title_copy() {
+                    break;
+                }
+            }
+            clock.lap(Phase::ListSteps);
+        }
         // Every submission, not only those with textures to bring up: the
         // staging pools and the upload list (it holds what the last
         // submission staged) age on each one (`uploads`), and so do the
@@ -3063,28 +3083,28 @@ impl Host {
             Vec::with_capacity(2 * runs.len() + needed_barriers);
         // Where each run's lists start in `lists`.
         let mut firsts = Vec::with_capacity(runs.len());
-        // Title copies are done here on the CPU, ahead of the GPU work before
-        // them: a submission in flight that reads their destinations' host
-        // copies lands first (`VICTORY_PREP_AHEAD=1`).
-        if runs.iter().any(|r| r.batch_flags().has_title_copy) {
+        // If there was no texture staging, the CPU copies run here. Any
+        // preceding flight must still land before the copies read or write
+        // title memory.
+        if has_title_copies && !copies_before_uploads {
             clock.lap(Phase::Other);
             flight::land_ahead(flight::Early::TitleCopy);
             clock.lap(Phase::LandingEarly);
         }
-        let mut batch = Batch::take();
         clock.lap(Phase::Other);
         for (idx, list) in runs.iter().enumerate() {
-            list.run_deferred(&mut batch);
+            let first_step = idx
+                .checked_sub(uploads_offset)
+                .and_then(|i| copy_prefixes.get(i).copied())
+                .unwrap_or(0);
+            list.run_deferred(&mut batch, first_step);
             clock.lap(Phase::ListSteps);
             firsts.push(lists.len());
             let needs_barrier = idx
                 .checked_sub(uploads_offset)
                 .and_then(|i| barrier_before.get(i).copied())
                 .unwrap_or(false);
-            if needs_barrier
-                && !lists.is_empty()
-                && let Some(barrier) = barrier_lists.get(barrier_cursor)
-            {
+            if needs_barrier && let Some(barrier) = barrier_lists.get(barrier_cursor) {
                 lists.push(barrier.list());
                 barrier_cursor += 1;
             }
@@ -4647,6 +4667,7 @@ impl HostList {
     fn defer_title_copy(&self, step: Step) {
         let mut deferred = self.deferred();
         deferred.copies.push(step);
+        deferred.has_title_copy = true;
         deferred.refreshed.clear();
         deferred.slots.clear();
         deferred.filled_scratch.clear();
@@ -5099,13 +5120,38 @@ impl HostList {
     /// over).
     pub(crate) fn is_empty(&self) -> bool {
         let d = self.deferred();
-        let deferred_empty = d.copies.is_empty() && d.uploads.is_empty() && d.writes.is_empty() && d.after.is_empty() && d.missed.is_empty();
-        drop(d);
-        deferred_empty
-            && self.states.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
-            && self.twins.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
-            && self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
-            && self.clamps.lock().unwrap_or_else(|e| e.into_inner()).pending.is_empty()
+        let has_copies = !d.copies.is_empty();
+        !self.has_work(d, has_copies)
+    }
+
+    pub(crate) fn has_title_copy(&self) -> bool {
+        self.deferred().has_title_copy
+    }
+
+    /// Earlier work must complete before a CPU title copy can change what
+    /// the GPU reads, or observe what that work writes. Consecutive CPU
+    /// title copies already run in order in preparation.
+    pub(crate) fn needs_completion_before_title_copy(&self) -> bool {
+        let deferred = self.deferred();
+        let other_steps = deferred
+            .copies
+            .iter()
+            .any(|step| !matches!(step, Step::Copy(..) | Step::Move(..)));
+        self.has_work(deferred, other_steps)
+    }
+
+    fn has_work(&self, deferred: std::sync::MutexGuard<'_, Deferred>, has_steps: bool) -> bool {
+        let has_work = has_steps
+            || !deferred.uploads.is_empty()
+            || !deferred.writes.is_empty()
+            || !deferred.after.is_empty()
+            || !deferred.missed.is_empty();
+        drop(deferred);
+        has_work
+            || !self.states.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
+            || !self.twins.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
+            || !self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
+            || !self.clamps.lock().unwrap_or_else(|e| e.into_inner()).pending.is_empty()
     }
 
     /// `size` bytes of mapped upload memory for a texture to copy from,
@@ -5324,13 +5370,30 @@ impl HostList {
         deferred.copies.push(Step::Texture(staging, copy));
     }
 
-    /// Runs the list's submission-time steps; refreshes go into `batch`
-    /// (the title's big buffers, a 174 MB one among them, are read by most
-    /// lists of a submission, through many ranges).
-    fn run_deferred(&self, batch: &mut Batch) {
+    /// Runs the CPU copies recorded before this list's other steps and
+    /// returns how many to skip during ordinary preparation.
+    fn run_title_copy_prefix(&self, batch: &mut Batch) -> usize {
+        let deferred = self.deferred();
+        let prefix = deferred
+            .copies
+            .iter()
+            .take_while(|step| matches!(step, Step::Copy(..) | Step::Move(..)))
+            .count();
+        Self::run_steps(batch, &deferred.copies[..prefix]);
+        prefix
+    }
+
+    /// Runs the list's submission-time steps after any copy prefix.
+    fn run_deferred(&self, batch: &mut Batch, first_step: usize) {
+        Self::run_steps(batch, &self.deferred().copies[first_step..]);
+    }
+
+    /// Refreshes go into `batch` for merging across lists, which often
+    /// view overlapping ranges of the same buffers.
+    fn run_steps(batch: &mut Batch, steps: &[Step]) {
         #[cfg(feature = "diagnostics")]
         use crate::copystat::{C, add};
-        for step in &self.deferred().copies {
+        for step in steps {
             #[cfg(feature = "diagnostics")]
             let started = std::time::Instant::now();
             // The preparing report counts the copies' time only (the other
@@ -8070,7 +8133,7 @@ mod batch {
         let list = super::host().unwrap().new_list().unwrap();
         list.defer_copy(dst as *mut u8, src as *const u8, len);
         super::same_copy::TEST_MODE.with(|m| m.set(mode));
-        list.run_deferred(batch);
+        list.run_deferred(batch, 0);
         super::same_copy::TEST_MODE.with(|m| m.set(0));
     }
 
@@ -8084,7 +8147,7 @@ mod batch {
         list.defer_host(|| std::thread::sleep(std::time::Duration::from_millis(2)));
         let before = super::STEPS[3].load(std::sync::atomic::Ordering::Relaxed);
         let before_us = super::STEPS[super::STEP_NAMES.len() + 3].load(std::sync::atomic::Ordering::Relaxed);
-        list.run_deferred(&mut Batch::default());
+        list.run_deferred(&mut Batch::default(), 0);
         // Another test's frame report may take the counts meanwhile.
         let (after, after_us) = (
             super::STEPS[3].load(std::sync::atomic::Ordering::Relaxed),
@@ -8237,7 +8300,7 @@ mod batch {
         batch.add(&b, pb, 4 * PAGE);
         let list = super::host().unwrap().new_list().unwrap();
         list.defer_move((pa + PAGE) as *mut u8, pa as *const u8, 2 * PAGE);
-        list.run_deferred(&mut batch);
+        list.run_deferred(&mut batch, 0);
         batch.add(&a, pa, 4 * PAGE);
         batch.add(&b, pb, 4 * PAGE);
         assert_eq!(

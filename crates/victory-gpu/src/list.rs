@@ -911,7 +911,38 @@ fn buffer_range(buffer: This, offset: u64, len: u64) -> Option<*mut u8> {
     Some(unsafe { data.add(offset as usize) })
 }
 
-/// Buffer to buffer: both are host memory, copied at submission.
+/// Records a deferred CPU copy at the start of a segment if an earlier
+/// command needs to finish first. The queue submits the earlier segment
+/// before preparing this copy, even when both were recorded on one list.
+#[cfg(windows)]
+fn record_title_copy(this: This, dst: *mut u8, src: *const u8, len: usize, overlapping: bool) {
+    if len == 0 {
+        return;
+    }
+    let Some(current) = host_list(this) else { return };
+    let mut into = current;
+    if current.needs_completion_before_title_copy() {
+        let Some(next) = next_segment(this) else {
+            // Submitting the original segment would make the CPU copy
+            // overtake the commands the segment already holds.
+            crate::host::fail(format_args!("could not split host command list before a title copy"));
+        };
+        // SAFETY: this is a live title list passed to one of its methods.
+        let list = unsafe { &*this.cast::<List>() };
+        let mut state = list.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.flush_hdr_probe(current);
+        current.close();
+        state.cut(next);
+        into = next;
+    }
+    if overlapping {
+        into.defer_move(dst, src, len);
+    } else {
+        into.defer_copy(dst, src, len);
+    }
+}
+
+/// Buffer to buffer: both are title memory, copied at submission.
 extern "system" fn copy_buffer_region(
     this: This,
     dst: This,
@@ -921,11 +952,10 @@ extern "system" fn copy_buffer_region(
     len: u64,
 ) {
     #[cfg(windows)]
-    if let Some(list) = host_list(this)
-        && let Some(to) = buffer_range(dst, dst_offset, len)
+    if let Some(to) = buffer_range(dst, dst_offset, len)
         && let Some(from) = buffer_range(src, src_offset, len)
     {
-        list.defer_copy(to, from, len as usize);
+        record_title_copy(this, to, from, len as usize, false);
     }
     #[cfg(not(windows))]
     let _ = (this, dst, dst_offset, src, src_offset, len);
@@ -955,7 +985,7 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
             crate::resource::buffer_bytes(dst),
             crate::resource::buffer_bytes(src),
         ) {
-            list.defer_copy(to, from, a.min(b) as usize);
+            record_title_copy(this, to, from, a.min(b) as usize, false);
         }
     }
     #[cfg(not(windows))]
@@ -1406,15 +1436,8 @@ extern "system" fn clear_dsv(
 /// `memmove` when both ranges are committed.
 extern "system" fn copy_memory(this: This, dst: u64, src: u64, len: u64, _flags: u32) {
     #[cfg(windows)]
-    if let Some(list) = host_list(this)
-        && dst != 0
-        && src != 0
-    {
-        if src.abs_diff(dst) >= len {
-            list.defer_copy(dst as *mut u8, src as *const u8, len as usize);
-        } else {
-            list.defer_move(dst as *mut u8, src as *const u8, len as usize);
-        }
+    if dst != 0 && src != 0 {
+        record_title_copy(this, dst as *mut u8, src as *const u8, len as usize, src.abs_diff(dst) < len);
     }
     #[cfg(not(windows))]
     let _ = (this, dst, src, len);
