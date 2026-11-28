@@ -13,6 +13,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::{Acquire, Relaxed, Release}};
 use std::sync::{Arc, Mutex};
 
+
 use crate::backend::HostGpu;
 use crate::census_fast::{Snapshot, SnapshotCache, UnorderedIndex};
 use crate::census_maps::{Hashing, RangesMap};
@@ -167,7 +168,7 @@ impl Viewed {
             inner.walk = None;
         } else if inner.walk.is_none() {
             let mut walk = Walk::default();
-            for &r in inner.textures.keys() {
+            for r in inner.viewed_textures() {
                 walk.add(r);
             }
             inner.walk = Some(walk);
@@ -260,7 +261,7 @@ struct CopySpans {
     /// Heap slot indices currently referencing this `(shadow, uav)` in
     /// `Inner::slots`, so evicting a dead copy touches only its `k` slots in
     /// O(k) instead of scanning the entire heap.
-    slots: HashSet<u32>,
+    slots: HashSet<u32, Hashing>,
     /// Coalesced disjoint `[from, to)` sub-intervals (recomputed lazily when `dirty`).
     spans: Vec<(u64, u64)>,
     /// Bytes excluded as holes relative to this copy's single `(min, max)` envelope.
@@ -281,7 +282,7 @@ impl CopySpans {
             chunks: BTreeMap::new(),
             large: BTreeMap::new(),
             active_ranges: 0,
-            slots: HashSet::new(),
+            slots: HashSet::with_hasher(Hashing::Fold),
             spans: Vec::new(),
             hole_bytes: 0,
             dirty: true,
@@ -465,12 +466,76 @@ struct ActiveWord {
     entries: Vec<(u8, u32)>,
 }
 
+/// A heap's slots that view something, by slot number. Slot numbers are
+/// dense (below the heap's count), so a vector: the heap sync's ~40,000 slot
+/// updates a frame in the world each removed and inserted an entry of a
+/// hash map, and the lists' ~40,000 table slots each looked one up.
+#[derive(Default)]
+struct SlotMap {
+    slots: Vec<Option<Seen>>,
+    len: usize,
+}
+
+impl SlotMap {
+    fn get(&self, index: &u32) -> Option<&Seen> {
+        self.slots.get(*index as usize)?.as_ref()
+    }
+
+    #[cfg(test)]
+    fn contains_key(&self, index: &u32) -> bool {
+        self.get(index).is_some()
+    }
+
+    fn remove(&mut self, index: &u32) -> Option<Seen> {
+        let old = self.slots.get_mut(*index as usize)?.take();
+        if old.is_some() {
+            self.len -= 1;
+        }
+        old
+    }
+
+    fn insert(&mut self, index: u32, seen: Seen) -> Option<Seen> {
+        let i = index as usize;
+        if i >= self.slots.len() {
+            self.slots.resize_with(i + 1, || None);
+        }
+        let old = self.slots[i].replace(seen);
+        if old.is_none() {
+            self.len += 1;
+        }
+        old
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.len
+    }
+
+    #[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
+    fn values(&self) -> impl Iterator<Item = &Seen> {
+        self.slots.iter().flatten()
+    }
+
+    #[cfg(test)]
+    fn iter(&self) -> impl Iterator<Item = (u32, &Seen)> {
+        self.slots
+            .iter()
+            .enumerate()
+            .filter_map(|(i, s)| s.as_ref().map(|s| (i as u32, s)))
+    }
+}
+
 struct Inner {
-    slots: HashMap<u32, Seen, Hashing>,
+    slots: SlotMap,
     ranges: RangesMap<Range, (u32, Arc<Shadow>)>,
     /// Per title texture, the slots viewing it: an entry names its slots, so
     /// releasing the texture ([`Inner::forget`]) does not search the heap.
-    textures: BTreeMap<usize, BTreeSet<u32>>,
+    /// A texture whose last slot let go keeps its (empty) entry until it is
+    /// released: the title makes ~21,000 slots a frame null and many of them
+    /// view the same texture again soon after, and each time the entry and
+    /// its set went and were made again. Readers pass empty entries by
+    /// ([`Inner::viewed_textures`]).
+    textures: HashMap<usize, BTreeSet<u32>, Hashing>,
     /// Per `(copy, uav)` disjoint refresh sub-intervals (`CopySpans`), kept
     /// incrementally and coalesced lazily only when read. Stored densely so
     /// `refresh` indexes directly without hashing.
@@ -571,7 +636,7 @@ impl Walk {
     /// leaves the heap ([`Inner::forget`]) before its resource goes.
     fn collect(
         &mut self,
-        staged: &mut std::collections::HashSet<*const crate::texture::Staging>,
+        staged: &mut HashSet<*const crate::texture::Staging, Hashing>,
         work: &mut Vec<(
             Arc<crate::texture::Staging>,
             Arc<crate::resource::HostTexture>,
@@ -642,9 +707,9 @@ impl Default for Inner {
 impl Inner {
     fn new(fast: bool, quick_maps: bool, disjoint_spans: bool) -> Self {
         Inner {
-            slots: HashMap::with_hasher(Hashing::new(quick_maps)),
+            slots: SlotMap::default(),
             ranges: RangesMap::new(quick_maps),
-            textures: BTreeMap::new(),
+            textures: HashMap::with_hasher(Hashing::Fold),
             hulls: Vec::new(),
             hull_pos: HashMap::with_hasher(Hashing::new(quick_maps)),
             active_words: Vec::new(),
@@ -764,81 +829,104 @@ impl Inner {
         }
     }
 
+    /// The index in `hulls` of the copy spans of `(copy, uav)`, made if new.
+    fn hull_index(&mut self, hull_key: (usize, bool), shadow: &Arc<Shadow>) -> u32 {
+        if let Some(&idx) = self.hull_pos.get(&hull_key) {
+            return idx;
+        }
+        let entry = CopySpans::new(shadow.clone(), hull_key.1);
+        let bit = entry.bit;
+        let idx = self.hulls.len() as u32;
+        self.hulls.push(entry);
+        self.hull_pos.insert(hull_key, idx);
+        self.insert_hull_index(idx, bit);
+        idx
+    }
+
+    /// Drops the copy spans at `idx` (their last range went), moving the
+    /// last into its place.
+    fn drop_hull(&mut self, hull_key: (usize, bool), idx: u32) {
+        self.hull_pos.remove(&hull_key);
+        let last_idx = (self.hulls.len() - 1) as u32;
+        let removed = self.hulls.swap_remove(idx as usize);
+        self.remove_hull_index(idx, removed.bit);
+        if idx != last_idx {
+            let moved = &self.hulls[idx as usize];
+            let moved_key = (Arc::as_ptr(&moved.shadow) as usize, moved.uav);
+            let moved_bit = moved.bit;
+            self.hull_pos.insert(moved_key, idx);
+            self.move_hull_index(moved_bit, last_idx, idx);
+        }
+    }
+
+    /// The count of the buffer range `key` changes by `delta` (one slot's
+    /// change, or a batch's net change: [`Viewed::set_batch`]). The range
+    /// enters or leaves the UAV index and its copy's spans when its count
+    /// leaves or reaches 0 (the spans made with their first range and
+    /// dropped with their last). Returns `(unordered_changed, hulls_changed)`.
+    fn count_range(&mut self, key: Range, shadow: &Arc<Shadow>, delta: i64) -> (bool, bool) {
+        let mut unordered_changed = false;
+        let mut hulls_changed = false;
+        let e = self.ranges.entry_or(key, || (0, shadow.clone()));
+        let was = e.0;
+        e.0 = (i64::from(was) + delta).clamp(0, i64::from(u32::MAX)) as u32;
+        let now = e.0;
+        if now == 0 {
+            self.ranges.remove(&key);
+        }
+        if (was == 0) != (now == 0)
+            && key.3
+            && let Some(unordered) = &mut self.unordered
+        {
+            if now > 0 {
+                unordered.insert(key, shadow);
+            } else {
+                unordered.remove(&key);
+            }
+            unordered_changed = true;
+        }
+        let hull_key = (key.0, key.3);
+        let disjoint = self.disjoint_spans;
+        if was == 0 && now > 0 {
+            let idx = self.hull_index(hull_key, shadow);
+            hulls_changed |= self.hulls[idx as usize].add_range(key.1, key.2, disjoint);
+        } else if was > 0
+            && now == 0
+            && let Some(&idx) = self.hull_pos.get(&hull_key)
+        {
+            let (empty, changed) = self.hulls[idx as usize].remove_range(key.1, key.2, disjoint);
+            hulls_changed |= changed;
+            if empty {
+                self.drop_hull(hull_key, idx);
+            }
+        }
+        (unordered_changed, hulls_changed)
+    }
+
     /// Updates range, hull, texture, and (when enabled) UAV-index counts for
     /// one slot transition. Returns `(unordered_changed, hulls_changed)`.
     fn count(&mut self, slot: Option<u32>, seen: &Seen, add: bool) -> (bool, bool) {
-        let step = |n: &mut u32| if add { *n += 1 } else { *n = n.saturating_sub(1) };
         let mut unordered_changed = false;
         let mut hulls_changed = false;
         match seen {
             Seen::Buffer(shadow, address, len, uav) => {
                 let key = (Arc::as_ptr(shadow) as usize, *address, address + len, *uav);
-                let e = self.ranges.entry_or(key, || (0, shadow.clone()));
-                let was = e.0;
-                step(&mut e.0);
-                let now = e.0;
-                if now == 0 {
-                    self.ranges.remove(&key);
-                }
-                if (was == 0) != (now == 0)
-                    && key.3
-                    && let Some(unordered) = &mut self.unordered
-                {
-                    if now > 0 {
-                        unordered.insert(key, shadow);
-                    } else {
-                        unordered.remove(&key);
-                    }
-                    unordered_changed = true;
-                }
                 let hull_key = (key.0, key.3);
-                let disjoint = self.disjoint_spans;
                 if add {
-                    let idx = match self.hull_pos.get(&hull_key) {
-                        Some(&idx) => idx,
-                        None => {
-                            let entry = CopySpans::new(shadow.clone(), key.3);
-                            let bit = entry.bit;
-                            let idx = self.hulls.len() as u32;
-                            self.hulls.push(entry);
-                            self.hull_pos.insert(hull_key, idx);
-                            self.insert_hull_index(idx, bit);
-                            idx
-                        }
-                    };
-                    let entry = &mut self.hulls[idx as usize];
+                    // The range first (its copy's spans made with it), then
+                    // the slot among the copy's slots.
+                    (unordered_changed, hulls_changed) = self.count_range(key, shadow, 1);
+                    let idx = self.hull_index(hull_key, shadow);
                     if let Some(index) = slot {
-                        entry.slots.insert(index);
+                        self.hulls[idx as usize].slots.insert(index);
                     }
-                    if was == 0 && now > 0 {
-                        hulls_changed |= entry.add_range(key.1, key.2, disjoint);
-                    }
-                } else if let Some(&idx) = self.hull_pos.get(&hull_key) {
-                    let mut remove_copy = false;
+                } else {
+                    if let Some(index) = slot
+                        && let Some(&idx) = self.hull_pos.get(&hull_key)
                     {
-                        let entry = &mut self.hulls[idx as usize];
-                        if let Some(index) = slot {
-                            entry.slots.remove(&index);
-                        }
-                        if was > 0 && now == 0 {
-                            let (empty, changed) = entry.remove_range(key.1, key.2, disjoint);
-                            remove_copy = empty;
-                            hulls_changed |= changed;
-                        }
+                        self.hulls[idx as usize].slots.remove(&index);
                     }
-                    if remove_copy {
-                        self.hull_pos.remove(&hull_key);
-                        let last_idx = (self.hulls.len() - 1) as u32;
-                        let removed = self.hulls.swap_remove(idx as usize);
-                        self.remove_hull_index(idx, removed.bit);
-                        if idx != last_idx {
-                            let moved = &self.hulls[idx as usize];
-                            let moved_key = (Arc::as_ptr(&moved.shadow) as usize, moved.uav);
-                            let moved_bit = moved.bit;
-                            self.hull_pos.insert(moved_key, idx);
-                            self.move_hull_index(moved_bit, last_idx, idx);
-                        }
-                    }
+                    (unordered_changed, hulls_changed) = self.count_range(key, shadow, -1);
                 }
             }
             Seen::Texture(r) => {
@@ -850,9 +938,9 @@ impl Inner {
                     } else {
                         slots.remove(&index);
                     }
+                    // An emptied entry stays (see `textures`).
                     if slots.is_empty() {
-                        self.textures.remove(r);
-                        if let Some(walk) = &mut self.walk {
+                        if !new && let Some(walk) = &mut self.walk {
                             walk.remove(*r);
                         }
                     } else if new && let Some(walk) = &mut self.walk {
@@ -886,6 +974,11 @@ impl Inner {
             }
         }
         (unordered_changed, hulls_changed)
+    }
+
+    /// The textures some slot views (an emptied entry is no longer one).
+    fn viewed_textures(&self) -> impl Iterator<Item = usize> + '_ {
+        self.textures.iter().filter(|(_, slots)| !slots.is_empty()).map(|(&r, _)| r)
     }
 
     /// The title released the texture `resource`: the slots viewing it go.
@@ -969,13 +1062,48 @@ impl Viewed {
         if updates.is_empty() {
             return;
         }
+        let resolving = std::time::Instant::now();
         let entries = if self.quick_maps {
             resolve_updates(updates, Hashing::Fold)
         } else {
             resolve_updates(updates, std::hash::RandomState::new())
         };
+        let locking = std::time::Instant::now();
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        {
+            use crate::descriptor::{SyncStat as S, sync_stat};
+            sync_stat(S::ViewedResolveUs, (locking - resolving).as_micros() as u64);
+            sync_stat(S::ViewedLockUs, locking.elapsed().as_micros() as u64);
+        }
         let (mut unordered_changed, mut hulls_changed) = (false, false);
+        // Buffer ranges by their net change over the batch: the title
+        // rewrites heap slots in runs where one slot lets go of a range
+        // another takes (in the world ~23,000 slots a frame made null and
+        // ~14,000 made again, "noting it" ~22-26 ms of the heap sync on an M1
+        // Max), and each change on its own walked the range map and its
+        // copy's spans. Applied once at the end (ranges taken first, then the
+        // slots that took them join their copies, then ranges let go, which
+        // can drop a copy's spans), the counts, spans and slots are those one
+        // slot at a time would leave.
+        //
+        // Keyed by the copy's address: a range's copy is held once, by its
+        // entry here, cloned only when the batch first names it. Cloning it
+        // for every slot (four clones and drops a slot) was an atomic each
+        // on the big copies' counts, which the title's threads share.
+        let mut net: HashMap<Range, (i64, Arc<Shadow>), Hashing> =
+            HashMap::with_capacity_and_hasher(entries.len().min(1024), Hashing::Fold);
+        // Slots that took a buffer range (its key in `net`), joining its
+        // copy's slots once the ranges taken are in (a slot written twice in
+        // the batch joins once).
+        let mut joined: HashMap<u32, Range, Hashing> = HashMap::with_hasher(Hashing::Fold);
+        let key_of = |seen: &Seen| match seen {
+            Seen::Buffer(shadow, address, len, uav) => {
+                Some((Arc::as_ptr(shadow) as usize, *address, address + len, *uav))
+            }
+            _ => None,
+        };
+        let looping = std::time::Instant::now();
+        let (mut buffers, mut textures) = (0u64, 0u64);
         for (&(index, ref update), entry) in updates.iter().zip(entries) {
             // Unregister changes the epoch before acquiring this lock to evict
             // the old copy. Do not reinsert an entry after its eviction.
@@ -995,15 +1123,63 @@ impl Viewed {
                 continue;
             }
             if let Some(old) = inner.slots.remove(&index) {
-                let (u, h) = inner.count(Some(index), &old, false);
+                if let Some(key) = key_of(&old) {
+                    // Taken earlier in this batch: it has not joined yet.
+                    if joined.remove(&index).is_none()
+                        && let Some(&idx) = inner.hull_pos.get(&(key.0, key.3))
+                    {
+                        inner.hulls[idx as usize].slots.remove(&index);
+                    }
+                    let Seen::Buffer(shadow, ..) = old else {
+                        unreachable!("a buffer's key")
+                    };
+                    net.entry(key).or_insert((0, shadow)).0 -= 1;
+                    buffers += 1;
+                } else {
+                    textures += u64::from(matches!(old, Seen::Texture(_)));
+                    let (u, h) = inner.count(Some(index), &old, false);
+                    unordered_changed |= u;
+                    hulls_changed |= h;
+                }
+            }
+            if let Some(entry) = entry {
+                if let Some(key) = key_of(&entry) {
+                    net.entry(key)
+                        .or_insert_with(|| match &entry {
+                            Seen::Buffer(shadow, ..) => (0, shadow.clone()),
+                            _ => unreachable!("a buffer's key"),
+                        })
+                        .0 += 1;
+                    joined.insert(index, key);
+                    buffers += 1;
+                } else {
+                    textures += u64::from(matches!(entry, Seen::Texture(_)));
+                    let (u, h) = inner.count(Some(index), &entry, true);
+                    unordered_changed |= u;
+                    hulls_changed |= h;
+                }
+                inner.slots.insert(index, entry);
+            }
+        }
+        let applying = std::time::Instant::now();
+        let ranges = net.values().filter(|(d, _)| *d != 0).count() as u64;
+        for (key, (d, shadow)) in &net {
+            if *d > 0 {
+                let (u, h) = inner.count_range(*key, shadow, *d);
                 unordered_changed |= u;
                 hulls_changed |= h;
             }
-            if let Some(entry) = entry {
-                let (u, h) = inner.count(Some(index), &entry, true);
+        }
+        for (index, key) in joined {
+            let shadow = &net[&key].1;
+            let idx = inner.hull_index((key.0, key.3), shadow);
+            inner.hulls[idx as usize].slots.insert(index);
+        }
+        for (key, (d, shadow)) in &net {
+            if *d < 0 {
+                let (u, h) = inner.count_range(*key, shadow, *d);
                 unordered_changed |= u;
                 hulls_changed |= h;
-                inner.slots.insert(index, entry);
             }
         }
         if hulls_changed {
@@ -1013,6 +1189,14 @@ impl Viewed {
             && let Some(fast) = &self.fast
         {
             fast.invalidate();
+        }
+        {
+            use crate::descriptor::{SyncStat as S, sync_stat};
+            sync_stat(S::ViewedLoopUs, (applying - looping).as_micros() as u64);
+            sync_stat(S::ViewedApplyUs, applying.elapsed().as_micros() as u64);
+            sync_stat(S::ViewedBuffers, buffers);
+            sync_stat(S::ViewedTextures, textures);
+            sync_stat(S::ViewedRanges, ranges);
         }
     }
 
@@ -1076,23 +1260,14 @@ impl Viewed {
     /// Snapshot of distinct title texture resources currently viewed by this
     /// heap, for the background heap worker.
     pub(crate) fn texture_resources(&self) -> Vec<usize> {
-        self.inner
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .textures
-            .keys()
-            .copied()
-            .collect()
+        let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        inner.viewed_textures().collect()
     }
 
     /// Whether any title-written texture is currently viewed by this heap.
     pub(crate) fn has_textures(&self) -> bool {
-        !self
-            .inner
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .textures
-            .is_empty()
+        let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        inner.viewed_textures().next().is_some()
     }
 }
 
@@ -1173,11 +1348,34 @@ fn left_kind(view: &View) -> (usize, u64, u64) {
 ///
 /// shortcut: a title copy into texture memory recorded in the same
 /// submission shows from the next one on.
+/// Microseconds of [`uploads`] by step since the last frame report
+/// ([`take_upload_steps`]): recycling staging and resetting the list,
+/// textures read through tables, the heaps' textures, checking and detiling
+/// what changed, recording the copies.
+static UPLOAD_US: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
+
+/// [`UPLOAD_US`] in milliseconds per frame over `frames`, named, cleared.
+pub(crate) fn take_upload_steps(frames: f64) -> String {
+    const NAMES: [&str; 5] = ["recycle+reset", "table textures", "heap textures", "check+detile", "record"];
+    NAMES
+        .iter()
+        .zip(UPLOAD_US.each_ref().map(|a| a.swap(0, Relaxed)))
+        .map(|(n, us)| format!("{n} {:.1}", us as f64 / 1e3 / frames))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 pub(crate) fn uploads(
     heaps: &[Arc<Viewed>],
     textures: &[(Arc<crate::texture::Staging>, Arc<crate::resource::HostTexture>)],
 ) -> Option<Uploads> {
     static LIST: Mutex<Holder> = Mutex::new(Holder(None, false));
+    let mut lap_at = std::time::Instant::now();
+    let mut lap = |step: usize| {
+        let now = std::time::Instant::now();
+        UPLOAD_US[step].fetch_add((now - lap_at).as_micros() as u64, Relaxed);
+        lap_at = now;
+    };
     let list = {
         let mut guard = LIST.lock().unwrap_or_else(|e| e.into_inner());
         crate::texture::recycle();
@@ -1202,6 +1400,7 @@ pub(crate) fn uploads(
         guard.1 = false;
         list
     };
+    lap(0);
     let mut uploads = Uploads {
         list: Some(list),
         dirty: true,
@@ -1216,7 +1415,7 @@ pub(crate) fn uploads(
     // thread in a new shot, and title threads setting views waited on the
     // lock meanwhile (run evict5).
     let mut work: Vec<(Arc<crate::texture::Staging>, Arc<crate::resource::HostTexture>)> = Vec::new();
-    let mut staged = std::collections::HashSet::new();
+    let mut staged = HashSet::with_hasher(Hashing::Fold);
     for (staging, copy) in textures {
         // A host copy wrote it in a submission made before this one (it
         // was not when the list was recorded).
@@ -1227,9 +1426,10 @@ pub(crate) fn uploads(
             work.push((staging.clone(), copy.clone()));
         }
     }
+    lap(1);
     let worker_on = crate::heap_worker::on();
-    let mut done = std::collections::HashSet::new();
-    let mut walked = std::collections::HashSet::new();
+    let mut done = HashSet::with_hasher(Hashing::Fold);
+    let mut walked = HashSet::with_hasher(Hashing::Fold);
     if !worker_on {
         for viewed in heaps {
             let mut inner = viewed.inner.lock().unwrap_or_else(|e| e.into_inner());
@@ -1240,7 +1440,7 @@ pub(crate) fn uploads(
                 }
                 continue;
             }
-            for &r in inner.textures.keys() {
+            for r in inner.viewed_textures() {
                 if !done.insert(r) {
                     continue;
                 }
@@ -1271,10 +1471,13 @@ pub(crate) fn uploads(
             }
         }
     }
+    lap(2);
     let mut recorded = false;
     // The textures copied into stay alive in `work` until recorded.
     let mut readable = Vec::new();
-    for ((staging, copy), upload) in work.iter().zip(crate::texture::refresh_all(&work)) {
+    let refreshed = crate::texture::refresh_all(&work);
+    lap(3);
+    for ((staging, copy), upload) in work.iter().zip(refreshed) {
         if let Some(upload) = upload {
             readable.extend(crate::texture::record_upload(list, copy, staging, &upload));
             recorded = true;
@@ -1340,6 +1543,7 @@ pub(crate) fn uploads(
         unsafe { list.list.ResourceBarrier(&readable) };
     }
     list.close();
+    lap(4);
     uploads.dirty = recorded;
     *uploads.worker.get_mut().unwrap_or_else(|e| e.into_inner()) = ready;
     // A list recording nothing is not run (dropping `uploads` returns it to
@@ -1485,6 +1689,61 @@ pub(crate) fn refresh_slot(
     };
     if !shadow.clean() && !crate::watch::clean_bit(shadow.dirty_bit()) {
         add(shadow, *address as usize, *len as usize);
+    }
+}
+
+/// [`refresh_slot`] for each of `indices`, in their order, under one hold of
+/// the heap's lock: a world frame's lists read ~54,000 table slots, in runs
+/// of one heap.
+pub(crate) fn refresh_slots(
+    viewed: &Viewed,
+    indices: &[u32],
+    mut add: impl FnMut(&Arc<Shadow>, usize, usize),
+) {
+    let inner = viewed.inner.lock().unwrap_or_else(|e| e.into_inner());
+    // A run's tables name the same slots and ranges over and over (~38,000
+    // slot steps a frame took ~18 ms on an M1 Max): each slot, and each
+    // range, is asked for once a run. Nothing between a run's steps changes
+    // what an earlier ask of the same range brought up. Most runs are a few
+    // slots (~2.5 in the world, ~21,000 runs a frame): those are told apart
+    // by a scan, with no set made (an allocation each under Wine's heap
+    // lock).
+    const FEW: usize = 16;
+    thread_local! {
+        /// The slots a long run asked, kept from run to run.
+        static ASKED: std::cell::RefCell<HashSet<u32, Hashing>> =
+            const { std::cell::RefCell::new(HashSet::with_hasher(Hashing::Fold)) };
+    }
+    let mut asked = if indices.len() > FEW {
+        ASKED.with(|a| std::mem::replace(&mut *a.borrow_mut(), HashSet::with_hasher(Hashing::Fold)))
+    } else {
+        HashSet::with_hasher(Hashing::Fold)
+    };
+    asked.clear();
+    let mut last: (usize, u64, u64) = (0, 0, 0);
+    for (n, &index) in indices.iter().enumerate() {
+        let again = if indices.len() <= FEW {
+            indices[..n].contains(&index)
+        } else {
+            !asked.insert(index)
+        };
+        if again {
+            continue;
+        }
+        let Some(Seen::Buffer(shadow, address, len, _)) = inner.slots.get(&index) else {
+            continue;
+        };
+        let key = (Arc::as_ptr(shadow) as usize, *address, *len);
+        if key == last {
+            continue;
+        }
+        last = key;
+        if !shadow.clean() && !crate::watch::clean_bit(shadow.dirty_bit()) {
+            add(shadow, *address as usize, *len as usize);
+        }
+    }
+    if indices.len() > FEW {
+        ASKED.with(|a| *a.borrow_mut() = asked);
     }
 }
 
@@ -1693,7 +1952,7 @@ pub(crate) fn log(frames: f64) {
              host copies of title memory: {} ({:.1} MB); hulls {:.1} MB ({span_count} spans, holes {:.1} MB), unordered {:.1} MB",
             inner.ranges.len(),
             bytes as f64 / 1e6,
-            inner.textures.len(),
+            inner.viewed_textures().count(),
             left.join(", "),
             placed.len(),
             all.len(),
@@ -2021,9 +2280,206 @@ void main(uint3 id : SV_DispatchThreadID) {
         assert_eq!(inner.slots.len(), 2);
         assert!(matches!(inner.slots.get(&1), Some(Seen::Texture(0x20))));
         assert!(matches!(inner.slots.get(&3), Some(Seen::Left(_))));
-        assert_eq!(inner.textures.keys().copied().collect::<Vec<_>>(), [0x20]);
+        assert_eq!(inner.viewed_textures().collect::<Vec<_>>(), [0x20]);
         inner.forget(0x30);
         assert_eq!(inner.slots.len(), 2);
+    }
+
+    /// What `set_batch` (net counts per range) leaves is what the same
+    /// updates one slot at a time (`set`) leave: random batches over
+    /// overlapping ranges of three buffers, unordered and shader views,
+    /// unmade views, clears, slots written twice in a batch, and ranges one
+    /// slot drops while another takes them, with and without the fast census
+    /// and disjoint spans. A page bucket's observed bounds may differ (they
+    /// only grow until the page's last range goes, and the batch counts
+    /// neither a range dropped and taken again nor one taken and dropped
+    /// within it), but both hold every live range's bytes on the page.
+    #[test]
+    fn set_batch_leaves_what_one_slot_at_a_time_leaves() {
+        let Some(_host) = crate::host::host() else {
+            return; // no host GPU here
+        };
+        // A megabyte buffer, so ranges land in several 64 KiB page buckets
+        // and one spans more than 512 KiB (kept apart, `CopySpans::large`).
+        let bufs = [
+            resource(1, 0x10_0000, 1, 0, 1),
+            resource(1, 0x4_0000, 1, 0, 1),
+            resource(1, 0x1000, 1, 0, 1),
+        ];
+        for &buf in &bufs {
+            let (ptr, size) = crate::resource::buffer_bytes(buf).unwrap();
+            assert!(crate::shadow::find(ptr as u64, size).is_some());
+        }
+        let uav = |buf: This, first: u32, count: u32| {
+            View::Unordered(buf as usize, 0, Some([39, 1, first, 0, count, 0, 0, 0, 1, 0]))
+        };
+        let srv = |buf: This, first: u32, count: u32| {
+            View::Shader(buf as usize, Some([39, 1, 0x1688, first, 0, 0, count, 0, 1, 0]))
+        };
+        let views = [
+            uav(bufs[0], 0, 64),
+            uav(bufs[0], 32, 64),
+            uav(bufs[0], 40_000, 64),
+            uav(bufs[1], 16, 32),
+            uav(bufs[2], 32, 48),
+            srv(bufs[0], 0, 64),
+            srv(bufs[0], 20_000, 200_000),
+            srv(bufs[1], 0, 64),
+            srv(bufs[1], 8, 16),
+            srv(bufs[2], 100, 4),
+        ];
+        type Hull = (
+            (usize, bool),
+            u32,
+            Vec<(u64, u32)>,
+            Vec<(u64, u32)>,
+            Vec<(u64, u32)>,
+            Vec<((u64, u64), u32)>,
+            Vec<u32>,
+        );
+        // Everything the counts decide, in an order of its own, and each
+        // copy's page bounds by page.
+        type State = (
+            Vec<(Range, u32)>,
+            Vec<Hull>,
+            Vec<(usize, Vec<u32>)>,
+            Vec<(u32, String)>,
+            Vec<(usize, usize, usize)>,
+        );
+        type Bounds = BTreeMap<((usize, bool), u64), (u64, u64)>;
+        let state = |v: &Viewed| -> (State, Bounds) {
+            let mut writes = Vec::new();
+            widened_writes_into(v, &mut writes);
+            let mut writes: Vec<_> =
+                writes.iter().map(|(s, a, l)| (Arc::as_ptr(s) as usize, *a, *l)).collect();
+            writes.sort_unstable();
+            let i = v.inner.lock().unwrap();
+            // Hashed (`VICTORY_QUICK_SYNC` maps), the range map has no order.
+            let mut ranges: Vec<(Range, u32)> = i.ranges.iter().map(|(k, (n, _))| (*k, *n)).collect();
+            ranges.sort_unstable();
+            let mut bounds = Bounds::new();
+            let mut hulls: Vec<Hull> = i
+                .hulls
+                .iter()
+                .map(|h| {
+                    let key = (Arc::as_ptr(&h.shadow) as usize, h.uav);
+                    for (&p, b) in &h.chunks {
+                        bounds.insert((key, p), (b.min_lo, b.max_hi));
+                    }
+                    let mut slots: Vec<u32> = h.slots.iter().copied().collect();
+                    slots.sort_unstable();
+                    (
+                        key,
+                        h.active_ranges,
+                        h.starts.iter().map(|(a, n)| (*a, *n)).collect(),
+                        h.ends.iter().map(|(a, n)| (*a, *n)).collect(),
+                        h.chunks.iter().map(|(p, b)| (*p, b.count)).collect(),
+                        h.large.iter().map(|(r, n)| (*r, *n)).collect(),
+                        slots,
+                    )
+                })
+                .collect();
+            hulls.sort_unstable();
+            for (k, &idx) in &i.hull_pos {
+                let h = &i.hulls[idx as usize];
+                assert_eq!(*k, (Arc::as_ptr(&h.shadow) as usize, h.uav), "hull_pos names its hull");
+            }
+            assert_eq!(i.hull_pos.len(), i.hulls.len(), "every copy's spans are named");
+            let mut textures: Vec<(usize, Vec<u32>)> = i
+                .textures
+                .iter()
+                .filter(|(_, s)| !s.is_empty())
+                .map(|(r, s)| (*r, s.iter().copied().collect()))
+                .collect();
+            textures.sort_unstable();
+            let mut slots: Vec<_> = i
+                .slots
+                .iter()
+                .map(|(k, seen)| {
+                    let what = match seen {
+                        Seen::Buffer(s, a, l, u) => format!("b {:x} {a} {l} {u}", Arc::as_ptr(s) as usize),
+                        Seen::Texture(r) => format!("t {r}"),
+                        Seen::Left(k) => format!("l {k:?}"),
+                    };
+                    (k, what)
+                })
+                .collect();
+            slots.sort_unstable();
+            ((ranges, hulls, textures, slots, writes), bounds)
+        };
+        for mode in 0..8u8 {
+            let (fast, quick, disjoint) = (mode & 1 != 0, mode & 2 != 0, mode & 4 != 0);
+            let batched = Viewed::with_options(fast, quick, disjoint);
+            let single = Viewed::with_options(fast, quick, disjoint);
+            let mut rng = 0x2545_F491_4F6C_DD1Du64;
+            let mut next = || {
+                rng ^= rng << 13;
+                rng ^= rng >> 7;
+                rng ^= rng << 17;
+                rng
+            };
+            for round in 0..400 {
+                let n = 1 + (next() % 40) as usize;
+                let ops: Vec<(u32, Option<usize>, bool)> = (0..n)
+                    .map(|_| {
+                        let slot = (next() % 48) as u32;
+                        let view = (!next().is_multiple_of(4)).then(|| (next() % views.len() as u64) as usize);
+                        (slot, view, !next().is_multiple_of(7))
+                    })
+                    .collect();
+                let refs: Vec<(u32, Option<&View>, bool)> =
+                    ops.iter().map(|&(s, v, m)| (s, v.map(|i| &views[i]), m)).collect();
+                batched.set_batch(&refs);
+                for &(s, v, m) in &refs {
+                    single.set(s, v, m);
+                }
+                let ((b, b_bounds), (s, s_bounds)) = (state(&batched), state(&single));
+                assert!(
+                    b == s,
+                    "fast={fast} quick={quick} disjoint={disjoint} round {round}: batch differs from single sets"
+                );
+                // Page bounds only grow until a page's last range goes, so one
+                // slot at a time keeps those of a range a slot took and let go
+                // within the batch, which the batch never counts: the bounds
+                // may differ, but each must hold every live range's bytes on
+                // the page (what the refresh spans are made from).
+                for (bounds, who) in [(&b_bounds, "batch"), (&s_bounds, "single")] {
+                    for &((copy, from, to, uav), _) in &b.0 {
+                        if from >= to {
+                            continue;
+                        }
+                        let (p0, p1) = (from >> CHUNK_SHIFT, (to - 1) >> CHUNK_SHIFT);
+                        if p1 - p0 >= MAX_SMALL_CHUNKS {
+                            continue; // kept whole, in `large`
+                        }
+                        for p in p0..=p1 {
+                            let (lo, hi) = (from.max(p << CHUNK_SHIFT), to.min((p + 1) << CHUNK_SHIFT));
+                            let (b_lo, b_hi) = bounds[&((copy, uav), p)];
+                            assert!(
+                                b_lo <= lo && b_hi >= hi,
+                                "fast={fast} quick={quick} disjoint={disjoint} round {round}: \
+                                 {who}'s page {p} bounds miss a live range"
+                            );
+                        }
+                    }
+                }
+                if fast {
+                    let norm = |w: Option<Snapshot<Shadow>>| {
+                        let mut v: Vec<_> = w
+                            .expect("fast index")
+                            .iter()
+                            .map(|(s, a, l)| (Arc::as_ptr(s) as usize, *a, *l))
+                            .collect();
+                        v.sort_unstable();
+                        v
+                    };
+                    assert_eq!(norm(unordered_writes(&batched)), norm(unordered_writes(&single)), "round {round}");
+                }
+            }
+        }
+        for buf in bufs {
+            crate::object::release_ref(buf);
+        }
     }
 
     /// With `VICTORY_CENSUS_FAST=1`, `unordered_writes` matches the standard
@@ -2993,7 +3449,7 @@ void main(uint3 id : SV_DispatchThreadID) {
         // The title releases `b`.
         inner.forget(b);
         assert_eq!(walked(&inner), vec![c]);
-        assert_eq!(inner.textures.keys().copied().collect::<Vec<_>>(), vec![c]);
+        assert_eq!(inner.viewed_textures().collect::<Vec<_>>(), vec![c]);
         // Viewed again after it went: walked again.
         inner.count(Some(4), &Seen::Texture(a), true);
         assert_eq!(walked(&inner), vec![a, c]);

@@ -452,7 +452,7 @@ pub fn warm(
 /// Opens the same translated-shader cache as a run.
 pub(crate) fn open_shader_cache() -> Result<PathBuf> {
     let shaders = victory_core::Config::load()?.cache_subdir("shaders")?;
-    victory_gpu::shader_cache::use_shader_cache(shaders.clone())
+    victory_gpu::use_shader_cache(shaders.clone())
         .with_context(|| format!("no shader cache in {}", shaders.display()))
 }
 
@@ -676,10 +676,20 @@ fn translate_programs(
 /// with LDS then gets barriers between its halves instead of being refused.
 /// Without them the offline check refuses programs `run` translates.
 fn emit_options(wave32: bool, narrow: bool) -> emit::Options {
+    // `VICTORY_TRANSLATE_AS_RUN=1`: the options `run` takes under Wine
+    // (D3DMetal) with `VICTORY_ATOMIC_RACY=1`, so a dumped translation
+    // (`VICTORY_EMIT_DUMP`) is the one the title's GPU work runs.
+    let as_run = std::env::var("VICTORY_TRANSLATE_AS_RUN").as_deref() == Ok("1");
     emit::Options {
         view_marks: true,
         host_wave32: wave32,
         narrow_waves: wave32 && narrow,
+        atomic_locks: as_run,
+        racy_minmax: as_run,
+        half_loops: std::env::var("VICTORY_HALF_LOOPS").as_deref() == Ok("1"),
+        bias_as_gradients: as_run,
+        halves_rendezvous: as_run,
+        disable_literal_halves: std::env::var("VICTORY_LITERAL_HALVES").as_deref() == Ok("0"),
         ..Default::default()
     }
 }

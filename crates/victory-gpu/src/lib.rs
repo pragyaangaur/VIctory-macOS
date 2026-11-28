@@ -82,6 +82,7 @@ pub mod object;
 pub mod pipeline;
 #[cfg(windows)]
 mod placement;
+mod priority;
 #[cfg(windows)]
 mod primitive;
 pub mod query;
@@ -102,6 +103,8 @@ pub mod root;
 mod sampler;
 #[cfg(windows)]
 pub mod shader_cache;
+#[cfg(any(windows, test))]
+mod shader_resources;
 #[cfg(windows)]
 mod shadow;
 #[cfg(windows)]
@@ -149,6 +152,15 @@ pub use watch::{
     Writing as KernelWrite, fault_tracking, rosetta, stores_need_patching, title_memory_aliased,
     title_memory_remapped, title_memory_unmapping, writing as kernel_will_write,
 };
+
+/// Keeps host translations and console resource analysis across launches.
+#[cfg(windows)]
+pub fn use_shader_cache(dir: std::path::PathBuf) -> Option<std::path::PathBuf> {
+    let analysis = dir.join("resource-analysis");
+    let translations = shader_cache::use_shader_cache(dir)?;
+    shader_resources::use_cache(analysis);
+    Some(translations)
+}
 
 /// [`shader_cache::under_wine`], asked once: it looks `wine_get_version` up
 /// in ntdll, which takes Wine's loader lock, and draws ask it per descriptor,

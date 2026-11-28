@@ -81,6 +81,7 @@ fn build_with(words: &[u32], buffers: bool, nonuniform: u32) -> HostShader {
         atomic_lock_rounds: false,
         atomic_umax: false,
         racy_minmax: false,
+        half_loops: false,
         bias_as_gradients: false,
         host_wave32: false,
         narrow_waves: false,

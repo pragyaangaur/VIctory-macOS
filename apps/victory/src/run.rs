@@ -331,6 +331,8 @@ pub fn run(
     // run killed outright loses what it had recorded (VICTORY_PIPELINE_BOOK).
     victory_loader::log_crashes_to(temp.with_file_name("crashes.log"));
     victory_hle::runtime::use_console_timers();
+    // `VICTORY_PROFILE=<thread names>`: samples our own threads' stacks.
+    victory_loader::profile_on_request();
     if guard_lookup {
         victory_loader::probe_guard::watch();
     }

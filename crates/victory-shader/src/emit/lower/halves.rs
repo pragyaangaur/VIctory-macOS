@@ -262,6 +262,19 @@ impl Lower<'_> {
         self.exchange_halves(own, zero, at)
     }
 
+    /// Logical OR of `bit` across the lanes of this host wave alone.
+    pub(super) fn wave_any_true(&mut self, bit: V, at: usize) -> V {
+        let i32t = self.s.t.i32;
+        let four = self.s.m.named_struct("dx.types.fouri32", vec![i32t; 4]);
+        let r = self
+            .s
+            .op(at, "waveActiveBallot", Attr::NoUnwind, four, 116, &[bit]);
+        self.s.flags |= flags::WAVE_OPS;
+        let own = self.s.m.extract(at, r, 0);
+        let zero = self.s.m.i32(0);
+        self.s.m.cmp(at, pred::NE, own, zero)
+    }
+
     /// Group-wide logical OR of `bit` across every lane of every host wave in
     /// the threadgroup, so every host wave exits a lockstep predicated loop on
     /// the exact same iteration (never deadlocking at group barriers inside
@@ -342,6 +355,10 @@ impl Lower<'_> {
         let mut hi = self.s.m.load(at, hi);
         if let Some(saved) = saved {
             self.give_back(f, saved, at);
+        }
+        // `VICTORY_HALVES_EXTRA_BARRIER=1` (measurement only).
+        if crate::emit::halves_extra_barrier() {
+            self.group_sync(at);
         }
         if !group.is_multiple_of(2 * HALF) {
             let first = self.s.m.bin(at, Bin::Shl, high, five);

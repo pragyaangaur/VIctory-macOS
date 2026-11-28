@@ -512,6 +512,163 @@ pub struct UserData {
 /// the world was drawn black on M3 Max and M5 Pro Macs (#497), where keeping
 /// their barrier, as before, drew it. Tests run with the refusal on unless
 /// they turn it off ([`with_cap_barriers`]).
+/// Measurement only, never a default (`VICTORY_FIRST_LANE_PER_HALF`): on a
+/// host of 32-lane waves, how a wave64 compute program's
+/// `v_readfirstlane_b32` of a value not proven alike is translated, as
+/// before #522:
+///
+/// - `enter` (or `1`/`all`, with `reads`): it no longer puts the program in
+///   halves (`halves::needs_first_lane`); each host wave reads the first
+///   active lane of its own 32 lanes;
+/// - `reads` (or `1`/`all`, with `enter`): in a program already in halves,
+///   it reads its own half's first active lane, with no exchange between
+///   the halves. The halves' own barriers assume both agree on the value:
+///   on an M1 Max a run with `reads` alone hung the GPU while loading.
+///
+/// `enter` keeps a program out of halves altogether, so only the console
+/// program's own barriers remain, which it places under conditions the same
+/// in the whole group. On an M1 Max (Series X, standing in the world) it
+/// kept 29 programs out of halves, the batch culling ones among them, and
+/// took the GPU time of a frame from 352 to 269 ms.
+///
+/// That is the console's value only where it is the same in both halves
+/// (the commonest case: a reciprocal or other value made in VALU from
+/// scalars), so a program may compute something else; it tells what the
+/// halves cost the GPU (#553). Translations made with it are cached apart
+/// (`translation_build`, keyed by [`first_lane_mode`]).
+pub fn first_lane_mode() -> u8 {
+    #[cfg(test)]
+    {
+        0
+    }
+    #[cfg(not(test))]
+    {
+        static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+        *MODE.get_or_init(|| match std::env::var("VICTORY_FIRST_LANE_PER_HALF").as_deref() {
+            Ok("1" | "all") => 3,
+            Ok("enter") => 1,
+            Ok("reads") => 2,
+            _ => 0,
+        })
+    }
+}
+
+/// Whether any of [`first_lane_mode`] is on.
+pub fn first_lane_per_half() -> bool {
+    first_lane_mode() != 0
+}
+
+/// Measurement only, never a default (`VICTORY_HALVES_EXTRA_BARRIER=1`): an
+/// exchange between the two 32-lane halves of a console wave ends with one
+/// more group barrier, after its reads. What the frame's GPU time gains
+/// with it is about what leaving one of its two barriers out would save (a
+/// safe way of leaving one out, alternating exchange words, needs that to
+/// be worth it). Leaving the barrier before the store out instead let a
+/// half overwrite what the other had not read: GPU 270 -> 415 ms a frame on
+/// an M1 Max, the values wrong. The translation differs, so the shader
+/// cache keys on it.
+pub fn halves_extra_barrier() -> bool {
+    #[cfg(test)]
+    {
+        false
+    }
+    #[cfg(not(test))]
+    {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var("VICTORY_HALVES_EXTRA_BARRIER").as_deref() == Ok("1"))
+    }
+}
+
+/// [`first_lane_mode`]'s `enter`.
+pub(crate) fn first_lane_enter_alone() -> bool {
+    first_lane_mode() & 1 != 0
+}
+
+/// [`first_lane_mode`]'s `reads`.
+pub(crate) fn first_lane_reads_alone() -> bool {
+    first_lane_mode() & 2 != 0
+}
+
+thread_local! {
+    /// Programs this thread translated that [`first_lane_mode`]'s `enter`
+    /// kept out of halves, since [`take_kept_out_of_halves`].
+    static KEPT_OUT: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// Notes that a translation was kept out of halves ([`first_lane_mode`]).
+pub(crate) fn note_kept_out_of_halves() {
+    KEPT_OUT.with(|c| c.set(c.get() + 1));
+}
+
+/// How many times this thread's translations were kept out of halves by
+/// [`first_lane_mode`] since the last call (the runtime logs the program).
+pub fn take_kept_out_of_halves() -> u32 {
+    KEPT_OUT.with(|c| c.replace(0))
+}
+
+thread_local! {
+    /// Why this thread's last translation runs a console wave64 compute
+    /// program in 32-lane halves ([`IN_HALVES_LANES`] and the others), 0
+    /// when it does not; since [`take_in_halves`].
+    static IN_HALVES: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
+}
+
+/// [`take_in_halves`]: the program reads other lanes (swizzles, permutes,
+/// lane counts, DPP, readlane, masks read as data).
+pub const IN_HALVES_LANES: u8 = 1;
+/// [`take_in_halves`]: it reads a first lane (`VICTORY_FIRST_LANE_PER_HALF`
+/// would keep it out).
+pub const IN_HALVES_FIRST_LANE: u8 = 2;
+/// [`take_in_halves`]: its one console wave shares LDS that no barrier syncs.
+pub const IN_HALVES_LDS: u8 = 4;
+
+/// Notes why the translation runs in halves.
+pub(crate) fn note_in_halves(why: u8) {
+    IN_HALVES.with(|c| c.set(c.get() | why));
+}
+
+/// Why this thread's translations since the last call run in halves, as
+/// [`IN_HALVES_LANES`] bits; 0 when none did (the runtime logs the program,
+/// so the GPU timings' hashes can be told apart by it).
+pub fn take_in_halves() -> u8 {
+    IN_HALVES.with(|c| c.replace(0))
+}
+
+thread_local! {
+    /// The kinds of other-lane reads ([`LANES_SWIZZLE`] and the others) in
+    /// this thread's translations in halves since [`take_lane_kinds`].
+    static LANE_KINDS: std::cell::Cell<u16> = const { std::cell::Cell::new(0) };
+}
+
+/// `ds_swizzle` (within 32 lanes).
+pub const LANES_SWIZZLE: u16 = 1;
+/// `ds_permute` / `ds_bpermute` (any of the wave's lanes).
+pub const LANES_PERMUTE: u16 = 2;
+/// `v_permlane16` / `v_permlanex16` (within 32 lanes).
+pub const LANES_PERMLANE: u16 = 4;
+/// `v_mbcnt` (bits of a 64-lane mask below the lane).
+pub const LANES_MBCNT: u16 = 8;
+/// `v_readlane` / `v_writelane` (any lane).
+pub const LANES_READLANE: u16 = 16;
+/// DPP quad permutes (within 4 lanes).
+pub const LANES_DPP_QUAD: u16 = 32;
+/// Other DPP16 and DPP8 (within a row of 16 lanes on gfx10).
+pub const LANES_DPP_ROW: u16 = 64;
+/// Lane masks read as data.
+pub const LANES_MASK_DATA: u16 = 128;
+/// Literal halves (whole-wave control flow).
+pub const LANES_LITERAL: u16 = 256;
+
+/// Notes the kinds of other-lane reads of a translation in halves.
+pub(crate) fn note_lane_kinds(kinds: u16) {
+    LANE_KINDS.with(|c| c.set(c.get() | kinds));
+}
+
+/// The kinds since the last call ([`LANES_SWIZZLE`] bits).
+pub fn take_lane_kinds() -> u16 {
+    LANE_KINDS.with(|c| c.replace(0))
+}
+
 pub fn cap_barriers_refused() -> bool {
     #[cfg(test)]
     {
@@ -575,6 +732,13 @@ pub struct Options {
     /// of the lock's cost. The translation differs, so the shader cache keys
     /// on it.
     pub racy_minmax: bool,
+    /// With [`Options::host_wave32`]: a divergent loop made lockstep
+    /// (`lower::predicate`) whose body has no group barrier and no
+    /// rendezvous of halves tests only its own host wave's lanes to go on,
+    /// so each half leaves when its lanes are done instead of meeting the
+    /// other at two group barriers every iteration (`VICTORY_HALF_LOOPS=1`).
+    /// The translation differs, so the shader cache keys on it.
+    pub half_loops: bool,
     /// Compute-stage biased samples run as gradient samples with the quad
     /// gradients scaled by `2^bias`, for hosts that ignore the bias of a
     /// compute shader's sample (D3DMetal, #30).
@@ -1125,6 +1289,7 @@ fn emit_pruned(
         atomic_lock_rounds: options.atomic_lock_rounds,
         atomic_umax: options.atomic_umax,
         racy_minmax: options.racy_minmax,
+        half_loops: options.half_loops,
         bias_as_gradients: options.bias_as_gradients,
         host_wave32: options.host_wave32,
         narrow_waves: options.narrow_waves,

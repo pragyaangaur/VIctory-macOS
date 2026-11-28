@@ -483,7 +483,8 @@ pub(crate) struct HostPipeline {
 /// reports what a run makes.
 ///
 /// Mesh shaders whose standalone output footprint (packed or Metal-
-/// aligned) exceeds Metal's 32 KiB limit are re-translated together with
+/// aligned) exceeds Metal's 32 KiB limit (with `VICTORY_LINK_MESH_OUTPUTS=every`,
+/// every mesh shader) are re-translated together with
 /// their paired pixel shader, pruning unread outputs and repacking
 /// attribute order to eliminate alignment padding holes. When the paired pixel
 /// shader reads non-provoking vertex values (`VICTORY_P10`/`VICTORY_P20`),
@@ -499,9 +500,14 @@ fn linked_stages(
             .and_then(|ps| ps.translated())
             .is_some_and(|ps| victory_shader::emit::needs_vertex_deltas(&ps.host.dxil));
     mesh.and_then(|ms| {
-        let over_limit = super::link_mesh_outputs()
-            && over_limit_mesh_output_bytes(&ms.translated()?.host.dxil).is_some();
-        if over_limit {
+        let link = match super::mesh_link() {
+            super::MeshLink::Off => false,
+            super::MeshLink::OverLimit => {
+                over_limit_mesh_output_bytes(&ms.translated()?.host.dxil).is_some()
+            }
+            super::MeshLink::Every => ms.translated().is_some(),
+        };
+        if link {
             super::translate_linked(ms, pixel.map(Arc::as_ref), ps_deltas)
         } else if ps_deltas {
             let ps = pixel?;

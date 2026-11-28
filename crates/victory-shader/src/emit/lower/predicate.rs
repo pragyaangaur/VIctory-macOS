@@ -99,6 +99,10 @@ pub(super) struct PredicatePlan {
     pub(super) lockstep_exits: Map<usize, usize>,
     /// Blocks belonging to any lockstep-predicated loop.
     pub(super) in_lockstep_loop: Set<usize>,
+    /// Exiting blocks of while-shaped lockstep loops whose blocks after the
+    /// exit branch (down to the latch) can emit no group barrier: no
+    /// cross-half need, no LDS, no `s_barrier` (`Options::half_loops`).
+    pub(super) plain_tails: Set<usize>,
     /// Latch blocks promoted to group-uniform branches for `in_step_with`.
     pub(super) uniform_branches: Set<usize>,
     /// Blocks bypassed by `EarlyOut` that have no remaining live predecessors.
@@ -126,6 +130,7 @@ impl PredicatePlan {
             lockstep_headers: Map::default(),
             lockstep_exits: Map::default(),
             in_lockstep_loop: Set::default(),
+            plain_tails: Set::default(),
             uniform_branches: Set::default(),
             dead_blocks: Set::default(),
             idom: Vec::new(),
@@ -176,6 +181,7 @@ impl PredicatePlan {
             lockstep_headers: Map::default(),
             lockstep_exits: Map::default(),
             in_lockstep_loop: Set::default(),
+            plain_tails: Set::default(),
             uniform_branches: Set::default(),
             dead_blocks: Set::default(),
             idom,
@@ -361,6 +367,17 @@ impl PredicatePlan {
                         plan.lockstep_headers.insert(h, lp.latch);
                         plan.lockstep_exits.insert(lp.exit, h);
                         plan.uniform_branches.insert(lp.exiting);
+                        let plain = lp.body.iter().all(|&b| {
+                            rpo[b] <= rpo[lp.exiting]
+                                || (!needs[b]
+                                    && p.blocks[b].insts.iter().all(|i| {
+                                        let n = i.name();
+                                        n != "s_barrier" && !n.starts_with("ds_")
+                                    }))
+                        });
+                        if plain {
+                            plan.plain_tails.insert(lp.exiting);
+                        }
                         plan.in_lockstep_loop.extend(lp.body);
                         plan.step =
                             barriers::in_step_with(p, st, &eff_exits, &plan.uniform_branches);
@@ -1568,6 +1585,7 @@ impl Lower<'_> {
         }
         // 1. Compute `block_active[b]`.
         let active = if let Some(&latch) = self.pred.lockstep_headers.get(&b) {
+            self.loop_syncs.insert(b, self.s.syncs);
             let outer = self.pred_outer_active(b);
             self.loop_outer_active.insert(b, outer);
             let phi = self.s.m.phi(self.cur, self.s.t.i1);
@@ -1992,9 +2010,19 @@ impl Lower<'_> {
                 };
                 let next_act = and_base(self, stay);
                 self.pred_edge_active.insert((b, header), next_act);
-                let any = self
-                    .group_any_true(next_act, cur)
-                    .map_err(|w| unsupported(offset, w))?;
+                // A body with no barrier and no rendezvous of halves: each
+                // host wave may leave once its own lanes are done (nothing
+                // in the loop waits for the other half, and both reach
+                // what follows); the group-wide test cost two group
+                // barriers an iteration (`Options::half_loops`).
+                let alone = self.x.half_loops
+                    && self.loop_syncs.get(&header) == Some(&self.s.syncs);
+                let any = if alone {
+                    self.wave_any_true(next_act, cur)
+                } else {
+                    self.group_any_true(next_act, cur)
+                        .map_err(|w| unsupported(offset, w))?
+                };
                 let ok = self.count_iteration(header, pred::IULT);
                 let go = self.s.m.bin(cur, Bin::And, any, ok);
                 let exit_blk = self.edge(b, exit);
@@ -2030,9 +2058,17 @@ impl Lower<'_> {
                 };
                 let next_act = and_base(self, stays);
                 self.pred_edge_active.insert((b, stay), next_act);
-                let any = self
-                    .group_any_true(next_act, cur)
-                    .map_err(|w| unsupported(offset, w))?;
+                // As at a latch: no barrier in the body so far, and none
+                // can come in the blocks after this branch.
+                let alone = self.x.half_loops
+                    && self.pred.plain_tails.contains(&b)
+                    && self.loop_syncs.get(&header) == Some(&self.s.syncs);
+                let any = if alone {
+                    self.wave_any_true(next_act, cur)
+                } else {
+                    self.group_any_true(next_act, cur)
+                        .map_err(|w| unsupported(offset, w))?
+                };
                 let ok = self.count_iteration(header, pred::IULT);
                 let go = self.s.m.bin(cur, Bin::And, any, ok);
                 let exit_blk = self.edge(b, exit);

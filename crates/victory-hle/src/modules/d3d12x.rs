@@ -50,7 +50,7 @@ pub fn use_shader_cache(dir: std::path::PathBuf) {
     #[cfg(windows)]
     {
         victory_gpu::pipeline::use_pipeline_cache(dir.with_file_name("pipelines"));
-        victory_gpu::shader_cache::use_shader_cache(dir);
+        victory_gpu::use_shader_cache(dir);
     }
     #[cfg(not(windows))]
     let _ = dir;

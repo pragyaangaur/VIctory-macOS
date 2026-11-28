@@ -45,6 +45,11 @@ fn world_offsets() -> &'static [u64] {
 /// The first frame that ran 500 draws on the host.
 static WORLD: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
 
+/// The world's first frame, once seen (only with `VICTORY_CAPTURE_WORLD`).
+pub(crate) fn world_frame() -> Option<u64> {
+    WORLD.get().copied()
+}
+
 /// Frame `n` was presented: notes the world's first frame.
 pub(crate) fn presented(n: u64) {
     use std::sync::atomic::{AtomicU64, Ordering::Relaxed};

@@ -322,6 +322,56 @@ fn idle_split(
     )
 }
 
+/// `VICTORY_FLIGHT_TRACE=1` (diagnostics, off by default): one line per
+/// host submission, so a frame's preparing can be seen submission by
+/// submission (where in the frame the heavy ones are).
+pub(crate) fn flight_trace() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::switch::on("VICTORY_FLIGHT_TRACE"))
+}
+
+/// The present count and the submissions since it, for [`trace_flight`].
+static TRACE_AT: std::sync::Mutex<(u64, u32)> = std::sync::Mutex::new((0, 0));
+
+/// Logs a launched flight ([`flight_trace`]): its place since the last
+/// present, the wait for the one before it, its preparing by phase and the
+/// GPU's idle time before it. This thread's phase times are taken either way.
+fn trace_flight(
+    fence: u64,
+    landing: std::time::Duration,
+    preparing: std::time::Duration,
+    (unasked, idle_preparing): (std::time::Duration, std::time::Duration),
+) {
+    let phases = super::take_flight_phases();
+    if !flight_trace() {
+        return;
+    }
+    let presented = crate::queue::presented();
+    let index = {
+        let mut at = TRACE_AT.lock().unwrap_or_else(|e| e.into_inner());
+        if at.0 != presented {
+            *at = (presented, 0);
+        }
+        at.1 += 1;
+        at.1
+    };
+    let ms = |d: std::time::Duration| d.as_secs_f64() * 1e3;
+    let p: Vec<String> = phases.iter().map(|&us| format!("{:.1}", us as f64 / 1e3)).collect();
+    tracing::info!(
+        frame = presented,
+        index,
+        fence,
+        "flight trace: landing {:.1} ms, preparing {:.1} ms (evict/sync/uploads/steps/preludes/refresh/early/other {}), \
+         GPU idle before it {:.1} ms (nothing to run {:.1}, preparing {:.1})",
+        ms(landing),
+        ms(preparing),
+        p.join("/"),
+        ms(unasked + idle_preparing),
+        ms(unasked),
+        ms(idle_preparing),
+    );
+}
+
 /// The flights launched since the last call, and per [`Step`] their
 /// microseconds, cleared (the frame report).
 pub(crate) fn take_flight_times() -> (u64, [u64; 5]) {
@@ -615,6 +665,46 @@ pub(crate) fn sync_early_enabled() -> bool {
 thread_local! {
     /// [`sync_early_enabled`] on this test's thread.
     static TEST_SYNC_EARLY: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// `VICTORY_SYNC_EARLY=cut` (with [`sync_early_enabled`]): a submission whose
+/// heaps were synced while the flight before it ran is prepared without
+/// syncing them again after that flight lands. The early sync runs once the
+/// submission is already the title's (the submit worker took its lists), so
+/// it holds every descriptor the title wrote before submitting it; what the
+/// title writes after (in the world, right after each fence moves: ~32 ms of
+/// sync a frame after the landings on an M1 Max) is for later submissions,
+/// and by the rule above not in slots this one reads. The next early sync,
+/// while this one runs, takes it. Views the landing makes for slots shaders
+/// read (`descriptor::make_read`) are made by the landing itself.
+///
+/// shortcut: a title that writes a descriptor after submitting work that
+/// reads it (the console's GPU would read it if it came before the GPU got
+/// there) gets the view from before, for that submission only.
+pub(crate) fn sync_early_cut() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = sync_early_enabled()
+            && std::env::var_os("VICTORY_SYNC_EARLY").is_some_and(|v| v == "cut");
+        if on {
+            tracing::info!(
+                "heaps synced early are not synced again after the landing (VICTORY_SYNC_EARLY=cut)"
+            );
+        }
+        on
+    })
+}
+
+thread_local! {
+    /// This thread synced the heaps for the submission it prepares next while
+    /// the last flight ran ([`sync_early_cut`]).
+    static SYNCED_EARLY_FOR_NEXT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether the submission this thread prepares now had its heaps synced
+/// early ([`sync_early_cut`]); cleared.
+pub(crate) fn take_synced_early() -> bool {
+    SYNCED_EARLY_FOR_NEXT.with(|c| c.replace(false))
 }
 
 /// Heap syncs done while the last flight ran ([`sync_early_enabled`]) and
@@ -973,6 +1063,9 @@ impl Host {
                 crate::descriptor::sync_heaps();
                 SYNCED_EARLY[0].fetch_add(1, Ordering::Relaxed);
                 SYNCED_EARLY[1].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+                if sync_early_cut() {
+                    SYNCED_EARLY_FOR_NEXT.with(|c| c.set(true));
+                }
             }
             // Wait-Before-Prep: drain Flight N-1 completely before Flight N
             // touches any shared Shadow, upload staging pool, or Mark
@@ -1131,11 +1224,14 @@ impl Host {
         {
             let mut state = self.flight.lock().unwrap_or_else(|e| e.into_inner());
             debug_assert!(state.flights.len() < 2 && (state.flights.is_empty() || still_behind));
+            let mut idle = (std::time::Duration::ZERO, std::time::Duration::ZERO);
             if let Some(free) = state.free_since.take() {
                 let (unasked, preparing) = idle_split(free, asked, launched);
                 add_step(Step::IdleUnasked, unasked);
                 add_step(Step::IdlePreparing, preparing);
+                idle = (unasked, preparing);
             }
+            trace_flight(fence_value, landed - asked, launched - landed, idle);
             state.flights.push_back(flight);
             if !state.worker_started {
                 state.worker_started = true;
@@ -1281,6 +1377,14 @@ impl Host {
             std::time::Instant::now()
         };
         let gpu_duration = gpu_done.saturating_duration_since(flight.launched);
+        if flight_trace() {
+            tracing::info!(
+                fence = flight.fence_value,
+                lists = flight.segments.len(),
+                "flight trace: landed after {:.1} ms on the GPU",
+                gpu_duration.as_secs_f64() * 1e3
+            );
+        }
         #[cfg(test)]
         super::tests::native_call_group(flight.waited);
         {
@@ -1397,6 +1501,7 @@ fn spawn_flight_worker() {
     let _ = std::thread::Builder::new()
         .name("victory-flight".into())
         .spawn(|| {
+            crate::priority::raise_this_thread();
             let Some(host) = super::host() else {
                 return;
             };

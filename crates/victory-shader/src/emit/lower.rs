@@ -214,6 +214,8 @@ pub(crate) struct Parts<'a> {
     /// min or max is a plain read, compare and write
     /// ([`Options::racy_minmax`](super::Options)).
     pub racy_minmax: bool,
+    /// [`Options::half_loops`](super::Options).
+    pub half_loops: bool,
     /// Compute-stage biased samples run as gradient samples scaled by
     /// `2^bias` ([`Options::bias_as_gradients`](super::Options)).
     pub bias_as_gradients: bool,
@@ -403,6 +405,9 @@ struct Lower<'a> {
     loop_outer_active: Map<usize, Option<V>>,
     /// Lockstep loop active-lane phis `(phi, header, latch)` filled in `fill_phis`.
     loop_act_phis: Vec<(V, usize, usize)>,
+    /// [`Shader::syncs`](super::shader::Shader) when each lockstep loop
+    /// header was entered (`Options::half_loops`).
+    loop_syncs: Map<usize, u32>,
     /// [`Lower::relabelled_flat`], once made.
     relabelled: Option<V>,
     /// [`Lower::dispatched`], once made.
@@ -444,6 +449,9 @@ struct Lower<'a> {
     /// The results of first-lane reads each host half makes by itself
     /// ([`first_lane::read_alone`], [`first_lane::index_waterfalls`]).
     first_alone: HashSet<Value>,
+    /// Per counted loop header, the predicate it was entered under (`None`:
+    /// no predicate, or entries under different ones).
+    loop_entry_active: Map<usize, Option<V>>,
     /// Pixel: an ordered section (POPS), whose UAVs the host makes
     /// rasterizer-ordered views.
     pops: bool,
@@ -746,7 +754,7 @@ impl<'a> Lower<'a> {
             // Code reading other lanes needs the console's wave size and
             // lane order; so do lane masks read as numbers, and LDS shared
             // within one wave, where the console compiler leaves out barriers.
-            console_lanes = x.st.literal || insts().any(|i| {
+            let lanes_other = x.st.literal || insts().any(|i| {
                 let n = i.name();
                 n.starts_with("ds_swizzle")
                     || n.contains("permute")
@@ -783,7 +791,15 @@ impl<'a> Lower<'a> {
                         .iter()
                         .any(|a| matches!(a, Atom::Opaque(_) | Atom::Constant(_)))
                 })
-            } || halves::needs_first_lane(x, &mut alike_cache, &first_alone);
+            };
+            // `VICTORY_FIRST_LANE_PER_HALF=enter` (measurement only): a
+            // first-lane read alone no longer puts the program in halves.
+            let first_needed =
+                !lanes_other && halves::needs_first_lane(x, &mut alike_cache, &first_alone);
+            if first_needed && super::first_lane_enter_alone() {
+                super::note_kept_out_of_halves();
+            }
+            console_lanes = lanes_other || first_needed && !super::first_lane_enter_alone();
             let wave = if x.native.wave64 { 64 } else { 32 };
             let group = cs.threads.iter().product::<u32>();
             let one_wave = group <= wave;
@@ -821,6 +837,45 @@ impl<'a> Lower<'a> {
             let fits = x.narrow_waves && (synced || group <= 32);
             let needs_wave = console_lanes || one_wave && s.lds_dwords > 0 && !fits;
             halves = Self::halves_wanted(x, needs_wave);
+            if halves {
+                let lds = one_wave && s.lds_dwords > 0 && !fits;
+                super::note_in_halves(
+                    (u8::from(lanes_other) * super::IN_HALVES_LANES)
+                        | (u8::from(first_needed && !super::first_lane_enter_alone()) * super::IN_HALVES_FIRST_LANE)
+                        | (u8::from(lds) * super::IN_HALVES_LDS),
+                );
+                // Which reads of other lanes (diagnostics, logged with it).
+                let mut kinds = 0u16;
+                for i in insts() {
+                    let n = i.name();
+                    let dpp = match &i.fields {
+                        Fields::Valu(v) => v.dpp,
+                        _ => None,
+                    };
+                    let terms = [
+                        (n.starts_with("ds_swizzle"), super::LANES_SWIZZLE),
+                        (n.contains("permute"), super::LANES_PERMUTE),
+                        (n == "v_permlane16_b32" || n == "v_permlanex16_b32", super::LANES_PERMLANE),
+                        (n.starts_with("v_mbcnt"), super::LANES_MBCNT),
+                        (n == "v_readlane_b32" || n == "v_writelane_b32", super::LANES_READLANE),
+                        (matches!(dpp, Some(Dpp::Row { ctrl: 0..=0xFF, .. })), super::LANES_DPP_QUAD),
+                        (
+                            matches!(dpp, Some(Dpp::Row { ctrl: 0x100.., .. }) | Some(Dpp::Lanes { .. })),
+                            super::LANES_DPP_ROW,
+                        ),
+                        (reads_mask_as_data(x.st, i), super::LANES_MASK_DATA),
+                    ];
+                    for (on, bit) in terms {
+                        if on {
+                            kinds |= bit;
+                        }
+                    }
+                }
+                if x.st.literal {
+                    kinds |= super::LANES_LITERAL;
+                }
+                super::note_lane_kinds(kinds);
+            }
             if halves && !synced {
                 halves_refused = Self::halves_lds(group, s.lds_dwords);
             }
@@ -961,6 +1016,7 @@ impl<'a> Lower<'a> {
             pred_edge_active: Map::default(),
             loop_outer_active: Map::default(),
             loop_act_phis: Vec::new(),
+            loop_syncs: Map::default(),
             relabelled: None,
             dispatched: None,
             per_vertex_center,
@@ -980,6 +1036,7 @@ impl<'a> Lower<'a> {
                 HashSet::new()
             },
             first_alone,
+            loop_entry_active: Map::default(),
             pops: matches!(x.native.io, StageIo::Ps { db_shader_control, .. }
                 if db_shader_control & 1 << 16 != 0),
             depth_before_shader: matches!(x.native.io, StageIo::Ps { db_shader_control, .. }
@@ -7613,7 +7670,10 @@ impl<'a> Lower<'a> {
                         if inst.read(Reg::V(reg)).is_some_and(|x| self.alike.contains(&x)));
                 // Each half's own first active lane is the console's
                 // (`first_lane`): read it, with no exchange.
-                let alone = inst.writes.first().is_some_and(|w| self.first_alone.contains(&w.1));
+                // `VICTORY_FIRST_LANE_PER_HALF=reads` (measurement only):
+                // every read is taken as its half's own.
+                let alone = super::first_lane_reads_alone()
+                    || inst.writes.first().is_some_and(|w| self.first_alone.contains(&w.1));
                 if self.halves && !self.one_host_wave() && is_vec && !is_alike && !alone {
                     if !self.across_here() {
                         return Err(halves::FIRST_ACROSS);
@@ -11288,6 +11348,41 @@ impl<'a> Lower<'a> {
                 } else {
                     cond
                 };
+                // In halves predication, a lane outside the predicate the loop
+                // was entered under never was in it on the console (a skip-
+                // guard body runs in every lane): it takes the way out instead
+                // of the loop's own test, which it need never meet (it would
+                // spin to the iteration limit and leave the program). Lanes
+                // that left the predicate inside the loop (a break) stay, as
+                // the lockstep exchanges need (#655).
+                let header = |l: &Self, to: usize| {
+                    if back(l, to) {
+                        Some(to)
+                    } else if let LaneExit::Jump(h) = l.x.st.exits[to]
+                        && back(l, h)
+                    {
+                        Some(h)
+                    } else {
+                        None
+                    }
+                };
+                let entry = |l: &Self, h: usize| l.loop_entry_active.get(&h).copied().flatten();
+                let cond = match (header(self, taken), header(self, not_taken)) {
+                    (Some(h), None) => match entry(self, h) {
+                        Some(act) => self.s.m.bin(self.cur, Bin::And, cond, act),
+                        None => cond,
+                    },
+                    (None, Some(h)) => match entry(self, h) {
+                        Some(act) => {
+                            let t = self.s.m.bool(true);
+                            let outside = self.s.m.bin(self.cur, Bin::Xor, act, t);
+                            self.s.m.bin(self.cur, Bin::Or, cond, outside)
+                        }
+                        None => cond,
+                    },
+                    _ => cond,
+                };
+
                 // Critical edges get a block of their own, so loops have
                 // dedicated exits and preheaders as DXC emits them.
                 let (t, f) = (self.edge(b, taken), self.edge(b, not_taken));
@@ -11322,10 +11417,22 @@ impl<'a> Lower<'a> {
 
     /// A forward edge into loop header `to` (from DXIL block `via`) starts
     /// its count at 0.
-    fn enter_loop(&mut self, _from: usize, to: usize, via: usize) {
+    fn enter_loop(&mut self, from: usize, to: usize, via: usize) {
         if let Some((_, incoming)) = self.counters.get_mut(&to) {
             let z = self.s.m.i32(0);
             incoming.push((z, via));
+            // The predicate the loop is entered under, where there is one
+            // entry (`exit`: lanes outside it never were in the loop).
+            let act = self.pred_active(from);
+            match self.loop_entry_active.get(&to) {
+                None => {
+                    self.loop_entry_active.insert(to, act);
+                }
+                Some(&known) if known != act => {
+                    self.loop_entry_active.insert(to, None);
+                }
+                Some(_) => {}
+            }
         }
     }
 

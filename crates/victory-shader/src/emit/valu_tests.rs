@@ -155,6 +155,7 @@ fn lower_valu_cs(native: &NativeProgram) -> Result<HostShader, crate::ShaderErro
         atomic_lock_rounds: false,
         atomic_umax: false,
         racy_minmax: false,
+        half_loops: false,
         bias_as_gradients: false,
         host_wave32: false,
         narrow_waves: false,
@@ -1688,6 +1689,12 @@ fn lower_cs32(words: &[u32], used: &[(u8, ResourceType, u32, u8)], validate: boo
     lower_cs32_with(words, used, validate, false, false, false)
 }
 
+thread_local! {
+    /// Racy 64-bit min/max (no locks) for [`lower_cs32_with`]'s next
+    /// programs on this thread: only the scheduling probes set it.
+    static PROBE_RACY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 /// [`lower_cs32`], with 64-bit image atomics under locks if `atomic_locks`,
 /// tried first in rounds if `atomic_lock_rounds`, and a glc-clear umax
 /// reduced a texel a representative if `atomic_umax`.
@@ -1755,7 +1762,8 @@ fn lower_cs32_with(
         atomic_locks,
         atomic_lock_rounds,
         atomic_umax,
-        racy_minmax: false,
+        racy_minmax: PROBE_RACY.with(std::cell::Cell::get),
+        half_loops: false,
         bias_as_gradients: super::host::under_wine(),
         host_wave32: false,
         narrow_waves: false,
@@ -2951,6 +2959,7 @@ fn halves_go_through_a_table_as_they_are_and_name_their_views() {
         atomic_lock_rounds: false,
         atomic_umax: false,
         racy_minmax: false,
+        half_loops: false,
         bias_as_gradients: false,
         narrow_waves: false,
         uav_size_level0: false,
@@ -3125,6 +3134,7 @@ fn half_places_are_the_descriptors_the_program_loads() {
             atomic_lock_rounds: false,
             atomic_umax: false,
             racy_minmax: false,
+            half_loops: false,
             bias_as_gradients: false,
             narrow_waves: false,
             uav_size_level0: false,
@@ -3258,6 +3268,7 @@ fn a_format_load_read_as_halves_loads_the_integer() {
             atomic_lock_rounds: false,
             atomic_umax: false,
             racy_minmax: false,
+            half_loops: false,
             bias_as_gradients: false,
             narrow_waves: false,
             uav_size_level0: false,
@@ -3477,4 +3488,695 @@ fn v_cvt_f32_f64_matches_ieee754() {
             "{backend}: v_cvt_f32_f64(-|{x}|) = {got:#010x}, want {want:#010x}",
         );
     });
+}
+
+/// How the host schedules many small, latency-bound compute dispatches, the
+/// shape of Grand Theft Auto VI's hair pass (`CS_VisHair`: ~92 dispatches a
+/// frame of 1-12 groups, no barriers between them, ~158 ms a frame on an M1
+/// Max as if run one after another). Each dispatch here is one thread
+/// running a loop of dependent FMAs (about a millisecond); 64 of them are
+/// recorded six ways and each way is timed from submission to fence
+/// (best of three, after a warm-up):
+/// one list, every dispatch writing the same buffer; one list, each its own
+/// buffer; the same with a UAV barrier between dispatches; one dispatch of
+/// 64 groups (the same work, as concurrent as it gets); 64 lists in one
+/// submission; and four compute queues of 16 dispatches each. Run with
+/// `--ignored --nocapture` on a Mac.
+#[test]
+#[ignore = "a timing, for D3DMetal (hair pass scheduling)"]
+fn small_dispatch_scheduling_timing() {
+    use windows::Win32::Graphics::Direct3D12::*;
+    use windows::Win32::Graphics::Dxgi::Common::*;
+    use windows::core::Interface;
+    const N: u32 = 64;
+    const K: usize = 32;
+    let iterations: u32 = std::env::var("PROBE_ITERATIONS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(4000);
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    // s16 = s3 (iterations; s[8:11] hold the buffer's descriptor); loop:
+    // K x v_fma_f32 v1, v1, v2, v3; s16 -= 1; s_cmp_lg_u32 s16, 0;
+    // s_cbranch_scc1 loop; v0 = v1.
+    let mut body = vec![s_mov_b32(16, 3)];
+    for _ in 0..K {
+        body.extend(vop3(0x14B, 1, vgpr(1), vgpr(2), vgpr(3)));
+    }
+    body.push(sop2(0x01, 16, 16, 129)); // s_sub_u32 s16, s16, 1
+    body.push(0xBF07_8010); // s_cmp_lg_u32 s16, 0
+    let back = -(2 * K as i32 + 3);
+    body.push(0xBF85_0000 | (back as u32 & 0xFFFF)); // s_cbranch_scc1 loop
+    body.push(vop1(0x001, 0, vgpr(1))); // v_mov_b32 v0, v1
+    let shader = build_valu_cs(&body);
+    let Ok(host) = Host::new(false) else {
+        eprintln!("no SM 6.6 hardware device; skipped");
+        return;
+    };
+    let (root, pso) = host.compute_pipeline(&shader).expect("pipeline");
+    let dev = &host.device;
+    let err = |e: windows::core::Error| format!("{e}");
+    // The root constants of dispatch `i`: the loop count, and buffer `i`'s
+    // heap index as the table address (32 bytes a view).
+    let constants = |table: u32| {
+        let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+        for u in &shader.user_data {
+            ud[u.index as usize] = match (u.root, u.slot, u.dword) {
+                (RootType::Constants, 0, 0) => 0x3F80_0000, // v1 = 1.0
+                (RootType::Constants, 0, 1) => 0x3F7F_FFFF, // v2 just under 1.0
+                (RootType::Constants, 0, 2) => 0x3A83_126F, // v3 = 0.001
+                (RootType::Constants, 0, 3) => iterations,
+                (RootType::Constants, 0, _) => 0,
+                (RootType::Table, 1, _) => table,
+                other => panic!("unexpected user data {other:?}"),
+            };
+        }
+        ud
+    };
+    // SAFETY: D3D12 calls with descriptions that outlive them; every
+    // resource stays alive until the fences say the GPU is done.
+    unsafe {
+        let views: ID3D12DescriptorHeap = dev
+            .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                NumDescriptors: N,
+                Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+                ..Default::default()
+            })
+            .expect("heap");
+        let size = dev.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV) as usize;
+        let mut buffers = Vec::new();
+        for i in 0..N as usize {
+            let mut b: Option<ID3D12Resource> = None;
+            dev.CreateCommittedResource(
+                &D3D12_HEAP_PROPERTIES {
+                    Type: D3D12_HEAP_TYPE_DEFAULT,
+                    ..Default::default()
+                },
+                D3D12_HEAP_FLAG_NONE,
+                &D3D12_RESOURCE_DESC {
+                    Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                    Width: 256,
+                    Height: 1,
+                    DepthOrArraySize: 1,
+                    MipLevels: 1,
+                    SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                    Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                    Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                    ..Default::default()
+                },
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                None,
+                &mut b,
+            )
+            .expect("buffer");
+            let b = b.expect("buffer");
+            let mut at = views.GetCPUDescriptorHandleForHeapStart();
+            at.ptr += i * size;
+            dev.CreateUnorderedAccessView(
+                &b,
+                None,
+                Some(&D3D12_UNORDERED_ACCESS_VIEW_DESC {
+                    Format: DXGI_FORMAT_R32_TYPELESS,
+                    ViewDimension: D3D12_UAV_DIMENSION_BUFFER,
+                    Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
+                        Buffer: D3D12_BUFFER_UAV {
+                            NumElements: 64,
+                            Flags: D3D12_BUFFER_UAV_FLAG_RAW,
+                            ..Default::default()
+                        },
+                    },
+                }),
+                at,
+            );
+            buffers.push(b);
+        }
+        let queue = |kind| -> ID3D12CommandQueue {
+            dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC {
+                Type: kind,
+                ..Default::default()
+            })
+            .expect("queue")
+        };
+        let direct = queue(D3D12_COMMAND_LIST_TYPE_DIRECT);
+        let computes: Vec<ID3D12CommandQueue> =
+            (0..4).map(|_| queue(D3D12_COMMAND_LIST_TYPE_COMPUTE)).collect();
+        let uav_barrier = D3D12_RESOURCE_BARRIER {
+            Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
+            Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+            Anonymous: D3D12_RESOURCE_BARRIER_0 {
+                UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER {
+                    pResource: std::mem::ManuallyDrop::new(None),
+                }),
+            },
+        };
+        // A closed list of `kind` with dispatches `range`: each `groups`
+        // wide, writing its own buffer if `own`, with UAV barriers between
+        // them if `barriers`.
+        let record = |kind, range: std::ops::Range<u32>, groups: u32, own: bool, barriers: bool| {
+            let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(kind).expect("allocator");
+            let list: ID3D12GraphicsCommandList =
+                dev.CreateCommandList(0, kind, &alloc, &pso).expect("list");
+            list.SetDescriptorHeaps(&[Some(views.clone())]);
+            list.SetComputeRootSignature(&root);
+            for i in range {
+                if barriers && i > 0 {
+                    list.ResourceBarrier(&[uav_barrier.clone()]);
+                }
+                let ud = constants(if own { i * 32 } else { 0 });
+                list.SetComputeRoot32BitConstants(0, ud.len() as u32, ud.as_ptr().cast(), 0);
+                list.Dispatch(groups, 1, 1);
+            }
+            list.Close().expect("close");
+            (alloc, list)
+        };
+        let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).expect("fence");
+        let mut value = 0u64;
+        // Submits `lists[q]` on `queues[q]` (all at once) and times them to
+        // the last fence.
+        let mut run = |queues: &[&ID3D12CommandQueue], lists: &[Vec<ID3D12CommandList>]| {
+            let start = std::time::Instant::now();
+            for (q, l) in queues.iter().zip(lists) {
+                let l: Vec<Option<ID3D12CommandList>> = l.iter().cloned().map(Some).collect();
+                q.ExecuteCommandLists(&l);
+            }
+            let mut last = Vec::new();
+            for q in queues {
+                value += 1;
+                q.Signal(&fence, value).map_err(err).expect("signal");
+                last.push(value);
+            }
+            let want = *last.iter().max().unwrap();
+            while fence.GetCompletedValue() < want {
+                if let Err(e) = dev.GetDeviceRemovedReason() {
+                    panic!("device removed: {e}");
+                }
+                std::thread::yield_now();
+            }
+            start.elapsed()
+        };
+        let one = |l: &(ID3D12CommandAllocator, ID3D12GraphicsCommandList)| -> ID3D12CommandList {
+            l.1.cast().expect("cast")
+        };
+        let d = D3D12_COMMAND_LIST_TYPE_DIRECT;
+        let c = D3D12_COMMAND_LIST_TYPE_COMPUTE;
+        let single = record(d, 0..1, 1, false, false);
+        let shared = record(d, 0..N, 1, false, false);
+        let own = record(d, 0..N, 1, true, false);
+        let barriers = record(d, 0..N, 1, true, true);
+        let wide = record(d, 0..1, N, false, false);
+        let many: Vec<_> = (0..N).map(|i| record(d, i..i + 1, 1, true, false)).collect();
+        let quarters: Vec<_> = (0..4).map(|q| record(c, q * N / 4..(q + 1) * N / 4, 1, true, false)).collect();
+        let mut best = |name: &str, queues: &[&ID3D12CommandQueue], lists: Vec<Vec<ID3D12CommandList>>| {
+            let t = (0..4).map(|_| run(queues, &lists)).skip(1).min().unwrap();
+            eprintln!("{name:44} {:8.2} ms", t.as_secs_f64() * 1e3);
+            t
+        };
+        let t1 = best("one dispatch, one group", &[&direct], vec![vec![one(&single)]]);
+        best(&format!("{N} dispatches, one list, same buffer"), &[&direct], vec![vec![one(&shared)]]);
+        best(&format!("{N} dispatches, one list, own buffers"), &[&direct], vec![vec![one(&own)]]);
+        best(&format!("{N} dispatches, one list, UAV barriers"), &[&direct], vec![vec![one(&barriers)]]);
+        best(&format!("one dispatch of {N} groups"), &[&direct], vec![vec![one(&wide)]]);
+        best(&format!("{N} lists, one submission"), &[&direct], vec![many.iter().map(one).collect()]);
+        let qs: Vec<&ID3D12CommandQueue> = computes.iter().collect();
+        best("4 compute queues x 16 dispatches", &qs, quarters.iter().map(|l| vec![one(l)]).collect());
+        eprintln!(
+            "one group alone {:.2} ms; {N}x that serial would be {:.1} ms (iterations {iterations}, {K} FMAs each)",
+            t1.as_secs_f64() * 1e3,
+            t1.as_secs_f64() * 1e3 * f64::from(N)
+        );
+        drop(buffers);
+    }
+}
+
+/// [`small_dispatch_scheduling_timing`] for dispatches shaped like the hair
+/// pass: each is one group of 32 lanes running a loop of 64-bit `umax`
+/// image atomics (an R32G32_UINT texture, lane `l` on texel (l, 0)), lowered
+/// with the atomic locks in rounds (their lock words in the root UAV every
+/// dispatch shares, as in a frame) and, separately, racy. 64 of them:
+/// alone, in one list on one texture and one lock buffer (the frame's
+/// shape), each on its own texture, each with its own lock buffer, and as
+/// one dispatch of 64 groups. Run with `--ignored --nocapture` on a Mac.
+#[test]
+#[ignore = "a timing, for D3DMetal (hair pass scheduling)"]
+fn hair_like_dispatch_scheduling_timing() {
+    use windows::Win32::Graphics::Direct3D12::*;
+    use windows::Win32::Graphics::Dxgi::Common::*;
+    use windows::core::Interface;
+    const N: u32 = 64;
+    let iterations: u32 = std::env::var("PROBE_ITERATIONS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(256);
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let v0 = vgpr(0);
+    let mut words = atomics64_prologue();
+    words.extend([
+        vop1(0x001, 1, v0),  // v1 = lane: the low dword
+        vop1(0x001, 2, 129), // v2 = 1: the high dword
+        vop1(0x001, 3, v0),  // v3 = x = lane
+        vop1(0x001, 4, 128), // v4 = y = 0
+        s_mov_b32(16, 0),    // s16 = s0: iterations
+    ]);
+    words.extend(image_atomic(0x17, 1, 3, 8, 3, false)); // umax v[1:2] at (v3, v4)
+    words.push(sop2(0x01, 16, 16, 129)); // s_sub_u32 s16, s16, 1
+    words.push(0xBF07_8010); // s_cmp_lg_u32 s16, 0
+    words.push(0xBF85_0000 | (-5i32 as u32 & 0xFFFF)); // s_cbranch_scc1 the atomic
+    words.push(S_ENDPGM);
+    let Ok(host) = Host::new(false) else {
+        eprintln!("no SM 6.6 hardware device; skipped");
+        return;
+    };
+    let dev = &host.device;
+    for racy in [false, true] {
+        PROBE_RACY.with(|r| r.set(racy));
+        let shader = lower_cs32_with(&words, &[(4, ResourceType::Uav, 0, 8)], false, true, true, false);
+        PROBE_RACY.with(|r| r.set(false));
+        let (root, pso) = host.compute_pipeline(&shader).expect("pipeline");
+        let constants = |table: u32| {
+            let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+            for u in &shader.user_data {
+                ud[u.index as usize] = match (u.root, u.slot) {
+                    (RootType::Constants, 0) => iterations,
+                    (RootType::Table, 1) => table,
+                    (RootType::Table, _) => 0,
+                    other => panic!("unexpected user data {other:?}"),
+                };
+            }
+            ud
+        };
+        // SAFETY: D3D12 calls with descriptions that outlive them; every
+        // resource stays alive until the fence says the GPU is done.
+        unsafe {
+            let make = |heap: D3D12_HEAP_TYPE, desc: &D3D12_RESOURCE_DESC, state| -> ID3D12Resource {
+                let mut r: Option<ID3D12Resource> = None;
+                dev.CreateCommittedResource(
+                    &D3D12_HEAP_PROPERTIES { Type: heap, ..Default::default() },
+                    D3D12_HEAP_FLAG_NONE,
+                    desc,
+                    state,
+                    None,
+                    &mut r,
+                )
+                .expect("resource");
+                r.expect("resource")
+            };
+            let sample = DXGI_SAMPLE_DESC { Count: 1, Quality: 0 };
+            let buffer = |size: u64, flags| D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                Width: size,
+                Height: 1,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                SampleDesc: sample,
+                Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                Flags: flags,
+                ..Default::default()
+            };
+            let views: ID3D12DescriptorHeap = dev
+                .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                    Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                    NumDescriptors: N,
+                    Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+                    ..Default::default()
+                })
+                .expect("heap");
+            let size = dev.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV) as usize;
+            let mut keep = Vec::new();
+            for i in 0..N as usize {
+                let t = make(
+                    D3D12_HEAP_TYPE_DEFAULT,
+                    &D3D12_RESOURCE_DESC {
+                        Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+                        Width: 32,
+                        Height: 8,
+                        DepthOrArraySize: 1,
+                        MipLevels: 1,
+                        Format: DXGI_FORMAT_R32G32_UINT,
+                        SampleDesc: sample,
+                        Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                        ..Default::default()
+                    },
+                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                );
+                let mut at = views.GetCPUDescriptorHandleForHeapStart();
+                at.ptr += i * size;
+                dev.CreateUnorderedAccessView(
+                    &t,
+                    None,
+                    Some(&D3D12_UNORDERED_ACCESS_VIEW_DESC {
+                        Format: DXGI_FORMAT_R32G32_UINT,
+                        ViewDimension: D3D12_UAV_DIMENSION_TEXTURE2D,
+                        ..Default::default()
+                    }),
+                    at,
+                );
+                keep.push(t);
+            }
+            // The marks view (no marks) and the lock words: one shared, and
+            // one per dispatch.
+            let marks = make(D3D12_HEAP_TYPE_UPLOAD, &buffer(256, D3D12_RESOURCE_FLAG_NONE), D3D12_RESOURCE_STATE_GENERIC_READ);
+            let mut p = std::ptr::null_mut();
+            marks.Map(0, None, Some(&mut p)).expect("map");
+            p.cast::<[u32; 2]>().write([super::VIEW_MARK_NONE, 0]);
+            marks.Unmap(0, None);
+            let lock_bytes = u64::from(super::VIEW_WRITES_BYTES);
+            let locks: Vec<ID3D12Resource> = (0..N)
+                .map(|_| make(D3D12_HEAP_TYPE_DEFAULT, &buffer(lock_bytes, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS), D3D12_RESOURCE_STATE_UNORDERED_ACCESS))
+                .collect();
+            let direct: ID3D12CommandQueue = dev
+                .CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_DIRECT, ..Default::default() })
+                .expect("queue");
+            let record = |count: u32, groups: u32, own_texture: bool, own_locks: bool| {
+                let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).expect("allocator");
+                let list: ID3D12GraphicsCommandList =
+                    dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, &pso).expect("list");
+                list.SetDescriptorHeaps(&[Some(views.clone())]);
+                list.SetComputeRootSignature(&root);
+                list.SetComputeRootShaderResourceView(1, marks.GetGPUVirtualAddress());
+                for i in 0..count {
+                    let ud = constants(if own_texture { i * 32 } else { 0 });
+                    list.SetComputeRoot32BitConstants(0, ud.len() as u32, ud.as_ptr().cast(), 0);
+                    let lock = &locks[if own_locks { i as usize } else { 0 }];
+                    list.SetComputeRootUnorderedAccessView(2, lock.GetGPUVirtualAddress());
+                    list.Dispatch(groups, 1, 1);
+                }
+                list.Close().expect("close");
+                (alloc, list)
+            };
+            let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).expect("fence");
+            let mut value = 0u64;
+            let mut time = |l: &(ID3D12CommandAllocator, ID3D12GraphicsCommandList)| {
+                let list: ID3D12CommandList = l.1.cast().expect("cast");
+                (0..4)
+                    .map(|_| {
+                        let start = std::time::Instant::now();
+                        direct.ExecuteCommandLists(&[Some(list.clone())]);
+                        value += 1;
+                        direct.Signal(&fence, value).expect("signal");
+                        while fence.GetCompletedValue() < value {
+                            if let Err(e) = dev.GetDeviceRemovedReason() {
+                                panic!("device removed: {e}");
+                            }
+                            std::thread::yield_now();
+                        }
+                        start.elapsed()
+                    })
+                    .skip(1)
+                    .min()
+                    .unwrap()
+            };
+            let mode = if racy { "racy" } else { "locks in rounds" };
+            let ms = |d: std::time::Duration| d.as_secs_f64() * 1e3;
+            let alone = time(&record(1, 1, false, false));
+            let shared = time(&record(N, 1, false, false));
+            let own_texture = time(&record(N, 1, true, false));
+            let own_locks = time(&record(N, 1, false, true));
+            let own_both = time(&record(N, 1, true, true));
+            let wide = time(&record(1, N, false, false));
+            eprintln!(
+                "{mode}: alone {:.2} ms | {N} dispatches: shared texture+locks {:.2}, own textures {:.2}, own locks {:.2}, own both {:.2} | one dispatch of {N} groups {:.2} ({iterations} atomics a lane)",
+                ms(alone), ms(shared), ms(own_texture), ms(own_locks), ms(own_both), ms(wide)
+            );
+            drop(keep);
+        }
+    }
+}
+
+/// What one `ExecuteIndirect` costs the host GPU against a direct dispatch:
+/// Grand Theft Auto VI issues ~5,100 indirect executions a frame (~3,800 of
+/// them mesh draws), each with one argument. N tiny dispatches (one thread,
+/// a few FMAs, own buffer each) issued directly, as N executions of one
+/// argument each (root constants set before each, as the host does for a
+/// title's draws), and as one execution of N arguments; then the same
+/// with a UAV barrier before each. Run with `--ignored --nocapture` on a Mac.
+#[test]
+#[ignore = "a timing, for D3DMetal (indirect execution cost)"]
+fn indirect_execution_cost_timing() {
+    use windows::Win32::Graphics::Direct3D12::*;
+    use windows::Win32::Graphics::Dxgi::Common::*;
+    use windows::core::Interface;
+    let n: u32 = std::env::var("PROBE_COUNT").ok().and_then(|v| v.parse().ok()).unwrap_or(1024);
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let shader = build_valu_cs(&[vop3(0x14B, 0, vgpr(1), vgpr(2), vgpr(3))[0], vop3(0x14B, 0, vgpr(1), vgpr(2), vgpr(3))[1]]);
+    let Ok(host) = Host::new(false) else {
+        eprintln!("no SM 6.6 hardware device; skipped");
+        return;
+    };
+    let (root, pso) = host.compute_pipeline(&shader).expect("pipeline");
+    let dev = &host.device;
+    let constants = |table: u32| {
+        let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+        for u in &shader.user_data {
+            ud[u.index as usize] = match (u.root, u.slot) {
+                (RootType::Constants, 0) => 0x3F80_0000,
+                (RootType::Table, 1) => table,
+                other => panic!("unexpected user data {other:?}"),
+            };
+        }
+        ud
+    };
+    // SAFETY: D3D12 calls with descriptions that outlive them; every
+    // resource stays alive until the fence says the GPU is done.
+    unsafe {
+        let make = |heap: D3D12_HEAP_TYPE, size: u64, flags, state| -> ID3D12Resource {
+            let mut r: Option<ID3D12Resource> = None;
+            dev.CreateCommittedResource(
+                &D3D12_HEAP_PROPERTIES { Type: heap, ..Default::default() },
+                D3D12_HEAP_FLAG_NONE,
+                &D3D12_RESOURCE_DESC {
+                    Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                    Width: size,
+                    Height: 1,
+                    DepthOrArraySize: 1,
+                    MipLevels: 1,
+                    SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                    Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                    Flags: flags,
+                    ..Default::default()
+                },
+                state,
+                None,
+                &mut r,
+            )
+            .expect("buffer");
+            r.expect("buffer")
+        };
+        // One buffer of n 256-byte slots, a raw view per slot (heap index i).
+        let out = make(D3D12_HEAP_TYPE_DEFAULT, u64::from(n) * 256, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        let views: ID3D12DescriptorHeap = dev
+            .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                NumDescriptors: n,
+                Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+                ..Default::default()
+            })
+            .expect("heap");
+        let size = dev.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV) as usize;
+        for i in 0..n as usize {
+            let mut at = views.GetCPUDescriptorHandleForHeapStart();
+            at.ptr += i * size;
+            dev.CreateUnorderedAccessView(
+                &out,
+                None,
+                Some(&D3D12_UNORDERED_ACCESS_VIEW_DESC {
+                    Format: DXGI_FORMAT_R32_TYPELESS,
+                    ViewDimension: D3D12_UAV_DIMENSION_BUFFER,
+                    Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
+                        Buffer: D3D12_BUFFER_UAV {
+                            FirstElement: i as u64 * 64,
+                            NumElements: 64,
+                            Flags: D3D12_BUFFER_UAV_FLAG_RAW,
+                            ..Default::default()
+                        },
+                    },
+                }),
+                at,
+            );
+        }
+        // The arguments: n dispatches of one group, 12 bytes each.
+        // Written through an upload buffer into one of the GPU's own, in the
+        // indirect-argument state, as the host keeps its clamped arguments
+        // (D3DMetal never finished an execution reading an upload buffer).
+        let upload = make(D3D12_HEAP_TYPE_UPLOAD, u64::from(n) * 12, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ);
+        let mut p = std::ptr::null_mut();
+        upload.Map(0, None, Some(&mut p)).expect("map");
+        for i in 0..n as usize {
+            p.cast::<[u32; 3]>().add(i).write([1, 1, 1]);
+        }
+        upload.Unmap(0, None);
+        let args = make(D3D12_HEAP_TYPE_DEFAULT, u64::from(n) * 12, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST);
+        let signature: ID3D12CommandSignature = {
+            let arg = D3D12_INDIRECT_ARGUMENT_DESC { Type: D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH, ..Default::default() };
+            let mut s: Option<ID3D12CommandSignature> = None;
+            dev.CreateCommandSignature(
+                &D3D12_COMMAND_SIGNATURE_DESC { ByteStride: 12, NumArgumentDescs: 1, pArgumentDescs: &arg, NodeMask: 0 },
+                None,
+                &mut s,
+            )
+            .expect("signature");
+            s.expect("signature")
+        };
+        let queue: ID3D12CommandQueue = dev
+            .CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_DIRECT, ..Default::default() })
+            .expect("queue");
+        let uav_barrier = D3D12_RESOURCE_BARRIER {
+            Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
+            Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+            Anonymous: D3D12_RESOURCE_BARRIER_0 {
+                UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER { pResource: std::mem::ManuallyDrop::new(None) }),
+            },
+        };
+        {
+            let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).expect("allocator");
+            let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None).expect("list");
+            list.CopyBufferRegion(&args, 0, &upload, 0, u64::from(n) * 12);
+            list.ResourceBarrier(&[D3D12_RESOURCE_BARRIER {
+                Type: D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
+                Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+                Anonymous: D3D12_RESOURCE_BARRIER_0 {
+                    Transition: std::mem::ManuallyDrop::new(D3D12_RESOURCE_TRANSITION_BARRIER {
+                        pResource: std::mem::transmute_copy(&args),
+                        Subresource: D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                        StateBefore: D3D12_RESOURCE_STATE_COPY_DEST,
+                        StateAfter: D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+                    }),
+                },
+            }]);
+            list.Close().expect("close");
+            queue.ExecuteCommandLists(&[Some(list.cast().expect("cast"))]);
+            let f: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).expect("fence");
+            queue.Signal(&f, 1).expect("signal");
+            while f.GetCompletedValue() < 1 {
+                std::thread::yield_now();
+            }
+        }
+        // 0: direct, 1: one execution each, 2: one execution of n.
+        let record = |how: u8, barriers: bool| {
+            let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).expect("allocator");
+            let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, &pso).expect("list");
+            list.SetDescriptorHeaps(&[Some(views.clone())]);
+            list.SetComputeRootSignature(&root);
+            if how == 2 {
+                let ud = constants(0);
+                list.SetComputeRoot32BitConstants(0, ud.len() as u32, ud.as_ptr().cast(), 0);
+                list.ExecuteIndirect(&signature, n, &args, 0, None, 0);
+            } else {
+                for i in 0..n {
+                    if barriers && i > 0 {
+                        list.ResourceBarrier(&[uav_barrier.clone()]);
+                    }
+                    let ud = constants(i * 32);
+                    list.SetComputeRoot32BitConstants(0, ud.len() as u32, ud.as_ptr().cast(), 0);
+                    if how == 0 {
+                        list.Dispatch(1, 1, 1);
+                    } else {
+                        list.ExecuteIndirect(&signature, 1, &args, u64::from(i) * 12, None, 0);
+                    }
+                }
+            }
+            list.Close().expect("close");
+            (alloc, list)
+        };
+        let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).expect("fence");
+        let mut value = 0u64;
+        let ms = |d: std::time::Duration| d.as_secs_f64() * 1e3;
+        let mut time = |l: &(ID3D12CommandAllocator, ID3D12GraphicsCommandList)| {
+            let list: ID3D12CommandList = l.1.cast().expect("cast");
+            (0..4)
+                .map(|_| {
+                    let start = std::time::Instant::now();
+                    queue.ExecuteCommandLists(&[Some(list.clone())]);
+                    value += 1;
+                    queue.Signal(&fence, value).expect("signal");
+                    while fence.GetCompletedValue() < value {
+                        if let Err(e) = dev.GetDeviceRemovedReason() {
+                            panic!("device removed: {e}");
+                        }
+                        std::thread::yield_now();
+                    }
+                    start.elapsed()
+                })
+                .skip(1)
+                .min()
+                .unwrap()
+        };
+        let direct = time(&record(0, false));
+        eprintln!("direct: {:.2} ms", ms(direct));
+        let each = time(&record(1, false));
+        eprintln!("{n} executions of one: {:.2} ms", ms(each));
+        let direct_b = time(&record(0, true));
+        eprintln!("direct with UAV barriers: {:.2} ms", ms(direct_b));
+        let each_b = time(&record(1, true));
+        eprintln!("{n} executions of one with UAV barriers: {:.2} ms", ms(each_b));
+        let batched = time(&record(2, false));
+        eprintln!("one execution of {n}: {:.2} ms", ms(batched));
+        eprintln!(
+            "{n} tiny dispatches: direct {:.2} ms, {n} indirect executions of one {:.2} ms, one execution of {n} {:.2} ms; with UAV barriers: direct {:.2} ms, indirect {:.2} ms",
+            ms(direct), ms(each), ms(batched), ms(direct_b), ms(each_b)
+        );
+        eprintln!(
+            "per execution over a direct dispatch: {:.1} us (without barriers), {:.1} us (with)",
+            (ms(each) - ms(direct)) * 1e3 / f64::from(n),
+            (ms(each_b) - ms(direct_b)) * 1e3 / f64::from(n)
+        );
+    }
+}
+
+/// Timing probe, not a test: what copying title memory through
+/// `ReadProcessMemory` on our own process costs (VIctory's host copies and
+/// copy-backs go through it, so an unmapped page fails the call instead of
+/// faulting) against a plain memory copy, whole and in 64 KiB and 4 KiB
+/// pieces. `PROBE_MB` megabytes (default 64).
+#[test]
+#[ignore = "timing probe; run by hand under Wine"]
+fn self_read_copy_timing() {
+    use std::ffi::c_void;
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn ReadProcessMemory(process: isize, at: *const c_void, to: *mut c_void, len: usize, done: *mut usize) -> i32;
+        fn GetCurrentProcess() -> isize;
+        fn VirtualAlloc(at: *const c_void, len: usize, kind: u32, protect: u32) -> *mut c_void;
+    }
+    const MEM_COMMIT: u32 = 0x1000;
+    const MEM_RESERVE: u32 = 0x2000;
+    const PAGE_READWRITE: u32 = 0x04;
+    let mb: usize = std::env::var("PROBE_MB").ok().and_then(|v| v.parse().ok()).unwrap_or(64);
+    let len = mb << 20;
+    // SAFETY: fresh committed allocations of `len` bytes each.
+    let (src, dst) = unsafe {
+        let a = VirtualAlloc(std::ptr::null(), len, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE).cast::<u8>();
+        let b = VirtualAlloc(std::ptr::null(), len, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE).cast::<u8>();
+        assert!(!a.is_null() && !b.is_null());
+        for i in (0..len).step_by(4096) {
+            a.add(i).write((i >> 12) as u8);
+            b.add(i).write(0);
+        }
+        (a, b)
+    };
+    let rpm = |piece: usize| {
+        let start = std::time::Instant::now();
+        for at in (0..len).step_by(piece) {
+            let mut done = 0;
+            // SAFETY: both ranges are inside the allocations.
+            let ok = unsafe {
+                ReadProcessMemory(GetCurrentProcess(), src.add(at).cast(), dst.add(at).cast(), piece.min(len - at), &mut done)
+            };
+            assert!(ok != 0);
+        }
+        start.elapsed()
+    };
+    let plain = || {
+        let start = std::time::Instant::now();
+        // SAFETY: both ranges are the allocations, apart.
+        unsafe { std::ptr::copy_nonoverlapping(src, dst, len) };
+        start.elapsed()
+    };
+    let gbs = |d: std::time::Duration| len as f64 / d.as_secs_f64() / 1e9;
+    for round in 0..3 {
+        let (w, p64, p4, m) = (rpm(len), rpm(64 << 10), rpm(4 << 10), plain());
+        eprintln!(
+            "round {round}: {mb} MB: ReadProcessMemory whole {:.1} ms ({:.1} GB/s), 64 KiB pieces {:.1} ms ({:.1} GB/s), 4 KiB pieces {:.1} ms ({:.1} GB/s); plain copy {:.1} ms ({:.1} GB/s)",
+            w.as_secs_f64() * 1e3, gbs(w), p64.as_secs_f64() * 1e3, gbs(p64), p4.as_secs_f64() * 1e3, gbs(p4), m.as_secs_f64() * 1e3, gbs(m)
+        );
+    }
 }

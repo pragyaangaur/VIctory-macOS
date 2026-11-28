@@ -152,6 +152,17 @@ fn atomic_umax() -> bool {
 /// (`CS_VisHair`) costs ~158 ms of a ~517 ms GPU frame (leaving the pass
 /// out), and without the locks the frame took ~29 ms less GPU
 /// (docs/m1-max.md, 2026-11-27). Only with [`atomic_locks`].
+fn half_loops() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = crate::switch::on("VICTORY_HALF_LOOPS");
+        if on {
+            tracing::info!("VICTORY_HALF_LOOPS=1: lockstep loops with no barrier in them leave per 32-lane half");
+        }
+        on
+    })
+}
+
 fn racy_minmax() -> bool {
     static RACY: OnceLock<bool> = OnceLock::new();
     *RACY.get_or_init(|| {
@@ -304,6 +315,12 @@ pub(crate) fn translation_build(options: victory_shader::emit::Options) -> &'sta
     let apart = options.host_wave32 && !options.halves_rendezvous;
     let cap_barriers = victory_shader::emit::cap_barriers_refused();
     let limits = options.thread_limits;
+    let half_loops = options.host_wave32 && options.half_loops;
+    // `VICTORY_FIRST_LANE_PER_HALF=1` (measurement only) changes programs
+    // only where they run in halves.
+    let per_half = options.host_wave32 && victory_shader::emit::first_lane_per_half();
+    // `VICTORY_HALVES_EXTRA_BARRIER=1` (measurement only), likewise.
+    let extra_barrier = options.host_wave32 && victory_shader::emit::halves_extra_barrier();
     if !locks
         && !bias
         && !narrow
@@ -312,10 +329,13 @@ pub(crate) fn translation_build(options: victory_shader::emit::Options) -> &'sta
         && !apart
         && !cap_barriers
         && !limits
+        && !half_loops
+        && !per_half
+        && !extra_barrier
     {
         return build();
     }
-    static BUILDS: [OnceLock<[u8; 32]>; 2048] = [const { OnceLock::new() }; 2048];
+    static BUILDS: [OnceLock<[u8; 32]>; 16384] = [const { OnceLock::new() }; 16384];
     let n = usize::from(locks)
         | usize::from(bias) << 1
         | usize::from(narrow) << 2
@@ -326,7 +346,10 @@ pub(crate) fn translation_build(options: victory_shader::emit::Options) -> &'sta
         | usize::from(apart) << 7
         | usize::from(cap_barriers) << 8
         | usize::from(limits) << 9
-        | usize::from(racy) << 10;
+        | usize::from(racy) << 10
+        | usize::from(half_loops) << 11
+        | usize::from(per_half) << 12
+        | usize::from(extra_barrier) << 13;
     BUILDS[n].get_or_init(|| {
         let mut h = blake3::Hasher::new();
         h.update(build());
@@ -341,6 +364,16 @@ pub(crate) fn translation_build(options: victory_shader::emit::Options) -> &'sta
         }
         if racy {
             h.update(b"racy minmax");
+        }
+        if half_loops {
+            h.update(b"half loops");
+        }
+        if per_half {
+            h.update(b"first lane per half");
+            h.update(&[victory_shader::emit::first_lane_mode()]);
+        }
+        if extra_barrier {
+            h.update(b"halves extra barrier");
         }
         if bias {
             h.update(b"bias as gradients");
@@ -379,6 +412,7 @@ pub(crate) fn runtime_options() -> victory_shader::emit::Options {
         atomic_lock_rounds: atomic_lock_rounds(),
         atomic_umax: atomic_umax(),
         racy_minmax: racy_minmax(),
+        half_loops: half_loops(),
         bias_as_gradients: bias_as_gradients(),
         host_wave32: host_wave32(),
         narrow_waves: narrow_waves(),
@@ -406,8 +440,60 @@ pub(crate) fn host_shader_with(
     let mut options = options;
     // One program at a time, if the switch lists hashes.
     options.uav_size_level0 = uav_size_level0_for(container);
-    let translate =
-        |c: &[u8]| victory_shader::emit::translate_with(c, options).map_err(|e| e.to_string());
+    let translate = |c: &[u8]| {
+        let _ = victory_shader::emit::take_kept_out_of_halves();
+        let _ = victory_shader::emit::take_in_halves();
+        let _ = victory_shader::emit::take_lane_kinds();
+        let r = victory_shader::emit::translate_with(c, options).map_err(|e| e.to_string());
+        // Which compute programs run a console wave in two 32-lane halves
+        // (each exchange between them a group barrier), and why, by the hash
+        // the GPU timings use. Logged when translated, not when cached.
+        let in_halves = victory_shader::emit::take_in_halves();
+        if in_halves != 0 && r.is_ok() {
+            use victory_shader::emit::{IN_HALVES_FIRST_LANE, IN_HALVES_LANES, IN_HALVES_LDS};
+            let hash = blake3::hash(c);
+            let hash: String = hash.as_bytes()[..8].iter().map(|b| format!("{b:02x}")).collect();
+            let why: Vec<&str> = [
+                (IN_HALVES_LANES, "reads other lanes"),
+                (IN_HALVES_FIRST_LANE, "reads a first lane"),
+                (IN_HALVES_LDS, "one wave's LDS"),
+            ]
+            .into_iter()
+            .filter(|(bit, _)| in_halves & bit != 0)
+            .map(|(_, why)| why)
+            .collect();
+            use victory_shader::emit as e;
+            let kinds = e::take_lane_kinds();
+            let reads: Vec<&str> = [
+                (e::LANES_SWIZZLE, "swizzle"),
+                (e::LANES_PERMUTE, "permute"),
+                (e::LANES_PERMLANE, "permlane"),
+                (e::LANES_MBCNT, "mbcnt"),
+                (e::LANES_READLANE, "readlane"),
+                (e::LANES_DPP_QUAD, "dpp-quad"),
+                (e::LANES_DPP_ROW, "dpp-row"),
+                (e::LANES_MASK_DATA, "mask-data"),
+                (e::LANES_LITERAL, "literal"),
+            ]
+            .into_iter()
+            .filter(|(bit, _)| kinds & bit != 0)
+            .map(|(_, name)| name)
+            .collect();
+            tracing::info!(hash, why = why.join(", "), reads = reads.join(" "), "program runs in 32-lane halves");
+        }
+        // `VICTORY_FIRST_LANE_PER_HALF` (measurement only): which programs
+        // its `enter` took out of halves, by the hash the logs use.
+        if victory_shader::emit::take_kept_out_of_halves() > 0 {
+            let hash = blake3::hash(c);
+            let hash: String = hash.as_bytes()[..8].iter().map(|b| format!("{b:02x}")).collect();
+            tracing::info!(
+                hash,
+                translated = r.is_ok(),
+                "program kept out of halves for its first-lane reads (VICTORY_FIRST_LANE_PER_HALF)"
+            );
+        }
+        r
+    };
     let build = translation_build(options);
     match CACHE.get() {
         Some(cache) => cached(cache, build, container, translate),

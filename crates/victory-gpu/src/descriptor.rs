@@ -227,8 +227,8 @@ fn mirror(handle: u64) {
 /// Where [`sync_heaps`] spends its time, since the last frame report:
 /// [`SyncStat`]'s slots. Always counted (a few clock reads a page): the
 /// frame report's "heap views synced" phase is the largest of preparing.
-pub(crate) static SYNC_STATS: [std::sync::atomic::AtomicU64; 20] =
-    [const { std::sync::atomic::AtomicU64::new(0) }; 20];
+pub(crate) static SYNC_STATS: [std::sync::atomic::AtomicU64; 27] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 27];
 
 /// [`SYNC_STATS`]'s slots.
 #[derive(Clone, Copy)]
@@ -274,6 +274,20 @@ pub(crate) enum SyncStat {
     KeepUs,
     /// Microseconds noting what the slots view (`viewed.set_batch`).
     ViewedUs,
+    /// Of them: resolving what each view reaches, before the heap's lock.
+    ViewedResolveUs,
+    /// Of them: waiting for the heap's lock.
+    ViewedLockUs,
+    /// Of them: the loop over the batch's slots (what each held and holds).
+    ViewedLoopUs,
+    /// Of them: the buffer ranges' net changes applied (counts, copies'
+    /// spans and slots).
+    ViewedApplyUs,
+    /// Slots of buffer views let go and taken, and of textures, noted.
+    ViewedBuffers,
+    ViewedTextures,
+    /// Buffer ranges whose count changed (net, per batch).
+    ViewedRanges,
 }
 
 /// Adds `n` to `stat`.
@@ -302,7 +316,8 @@ pub(crate) fn log_sync(frames: f64) {
         "heap slots made again per frame: holding that view already {:.0}, views created {:.0} ({:.1} ms{}), \
          copied from one created in the same sync {:.0}, left null for draws {:.0}, made null {:.0}; ms: looking \
          the views up and preparing them {:.1}, the slots' loop {:.1}, copying descriptors {:.1}, keeping what they \
-         view {:.1}, noting it {:.1}, the rest {:.1}",
+         view {:.1}, noting it {:.1} (resolving {:.1}, waiting for the lock {:.1}, the slots {:.1}, the ranges \
+         {:.1}; {:.0} buffer and {:.0} texture slot changes, {:.0} ranges), the rest {:.1}",
         per(s[8]),
         per(s[9]),
         ms(s[10]),
@@ -319,6 +334,13 @@ pub(crate) fn log_sync(frames: f64) {
         ms(s[15]),
         ms(s[18]),
         ms(s[19]),
+        ms(s[20]),
+        ms(s[21]),
+        ms(s[22]),
+        ms(s[23]),
+        per(s[24]),
+        per(s[25]),
+        per(s[26]),
         ms(s[6].saturating_sub(s[15] + s[16] + s[17] + s[18] + s[19])),
     );
 }

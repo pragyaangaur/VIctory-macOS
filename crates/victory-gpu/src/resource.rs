@@ -1645,7 +1645,7 @@ fn make_texture(d: &ResourceDesc, state: u32, clear: *const c_void) -> Option<Ho
     let mut texture: Option<ID3D12Resource> = None;
     let mut castable_formats = match () {
         () if d.flags & DEPTH != 0 => Vec::new(),
-        () if crate::shader_cache::under_wine() => castable_metal(d.format),
+        () if crate::under_wine() => castable_metal(d.format),
         () => castable(d.format),
     };
     let mut initial = crate::host::legal_for(d.flags, crate::host::texture_state(state));
@@ -1890,6 +1890,10 @@ const NEVER: u64 = u64::MAX;
 const BUDGET_HIGH: f64 = 0.90;
 #[cfg(windows)]
 const BUDGET_LOW: f64 = 0.85;
+/// Presented frames between two passes over idle textures when no budget
+/// is passed ([`evict_unused`]).
+#[cfg(windows)]
+pub(crate) const IDLE_PASS_FRAMES: u64 = 30;
 /// A texture made again within this many frames of being given up counts
 /// as remade soon ([`EVICTIONS`]): too eager an [`IDLE_MS`].
 #[cfg(windows)]
@@ -1974,16 +1978,33 @@ pub(crate) fn evict_unused() {
     let ram = ram_over();
     let mut part = EvictClock(std::time::Instant::now());
     part.lap(EvictPart::Budget);
-    // Read through the heap since the last pass: used (a slot's read mark is
-    // reported as new only once, so its first read alone stamped it; run
-    // evict1 gave up and made again hundreds of textures a frame).
-    let read = crate::descriptor::read_textures(&crate::shadow::reads_since());
-    part.lap(EvictPart::ReadMarks);
-    let candidates = candidates();
-    part.lap(EvictPart::Candidates);
-    evict_among(&candidates, &read, frame, now_ms(), over.max(ram));
-    drop(candidates);
-    part.lap(EvictPart::GiveUp);
+    // Idle textures go in a pass every [`IDLE_PASS_FRAMES`] frames, past a
+    // budget every frame: giving up a texture finds the heap slots viewing
+    // it by a scan of each heap's slots (`HostHeap::evict`), and in GTA VI's
+    // settled world, which gives up a few idle textures every frame, that
+    // scan took ~15 ms of each frame on an M1 Max. A texture idle for
+    // [`IDLE_MS`] goes up to that many frames later.
+    static LAST_PASS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
+    let last = LAST_PASS.load(Relaxed);
+    let texture_pass = over > 0
+        || ram > 0
+        || last == u64::MAX
+        || frame < last
+        || frame - last >= IDLE_PASS_FRAMES;
+    if texture_pass {
+        LAST_PASS.store(frame, Relaxed);
+        // Read through the heap since the last pass: used (a slot's read mark is
+        // reported as new only once, so its first read alone stamped it; run
+        // evict1 gave up and made again hundreds of textures a frame).
+        let read = crate::descriptor::read_textures(&crate::shadow::reads_since());
+        part.lap(EvictPart::ReadMarks);
+        let candidates = candidates();
+        part.lap(EvictPart::Candidates);
+        evict_among(&candidates, &read, frame, now_ms(), over.max(ram));
+        part.lap(EvictPart::GiveUp);
+        drop(candidates);
+        part.lap(EvictPart::LetGo);
+    }
     empty_sparse_heap(frame);
     part.lap(EvictPart::SparseHeap);
     // Host copies of title memory take the same memory and textures give
@@ -2022,10 +2043,14 @@ pub(crate) enum EvictPart {
     Trim,
     /// Unordered views left null made again (`descriptor::remake_unordered`).
     Remake,
+    /// Of [`EvictPart::GiveUp`]: the heap slots viewing them made null.
+    NullSlots,
+    /// The candidates let go (a host texture given up goes with its last).
+    LetGo,
 }
 
 #[cfg(windows)]
-const EVICT_NAMES: [&str; 9] = [
+const EVICT_NAMES: [&str; 11] = [
     "budget asked",
     "read marks",
     "candidates",
@@ -2035,6 +2060,8 @@ const EVICT_NAMES: [&str; 9] = [
     "stale copies",
     "readbacks trimmed",
     "unordered views made again",
+    "of given up: slots made null",
+    "candidates let go",
 ];
 
 #[cfg(windows)]
@@ -2411,8 +2438,10 @@ fn give_up(gone: &[Owned], frame: u64) -> (u64, u64) {
     }
     {
         use windows::core::Interface;
+        let mut part = EvictClock(std::time::Instant::now());
         let raws = gone.iter().map(|(t, _)| t.texture.as_raw() as usize).collect();
         crate::descriptor::evict(&raws);
+        part.lap(EvictPart::NullSlots);
     }
     let at = TEXTURES_AT.lock().unwrap_or_else(|e| e.into_inner());
     let live: std::collections::HashSet<usize> = at.values().flatten().copied().collect();

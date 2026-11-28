@@ -286,6 +286,7 @@ fn wake_submit() {
 
 #[cfg(windows)]
 fn submit_worker() {
+    crate::priority::raise_this_thread();
     loop {
         {
             let mut work = SUBMIT_WORK.0.lock().unwrap_or_else(|e| e.into_inner());
@@ -542,6 +543,9 @@ pub(crate) fn drain_submit(why: Why) {
         host.finish_flight_now();
         return;
     }
+    name_drain_thread();
+    // The title thread prepares at VIctory's priority (`VICTORY_PREP_PRIORITY`).
+    let _raised = crate::priority::Raised::now();
     // The calling thread waits here for the submit worker's turn and the
     // flight in the air, then runs what is left: counted as `why`'s.
     let _drain = lock_timed(&SUBMIT_DRAIN, &BLOCKED_US[why as usize][0]);
@@ -555,6 +559,27 @@ pub(crate) fn drain_submit(why: Why) {
         }
     }
     add_run(why, entered);
+}
+
+/// With `VICTORY_PROFILE` set, names a thread that drains queued host work
+/// `victory-drain`, once, so the sampling profiler (`victory_loader`'s
+/// `profile`) can find it. PresentX drains on the title's thread and holds
+/// [`SUBMIT_DRAIN`] meanwhile, so in the world it prepares most host
+/// submissions itself while `victory-submit` waits for that lock (~83% of
+/// the worker's time in a profile on an M1 Max).
+#[cfg(windows)]
+fn name_drain_thread() {
+    thread_local! {
+        static NAMED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var_os("VICTORY_PROFILE").is_some()) || NAMED.with(|n| n.replace(true)) {
+        return;
+    }
+    use windows_sys::Win32::System::Threading::{GetCurrentThread, SetThreadDescription};
+    let name: Vec<u16> = "victory-drain".encode_utf16().chain([0]).collect();
+    // SAFETY: the current thread's pseudo-handle and a NUL-terminated name.
+    unsafe { SetThreadDescription(GetCurrentThread(), name.as_ptr()) };
 }
 
 /// Called by synchronous `Host::execute` callers (`present`, `resource.rs`,
