@@ -628,13 +628,14 @@ impl Shadow {
     }
 
     /// A zero-copy shadow whose title range `[start, start + len)` shares
-    /// physical pages with `buffer` (`mach_vm_remap`).
+    /// physical pages with `buffer` from `base` on (`mach_vm_remap`).
     pub(crate) fn new_aliased(
         buffer: ID3D12Resource,
         data: *mut u8,
         gpu: u64,
         start: u64,
         len: u64,
+        base: u64,
     ) -> Arc<Shadow> {
         let marks = marks().take(pages(start, len));
         let shadow = Arc::new(Shadow {
@@ -650,7 +651,7 @@ impl Shadow {
             widened: Mutex::default(),
             widened_source: Mutex::default(),
             has_widened: AtomicBool::new(false),
-            base: 0,
+            base,
             slice: None,
             aliased: true,
             sums: Mutex::default(),
@@ -723,6 +724,34 @@ impl Shadow {
             marked && self.marked() && !has_untracked,
         );
         list.mark_widened_write(self, address as usize, len as usize);
+    }
+
+    /// Arms the pages of `[address, address + len)` (tracked memory only)
+    /// for shaders that may write them through views no list declared (a
+    /// flight's heaps and title-memory programs, `crate::host::flight`): a
+    /// title write there before the copy-back saves the page's bytes from
+    /// before it, so that [`Shadow::copy_back_marked`] keeps both writers'
+    /// bytes, as for a declared marked write ([`Shadow::writing`]), instead
+    /// of the title's page whole.
+    pub(crate) fn arm_undeclared(&self, address: usize, len: usize) {
+        if let Some(t) = &self.tracked {
+            t.arm(address, address.saturating_add(len));
+        }
+    }
+
+    /// The flight that armed the copy ([`Shadow::arm_undeclared`]) has been
+    /// copied back: nothing stays armed or saved, unless a submitted list
+    /// still declares writes there (its own copy-back disarms it then).
+    pub(crate) fn disarm_undeclared(&self) {
+        if let Some(t) = &self.tracked
+            && self
+                .pending
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_empty()
+        {
+            t.disarm();
+        }
     }
 
     /// At submission, after the range's refresh: a submitted list's shaders
@@ -3962,6 +3991,104 @@ pub(crate) mod tests {
         list.close();
     }
 
+    /// A shader writes the copy a widened view is patched from earlier in
+    /// the same list, a UAV barrier between: the patch's copy out of that
+    /// copy takes what the shader wrote. A UAV barrier orders UAV accesses
+    /// only, and D3DMetal ran the copy before the shader's writes landed.
+    #[test]
+    fn a_widened_patch_takes_what_a_shader_wrote_before_it_in_the_list() {
+        use crate::compute::{Param, pipeline};
+        const SHADER: &str = r#"
+cbuffer C : register(b0) { uint count; uint seed; };
+RWByteAddressBuffer dst : register(u0);
+[numthreads(64, 1, 1)]
+void main(uint3 id : SV_DispatchThreadID) {
+    if (id.x < count) {
+        uint v = id.x;
+        [loop] for (uint k = 0; k < 256; ++k) {
+            v = v * 1664525u + 1013904223u;
+        }
+        dst.Store(id.x * 4, id.x + seed + (v & 0u));
+    }
+}
+"#;
+        let Some(host) = host() else {
+            return; // no host GPU here
+        };
+        let Ok((root, pso)) = pipeline(
+            SHADER,
+            windows::core::s!("widen_after_uav_writes"),
+            0,
+            &[
+                Param::Constants {
+                    register: 0,
+                    count: 2,
+                },
+                Param::Uav { register: 0 },
+            ],
+        ) else {
+            return; // no shader compiler here
+        };
+        // A title range of its own, as in
+        // `widened_views_patch_partial_elements_from_another_shadow`.
+        const ELEMENTS: u64 = 8192;
+        let start = 0x10_0000u64;
+        let bytes = ELEMENTS * 12;
+        let (parent_buffer, parent_data) = host.shared_buffer(bytes).unwrap();
+        // SAFETY: a live buffer.
+        let parent_gpu = unsafe { parent_buffer.GetGPUVirtualAddress() };
+        let parent = Shadow::new(parent_buffer, parent_data, parent_gpu, start, bytes);
+        // SAFETY: the parent shadow's bytes.
+        unsafe { std::ptr::write_bytes(parent_data, 0, bytes as usize) };
+        // A distinct shadow one dword in: its writes patch the view.
+        let len = bytes - 4;
+        let (writer_buffer, writer_data) = host.shared_buffer(len).unwrap();
+        // SAFETY: a live buffer.
+        let writer_gpu = unsafe { writer_buffer.GetGPUVirtualAddress() };
+        // SAFETY: the writer's bytes, stale until the shader writes them.
+        unsafe { std::ptr::write_bytes(writer_data, 0xee, len as usize) };
+        let writer = Shadow::new(writer_buffer, writer_data, writer_gpu, start + 4, len);
+        let widened = parent.widened(start, bytes, 1).expect("a widened view");
+        let seed = 0x5000_0000u32;
+        let dwords = (len / 4) as u32;
+        let list = host.new_list().unwrap();
+        // SAFETY: an open list, our pipeline and a live buffer.
+        unsafe {
+            list.list.SetComputeRootSignature(&root);
+            list.list.SetPipelineState(&pso);
+            let constants = [dwords, seed];
+            list.list
+                .SetComputeRoot32BitConstants(0, 2, constants.as_ptr().cast(), 0);
+            list.list.SetComputeRootUnorderedAccessView(1, writer_gpu);
+            list.list.Dispatch(dwords.div_ceil(64), 1, 1);
+            list.list.ResourceBarrier(&[crate::host::uav_barrier()]);
+        }
+        list.keep(&root);
+        list.keep(&pso);
+        let writes = [(writer.clone(), start as usize + 4, len as usize)];
+        assert!(
+            crate::widened::sync(&list, &[], &writes, &std::collections::HashSet::new()).is_some()
+        );
+        list.close();
+        host.execute(&[&list]);
+        let got = widened.read_host(ELEMENTS as usize * 4);
+        // Title dword k (from 1) is the writer's dword k - 1; dword 0 the
+        // parent's 0; each element's fourth dword the view's 1.
+        let want = |i: usize| match (i / 4 * 3 + i % 4, i % 4) {
+            (_, 3) => 1,
+            (0, _) => 0,
+            (k, _) => seed + k as u32 - 1,
+        };
+        let stale = (0..got.len()).filter(|&i| got[i] != want(i)).count();
+        assert_eq!(
+            stale,
+            0,
+            "{stale} of {} widened dwords miss the shader's writes",
+            got.len()
+        );
+        drop((widened, writer, parent));
+    }
+
     /// An element-aligned shadow that starts after the widened view cannot
     /// back the direct source root SRV; it must use the composed patch path.
     #[test]
@@ -4589,7 +4716,7 @@ pub(crate) mod tests {
         let outer = find(base + 0x100, 64).expect("outer shadow");
         assert!(!outer.is_aliased());
 
-        let aliased = Shadow::new_aliased(buffer, data, gpu, base, 0x10000);
+        let aliased = Shadow::new_aliased(buffer, data, gpu, base, 0x10000, 0);
         register_aliased(aliased.clone());
         let hit = find(base + 0x100, 64).expect("aliased shadow");
         assert!(hit.is_aliased());

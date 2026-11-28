@@ -310,6 +310,42 @@ pub(crate) fn step_and_cap_with(
                 || st.highs.contains_key(&v)
                 || st.scc_votes.contains_key(&v))
     };
+    // A plain number the compiler keeps in VCC_LO or VCC_HI as a spare
+    // scalar register, not a lane mask: written alone (besides
+    // SCC) by a scalar ALU instruction, and not a mask the structure knows
+    // (`masks`, `highs`, `other`). Such a value may be read as data like any
+    // SGPR; `from_scalar` below still needs every value it is computed from
+    // to be alike, so this admits no lane mask:
+    // - EXEC on entry, and any phi, is no instruction's write;
+    // - `v_cmp`/`v_cmpx` and other VALU results are never alike (`own`), so
+    //   neither is anything a scalar instruction computes from them;
+    // - a saved copy of either (`s_mov_b64 s[10:11], exec`,
+    //   `s_and_saveexec_b64`) reads the mask and so is not alike, and nor is
+    //   a later move of the copy back into VCC; a spill through
+    //   `v_writelane`/`v_readlane` goes by `st.restored`;
+    // - a 64-bit write (`s_and_b64 vcc, …`, `s_mov_b64 vcc, …`) is left out
+    //   whatever it reads: in wave64 halves VCC_HI is the upper 32 lanes'
+    //   bits, which differ between the host waves;
+    // - EXEC is never scratch: a write to it changes which lanes run.
+    let scratch_defs: Set<Value> = p
+        .blocks
+        .iter()
+        .flat_map(|b| b.insts.iter())
+        .filter(|i| matches!(i.fields, Fields::Sop { .. }))
+        .filter_map(|i| {
+            let mut words = i.writes.iter().filter(|w| w.0 != Reg::Scc);
+            match (words.next(), words.next()) {
+                (Some(&(Reg::S(k), v)), None) if k == VCC || k == VCC + 1 => Some(v),
+                _ => None,
+            }
+        })
+        .collect();
+    let scratch = |v: Value| {
+        scratch_defs.contains(&v)
+            && !st.masks.contains_key(&v)
+            && !st.highs.contains_key(&v)
+            && !st.other.contains_key(&v)
+    };
     // Group-uniform VGPRs: optimistically all non-entry VGPRs, narrowed with
     // `alike` in lockstep. Entry VGPRs (`v0`/`v1`/`v2` thread ids) are never
     // group-uniform.
@@ -485,10 +521,9 @@ pub(crate) fn step_and_cap_with(
             for (i, inst) in block.insts.iter().enumerate() {
                 let name = inst.name();
                 // Group-uniform scalar ops.
-                let from_scalar = inst
-                    .reads
-                    .iter()
-                    .all(|&(r, v)| scalar(r) && (!mask(r) || tracked(v)) && alike.contains(&v));
+                let from_scalar = inst.reads.iter().all(|&(r, v)| {
+                    scalar(r) && (!mask(r) || tracked(v) || scratch(v)) && alike.contains(&v)
+                });
                 let lane_read = st.literal
                     && step[b]
                     && match name {

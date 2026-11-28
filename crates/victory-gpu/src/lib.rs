@@ -106,6 +106,9 @@ mod tdr;
 mod texback;
 #[cfg(windows)]
 mod texture;
+// Plain std, so its tests run everywhere.
+#[cfg(any(windows, test))]
+mod timing_cuts;
 #[cfg(windows)]
 mod twin;
 #[cfg(windows)]
