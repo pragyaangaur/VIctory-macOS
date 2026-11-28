@@ -144,6 +144,8 @@ pub use tiled::{on_physical_tiles, physical_retiled};
 pub use host::{MeshSupport, host_mesh_support, on_failure};
 #[cfg(windows)]
 pub use shadow::on_physical_runs;
+#[cfg(all(windows, feature = "diagnostics"))]
+pub use shadow::{PhysicalCopyExtent, on_physical_copy_extents};
 #[cfg(windows)]
 pub use watch::{
     Writing as KernelWrite, fault_tracking, rosetta, stores_need_patching, title_memory_aliased,

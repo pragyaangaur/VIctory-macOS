@@ -237,3 +237,179 @@ fn marked_copy_back_serializes_mirrored_title_views() {
 fn marked_copy_back_serializes_subranges_of_one_tracked_page() {
     assert_eq!(exercise(Layout::SharesPage), (false, true));
 }
+
+struct RegisteredViews {
+    _memory: GuestMemory,
+    starts: [usize; 2],
+}
+
+impl RegisteredViews {
+    fn new() -> Self {
+        let memory = GuestMemory::mirrored();
+        let starts = [memory.base, memory.mirror.unwrap()];
+        for at in starts {
+            register(at, at as u64, COPY_LEN as u64);
+        }
+        Self {
+            _memory: memory,
+            starts,
+        }
+    }
+
+    fn copies(&self) -> [Arc<Shadow>; 2] {
+        self.starts
+            .map(|at| find(at as u64, COPY_LEN as u64).expect("registered title buffer shadow"))
+    }
+}
+
+impl Drop for RegisteredViews {
+    fn drop(&mut self) {
+        for at in self.starts {
+            unregister(at, at as u64);
+        }
+    }
+}
+
+/// One physical section with two title addresses, acquired through the
+/// registered-buffer lookup used by descriptor binding.
+#[test]
+#[ignore = "requires D3D12 and times title buffer shadow refreshes"]
+fn benchmark_mirrored_registered_buffers() {
+    const SAMPLES: usize = 9;
+    const PASSES: usize = 100;
+    let _quiet = host().expect("D3D12 host for buffer copies").quiet();
+    let views = RegisteredViews::new();
+    let starts = views.starts;
+    let copies = views.copies();
+    let [a, b] = &copies;
+    let allocated: u64 = copies
+        .iter()
+        .map(|copy| {
+            // SAFETY: a live host buffer held by the shadow.
+            unsafe { copy.buffer.GetDesc().Width }
+        })
+        .sum();
+    assert_ne!(a.gpu(starts[0] as u64), b.gpu(starts[1] as u64));
+    assert_eq!(allocated, 2 * COPY_LEN as u64);
+    assert!(crate::watch::aliased(starts[0], COPY_LEN));
+    for sample in 0..=SAMPLES {
+        let mut bytes = 0;
+        let mut refreshed = 0;
+        let mut elapsed = std::time::Duration::ZERO;
+        for pass in 0..PASSES {
+            let written = (pass + sample * PASSES) as u8;
+            fill_title(starts[pass % starts.len()], COPY_LEN, written);
+            let started = std::time::Instant::now();
+            for (&at, copy) in starts.iter().zip(&copies) {
+                let copied = copy.update(at, COPY_LEN);
+                refreshed += usize::from(copied != 0);
+                bytes += copied;
+            }
+            elapsed += started.elapsed();
+            let expected = [u32::from_ne_bytes([written; 4]); 2];
+            for (&at, copy) in starts.iter().zip(&copies) {
+                assert_eq!(copy.read_host(at as u64, 2), expected);
+                assert_eq!(copy.read_host((at + COPY_LEN - 8) as u64, 2), expected);
+            }
+        }
+        assert_eq!(refreshed, PASSES * starts.len());
+        if sample > 0 {
+            eprintln!(
+                "physical_alias sample={sample} passes={PASSES} physical_bytes={COPY_LEN} allocated_bytes={allocated} refreshed={refreshed} refreshed_bytes={bytes} elapsed_ns={}",
+                elapsed.as_nanos()
+            );
+        }
+    }
+    // A GPU-equivalent byte write through one copy must preserve a
+    // neighboring CPU write through its other title alias during copy-back.
+    a.writing(starts[0], PAGE, false);
+    fill_title(starts[1] + 3, 1, 0xd8);
+    a.write_host(starts[0] as u64 + 2, &[0x67]);
+    assert_eq!(a.copy_back(starts[0], PAGE), PAGE);
+    b.update(starts[1], PAGE);
+    let value = b.read_host(starts[1] as u64, 1)[0];
+    assert_eq!(value.to_ne_bytes()[2..], [0x67, 0xd8]);
+}
+
+#[test]
+#[ignore = "requires a D3D12 device and the HLSL compiler"]
+fn registered_physical_aliases_read_back_gpu_and_cpu_writes() {
+    use crate::compute::{self, Param};
+
+    let host = host().expect("D3D12 host for physical aliases");
+    let views = RegisteredViews::new();
+    let starts = views.starts;
+    fill_title(starts[0], COPY_LEN, INITIAL);
+    let copies = views.copies();
+    let [a, b] = &copies;
+    let (write_root, write_pipeline) = compute::pipeline(
+        "RWByteAddressBuffer b : register(u0);\n\
+         [numthreads(1,1,1)] void main() {\n\
+             b.Store(0, 0x19196719u);\n\
+          }",
+        windows::core::s!("physical alias writer"),
+        0,
+        &[Param::Uav { register: 0 }],
+    )
+    .expect("compile physical alias writer");
+    let writer = host.new_list().expect("record physical alias writer");
+    a.refresh(&writer, starts[0] as u64, PAGE as u64);
+    a.gpu_writes(&writer, starts[0] as u64, PAGE as u64, false);
+    // SAFETY: open list and live pipeline and guest shadow.
+    unsafe {
+        writer.list.SetComputeRootSignature(&write_root);
+        writer.list.SetPipelineState(&write_pipeline);
+        writer
+            .list
+            .SetComputeRootUnorderedAccessView(0, a.gpu(starts[0] as u64));
+        writer.list.Dispatch(1, 1, 1);
+    }
+    writer.close();
+    host.execute_sync(&[&writer], &[]);
+    fill_title(starts[1] + 3, 1, 0xd8);
+
+    let (read_root, read_pipeline) = compute::pipeline(
+        "ByteAddressBuffer a : register(t0);\n\
+         ByteAddressBuffer b : register(t1);\n\
+         RWByteAddressBuffer outbuf : register(u0);\n\
+         [numthreads(1,1,1)] void main() { outbuf.Store(0, a.Load(0)); outbuf.Store(4, b.Load(0)); }",
+        windows::core::s!("physical alias reader"),
+        0,
+        &[
+            Param::Srv {
+                register: 0,
+                space: 0,
+            },
+            Param::Srv {
+                register: 1,
+                space: 0,
+            },
+            Param::Uav { register: 0 },
+        ],
+    )
+    .expect("compile physical alias reader");
+    let reader = host.new_list().expect("record physical alias reader");
+    a.refresh(&reader, starts[0] as u64, PAGE as u64);
+    b.refresh(&reader, starts[1] as u64, PAGE as u64);
+    let (output, data) = host.shared_buffer(8).expect("readback buffer");
+    // SAFETY: open list and live pipeline, guest shadows and output buffer.
+    unsafe {
+        reader.list.SetComputeRootSignature(&read_root);
+        reader.list.SetPipelineState(&read_pipeline);
+        reader
+            .list
+            .SetComputeRootShaderResourceView(0, a.gpu(starts[0] as u64));
+        reader
+            .list
+            .SetComputeRootShaderResourceView(1, b.gpu(starts[1] as u64));
+        reader
+            .list
+            .SetComputeRootUnorderedAccessView(2, output.GetGPUVirtualAddress());
+        reader.list.Dispatch(1, 1, 1);
+    }
+    reader.close();
+    host.execute_sync(&[&reader], &[]);
+    // SAFETY: both dwords are in the mapped buffer; the queue has completed.
+    let readback = unsafe { data.cast::<[u32; 2]>().read_volatile() };
+    assert_eq!(readback, [0xd819_6719; 2]);
+}

@@ -2257,6 +2257,11 @@ pub(crate) fn log_lookups(frames: f64) {
     }
 }
 
+#[cfg(feature = "diagnostics")]
+mod physical_census;
+#[cfg(feature = "diagnostics")]
+pub use physical_census::{PhysicalCopyExtent, on_physical_copy_extents};
+
 /// Logs the host buffers the copies of title memory hold, once per report:
 /// one per title buffer and one per window of loose memory, and the
 /// zero-copy aliases, whose host buffers are the title's own memory
@@ -2299,6 +2304,7 @@ pub(crate) fn log_held() {
         aliased.0,
         aliased.1,
     );
+    physical_census::log();
 }
 
 /// User virtual space ends at 2^47 on x86_64 Windows; pages below
