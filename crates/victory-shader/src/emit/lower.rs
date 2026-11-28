@@ -5562,14 +5562,7 @@ impl<'a> Lower<'a> {
         else {
             return Err("a scalar load");
         };
-        let count = match inst.name().strip_prefix("s_load_dword") {
-            Some("") => 1u32,
-            Some("x2") => 2,
-            Some("x4") => 4,
-            Some("x8") => 8,
-            Some("x16") => 16,
-            _ => return Err("a scalar load from the code"),
-        };
+        let count = smem_dwords(inst.name()).ok_or("a scalar load from the code")?;
         let c = self.cur;
         let mut addr = self.s.m.i32(a.offset);
         if let Some(d) = a.dynamic {

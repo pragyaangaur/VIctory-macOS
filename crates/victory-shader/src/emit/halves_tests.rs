@@ -22,12 +22,12 @@ use crate::native::{
 };
 use crate::{gfx10, io, ir, resource, structure};
 
-const S_ENDPGM: u32 = 0xBF81_0000;
+pub(super) const S_ENDPGM: u32 = 0xBF81_0000;
 
 const S_WAITCNT_LGKM: u32 = 0xBF8C_C07F; // s_waitcnt lgkmcnt(0)
 
 /// `s[40:43]`: the raw UAV at table dword 16 (s0 is the table's address).
-const PROLOGUE: [u32; 5] = [
+pub(super) const PROLOGUE: [u32; 5] = [
     0xBE84_0300, // s_mov_b32 s4, s0
     0xBE85_0380, // s_mov_b32 s5, 0
     0xF408_0A02,
@@ -36,7 +36,7 @@ const PROLOGUE: [u32; 5] = [
 ];
 
 /// `buffer_store_dword v<vdata>, v16, s[40:43], 0 offen offset:<offset>`.
-const fn store(vdata: u8, offset: u32) -> [u32; 2] {
+pub(super) const fn store(vdata: u8, offset: u32) -> [u32; 2] {
     [0xE070_1000 | offset, 0x800A_0010 | (vdata as u32) << 8]
 }
 
@@ -95,7 +95,7 @@ fn console(l: u32) -> [u32; 8] {
     ]
 }
 
-fn native(words: &[u32], wave64: bool, threads: u32, lds_bytes: u32) -> NativeProgram {
+pub(super) fn native(words: &[u32], wave64: bool, threads: u32, lds_bytes: u32) -> NativeProgram {
     let range = |kind, table_offset_dwords, dwords| UsedResource {
         kind,
         root: RootType::Table,
@@ -163,7 +163,7 @@ fn lower_halves(
 /// `limits` the program goes through the translation's own entry, where
 /// `literal` retries a refusal in whole-wave halves; without, `literal`
 /// takes a 64-thread wave64 program straight to the whole-wave translation.
-fn lower_halves_limited(
+pub(super) fn lower_halves_limited(
     native: &NativeProgram,
     host_wave32: bool,
     narrow_waves: bool,
@@ -1204,6 +1204,214 @@ fn first_lane_of_a_buffer_load(offset: u32) -> Vec<u32> {
     w.extend(store(5, 0));
     w.push(S_ENDPGM);
     w
+}
+
+#[derive(Clone, Copy, Debug)]
+enum ScalarFirstLane {
+    Code,
+    ShortTable,
+    Mutable,
+    Guarded,
+}
+
+const SCALAR_FIRST_VALUE: u32 = 42;
+
+/// Read the second dword of an embedded scalar load, then use the first
+/// lane in a scalar branch. Store the selected value under a mask, restore
+/// EXEC, and repeat the store at the next dword for all lanes.
+fn scalar_first_lane(mask: &[u32], source: ScalarFirstLane) -> Vec<u32> {
+    let mut words = PROLOGUE.to_vec();
+    let pc = words.len();
+    if matches!(source, ScalarFirstLane::Mutable) {
+        words.extend([
+            0xF408_0B02,
+            0xFA00_0020, // s_load_dwordx4 s[44:47], s[4:5], 0x20
+            S_WAITCNT_LGKM,
+            0xF420_03D6,
+            0xFA00_0000, // s_buffer_load_dword s15, s[44:47], 0
+        ]);
+    } else {
+        words.extend([
+            0xBEA0_1F00, // s_getpc_b64 s[32:33]
+            0xF404_0390,
+            0xFA00_0000, // s_load_dwordx2 s[14:15], s[32:33], <table offset>
+        ]);
+    }
+    words.extend([
+        S_WAITCNT_LGKM,
+        0x3420_0085, // v_lshlrev_b32 v16, 5, v0
+    ]);
+    if matches!(source, ScalarFirstLane::Guarded) {
+        words.push(0x7E08_0287); // v_mov_b32 v4, 7 (inactive lanes retain this)
+        words.extend(MASK_LANES_40_41);
+        words.extend([
+            0xBE80_246A, // s_and_saveexec_b64 s[0:1], vcc
+            0x7E08_020F, // v_mov_b32 v4, s15
+            0xBEFE_0400, // s_mov_b64 exec, s[0:1]
+        ]);
+    } else {
+        words.push(0x7E08_020F); // v_mov_b32 v4, s15
+    }
+    words.extend(mask);
+    words.extend([
+        0xBE80_246A, // s_and_saveexec_b64 s[0:1], vcc
+        0x7E18_0504, // v_readfirstlane_b32 s12, v4
+        0xBEFE_0400, // s_mov_b64 exec, s[0:1]
+        0x7E0A_020C, // v_mov_b32 v5, s12
+        0x7E0C_020C, // v_mov_b32 v6, s12 (raw result)
+        0xBF06_AA0C, // s_cmp_eq_u32 s12, 42
+        0xBF85_0001, // s_cbranch_scc1 (skip replacing v5)
+        0x7E0A_0288, // v_mov_b32 v5, 8
+        0xBE80_246A, // s_and_saveexec_b64 s[0:1], vcc
+    ]);
+    words.extend(store(5, 0));
+    words.push(0xBEFE_0400); // s_mov_b64 exec, s[0:1]
+    words.extend(store(5, 4));
+    words.extend(store(6, 8));
+    words.push(S_ENDPGM);
+    if !matches!(source, ScalarFirstLane::Mutable) {
+        words[pc + 2] |= ((words.len() - pc - 1) * 4) as u32;
+        words.push(71);
+        if !matches!(source, ScalarFirstLane::ShortTable) {
+            words.push(SCALAR_FIRST_VALUE);
+        }
+    }
+    words
+}
+
+pub(super) fn compute_container(program: &NativeProgram) -> Vec<u8> {
+    let part = crate::native::tests::compute_part(program);
+    super::container::build(&[(b"DXIL", &part)])
+}
+
+#[test]
+fn bounded_code_scalar_load_removes_only_the_proven_exchange() {
+    for threads in [64, 96, 128] {
+        for (source, wave_size) in [
+            (ScalarFirstLane::Code, None),
+            (ScalarFirstLane::ShortTable, Some(32)),
+            (ScalarFirstLane::Mutable, Some(32)),
+            (ScalarFirstLane::Guarded, Some(32)),
+        ] {
+            let n = native(
+                &scalar_first_lane(&MASK_LANES_12_44, source),
+                true,
+                threads,
+                0,
+            );
+            let l = lowered_with(&n, true, true).expect("translated");
+            assert_eq!(l.wave_size, wave_size, "{source:?}, {threads} threads");
+            assert_eq!(
+                l.barriers == 0,
+                wave_size.is_none(),
+                "{source:?}, {threads} threads"
+            );
+            let shader = super::translate_with(&compute_container(&n), scalar_first_lane_options())
+                .expect("production translation");
+            let dxil = crate::dxbc::Container::parse(&shader.dxil).expect("emitted container");
+            let psv = dxil.part(crate::dxbc::FourCC::PSV0).expect("compute runtime info");
+            // The runtime-info size prefix occupies the first four bytes.
+            let min_wave = u32::from_le_bytes(psv.data[20..24].try_into().unwrap());
+            let max_wave = u32::from_le_bytes(psv.data[24..28].try_into().unwrap());
+            assert_eq!(
+                (min_wave, max_wave),
+                wave_size.map_or((0, u32::MAX), |width| (width, width)),
+                "{source:?}, {threads} threads"
+            );
+        }
+    }
+}
+
+fn scalar_first_lane_options() -> super::Options {
+    super::Options {
+        host_wave32: true,
+        narrow_waves: true,
+        halves_rendezvous: true,
+        ..super::Options::default()
+    }
+}
+
+/// Explicit hardware acceptance. Missing devices, pipelines and readbacks
+/// all fail this test. Fixture outputs are derived from console lane order.
+#[test]
+#[ignore = "requires a D3D12 hardware device with 32-lane waves"]
+#[cfg(windows)]
+fn bounded_code_scalar_first_lane_gpu() {
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let host = Host::new(false).expect("D3D12 hardware device");
+    assert!(
+        host.wave32().expect("hardware wave width"),
+        "requires wave32 hardware"
+    );
+    let mut dispatches = 0;
+    let mut checked = 0;
+    for threads in [64u32, 96, 128] {
+        for (mask, active) in [
+            (&MASK_LANES_8_9, (|t| t >> 1 == 4) as fn(u32) -> bool),
+            (&MASK_LANES_40_41, |t| t >> 1 == 20),
+            (&MASK_LANES_12_44, |t| t & 31 == 12),
+            (&MASK_EMPTY, |_| false),
+        ] {
+            for source in [
+                ScalarFirstLane::Code,
+                ScalarFirstLane::Mutable,
+                ScalarFirstLane::Guarded,
+            ] {
+                let n = native(&scalar_first_lane(mask, source), true, threads, 0);
+                let shader =
+                    super::translate_with(&compute_container(&n), scalar_first_lane_options())
+                        .expect("production translation");
+                let (root, pso) = host.compute_pipeline(&shader).expect("compute pipeline");
+                let input = [SCALAR_FIRST_VALUE, 0, 0, 0];
+                let out = host
+                    .dispatch(
+                        &root,
+                        &pso,
+                        &Dispatch {
+                            roots: vec![(
+                                0,
+                                Root::Constants(vec![0; shader.user_data_dwords().max(1) as usize]),
+                            )],
+                            views: &[
+                                View::Texture(1, 1, &[[0.0; 4]]),
+                                View::Buffer {
+                                    data: &input,
+                                    stride: Stride::Structured(16),
+                                },
+                                View::RawUav(threads * 8),
+                            ],
+                            samplers: &[],
+                            groups: [1, 1, 1],
+                        },
+                    )
+                    .expect("dispatch and readback");
+                let mut expected = Vec::new();
+                for t in 0..threads {
+                    let wave_start = t & !63;
+                    let first = (wave_start..(wave_start + 64).min(threads))
+                        .find(|&lane| active(lane))
+                        .unwrap_or(wave_start);
+                    let raw = if matches!(source, ScalarFirstLane::Guarded) && first >> 1 != 20 {
+                        7
+                    } else {
+                        SCALAR_FIRST_VALUE
+                    };
+                    let value = if raw == SCALAR_FIRST_VALUE { raw } else { 8 };
+                    expected.extend([if active(t) { value } else { 0 }, value, raw, 0, 0, 0, 0, 0]);
+                }
+                assert_eq!(
+                    out,
+                    [expected],
+                    "{source:?}, {threads} threads, mask {mask:x?}"
+                );
+                dispatches += 1;
+                checked += threads * 8;
+            }
+        }
+    }
+    eprintln!("{dispatches} hardware dispatches, {checked} checked dwords");
 }
 
 /// Per thread `l` of a group of 128 (two console wave64s), two dwords at

@@ -250,6 +250,8 @@ mod crosslane_tests;
 #[cfg(all(test, windows))]
 mod diff_tests;
 #[cfg(all(test, windows))]
+mod first_lane_bench;
+#[cfg(all(test, windows))]
 mod flow_tests;
 #[cfg(all(test, windows))]
 mod halves_tests;

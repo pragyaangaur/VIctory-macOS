@@ -1561,6 +1561,28 @@ impl Host {
         pso: &ID3D12PipelineState,
         d: &Dispatch,
     ) -> Result<Vec<Vec<u32>>, String> {
+        self.dispatch_with_timing(root, pso, d, false).map(|(out, _)| out)
+    }
+
+    /// Measures command-list submission through fence completion. The list
+    /// includes upload/clear commands and UAV copies. Pipeline creation,
+    /// command-list recording and CPU readback are outside this interval.
+    pub fn dispatch_timed(
+        &self,
+        root: &ID3D12RootSignature,
+        pso: &ID3D12PipelineState,
+        d: &Dispatch,
+    ) -> Result<(Vec<Vec<u32>>, std::time::Duration), String> {
+        self.dispatch_with_timing(root, pso, d, true)
+    }
+
+    fn dispatch_with_timing(
+        &self,
+        root: &ID3D12RootSignature,
+        pso: &ID3D12PipelineState,
+        d: &Dispatch,
+        event_wait: bool,
+    ) -> Result<(Vec<Vec<u32>>, std::time::Duration), String> {
         let _guard = self.lock_warp();
         let dev = &self.device;
         // SAFETY: D3D12 calls with descriptions that outlive them; resources
@@ -2162,10 +2184,16 @@ impl Host {
                 }
             }
             list.Close().map_err(err)?;
-            queue.ExecuteCommandLists(&[Some(list.cast().map_err(err)?)]);
+            let commands = [Some(list.cast().map_err(err)?)];
             let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).map_err(err)?;
-            queue.Signal(&fence, 1).map_err(err)?;
-            wait_done(dev, &fence)?;
+            let completion = if event_wait {
+                submit_and_time(dev, &queue, &commands, &fence)?
+            } else {
+                queue.ExecuteCommandLists(&commands);
+                queue.Signal(&fence, 1).map_err(err)?;
+                wait_done(dev, &fence)?;
+                std::time::Duration::ZERO
+            };
             let mut out = Vec::new();
             for (_, size, n, rb) in &uavs {
                 let mut p = std::ptr::null_mut();
@@ -2190,8 +2218,41 @@ impl Host {
                 out.push(words);
             }
             drop(keep);
-            Ok(out)
+            Ok((out, completion))
         }
+    }
+}
+
+/// Use a fence event for timing rather than yield-polling the fence, which
+/// can add scheduler delays after the GPU has completed.
+#[cfg(test)]
+fn submit_and_time(
+    dev: &ID3D12Device,
+    queue: &ID3D12CommandQueue,
+    commands: &[Option<ID3D12CommandList>],
+    fence: &ID3D12Fence,
+) -> Result<std::time::Duration, String> {
+    use windows::Win32::Foundation::{CloseHandle, WAIT_OBJECT_0};
+    use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
+
+    // SAFETY: the event and command objects live through fence completion.
+    unsafe {
+        let event = CreateEventW(None, false, false, None).map_err(err)?;
+        let result = (|| {
+            fence.SetEventOnCompletion(1, event).map_err(err)?;
+            let start = std::time::Instant::now();
+            queue.ExecuteCommandLists(commands);
+            queue.Signal(fence, 1).map_err(err)?;
+            let wake = WaitForSingleObject(event, GPU_DEADLINE.as_millis() as u32);
+            let duration = start.elapsed();
+            dev.GetDeviceRemovedReason().map_err(err)?;
+            if wake != WAIT_OBJECT_0 || fence.GetCompletedValue() < 1 {
+                return Err(format!("GPU completion wait failed: {wake:?}"));
+            }
+            Ok(duration)
+        })();
+        let _ = CloseHandle(event);
+        result
     }
 }
 

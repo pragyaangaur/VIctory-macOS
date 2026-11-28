@@ -1012,7 +1012,7 @@ pub(super) fn lane_uniform(x: &Parts) -> HashSet<Value> {
     let per_lane = |v: Value| x.res.waterfall.reads.contains(&v);
     // Scalar SSA values the same in every lane of a console wave, proven the
     // same way: a root parameter's dword on entry (a root constant, a user
-    // SGPR), grown by [`SCALAR_ALOP`] over such values in the fixed point.
+    // SGPR), fixed code-table loads, and [`SCALAR_ALOP`] over such values.
     let mut same_s: HashSet<Value> = x.res.params.iter().map(|&(v, _, _)| v).collect();
     // Whether any instruction writes memory a `global_load_dword*` can read
     // (a global, flat, buffer or image store or atomic, or a scalar store,
@@ -1065,6 +1065,33 @@ pub(super) fn lane_uniform(x: &Parts) -> HashSet<Value> {
     // title-memory address, so a root descriptor is not one. Every dword a
     // `global_load_dword*` at that address loads is covered by the table.
     let is_code = |site: Site| matches!(addr_of.get(&site), Some(Address { param: CODE, .. }));
+    // Fixed loads from the private code table are independent of all
+    // title-memory stores. Require the entire load to fit: code_dword's
+    // out-of-range clamping does not establish the console's value.
+    let fixed_code_load = |inst: &Inst, site: Site| {
+        let Fields::Smem {
+            data: Some(Operand::Scalar { code, .. }),
+            ..
+        } = inst.fields
+        else {
+            return false;
+        };
+        let Some(Address {
+            param: CODE,
+            offset,
+            dynamic: None,
+        }) = addr_of.get(&site)
+        else {
+            return false;
+        };
+        offset.is_multiple_of(4)
+            && smem_dwords(inst.name()).is_some_and(|count| {
+                u32::from(code) + count <= u32::from(VCC)
+                    && offset
+                        .checked_add(4 * count)
+                        .is_some_and(|end| end as usize <= x.native.code.len())
+            })
+    };
     let mut tid_aliases: HashSet<Value> = wave_tid.into_iter().collect();
     for block in &p.blocks {
         for inst in &block.insts {
@@ -1317,6 +1344,14 @@ pub(super) fn lane_uniform(x: &Parts) -> HashSet<Value> {
                 // would then happen in one half and not the other.
                 if writes_global && !pure_ok {
                     continue;
+                }
+                // The fixed address needs no input equality. The load still
+                // needs to run together in both halves before its SSA result
+                // can feed the scalar and vector uniformity rules.
+                if st.guards[b][i].is_none() && pure_wave_all[b] && fixed_code_load(inst, (b, i)) {
+                    next_s.extend(inst.writes.iter().filter_map(|&(r, v)| {
+                        matches!(r, Reg::S(code) if code < VCC).then_some(v)
+                    }));
                 }
                 // A whitelisted scalar op over values every lane holds alike
                 // (and constants) writes a scalar every lane holds alike. A

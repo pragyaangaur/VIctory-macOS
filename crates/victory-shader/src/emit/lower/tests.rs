@@ -3902,6 +3902,32 @@ fn a_global_load_from_the_code_table_stays_uniform_with_a_store_present() {
     );
 }
 
+#[test]
+fn a_fixed_code_smem_load_avoids_halves_only_when_the_whole_load_is_in_bounds() {
+    let mut w = vec![0xBE80_1F00]; // s_getpc_b64 s[0:1] (PC = byte 4)
+    w.extend(smem(1, 4, 0, 44, None)); // s_load_dwordx2 s[4:5], s[0:1], 44
+    w.extend([
+        0xBF8C_0000, // s_waitcnt lgkmcnt(0)
+        0x7E02_0205, // v_mov_b32 v1, s5 (the second dword)
+        0x7E0C_0501, // v_readfirstlane_b32 s6, v1
+        0xBF06_8006, // s_cmp_eq_u32 s6, 0
+        0xBF85_0003, // s_cbranch_scc1 to s_endpgm
+        V_LSHLREV_V1_2_V0,
+    ]);
+    w.extend(global_store(0, 1, 2, 0)); // global_store_dword v0, v1, s[2:3], 0
+    w.push(S_ENDPGM);
+    assert_eq!(w.len() * 4, 48, "the scalar load starts at the table");
+    w.extend([0x1111_1111, 0x2222_2222]);
+    let in_bounds = lower_halves(&w).expect("a bounded code-table load lowers");
+    assert_eq!(in_bounds.wave_size, None);
+    assert_eq!(in_bounds.shape.barriers, 0);
+
+    w.pop(); // same starting address, but the second dword falls past the code
+    let out_of_bounds = lower_halves(&w).expect("the existing code-table clamp still lowers");
+    assert_eq!(out_of_bounds.wave_size, Some(32));
+    assert!(out_of_bounds.shape.barriers > 0);
+}
+
 /// Where the shader also stores (here a `global_store_dword`), a
 /// `buffer_load_dword` result is not lane-uniform: the console wave's two
 /// host waves can observe the store to the loaded buffer at different times
