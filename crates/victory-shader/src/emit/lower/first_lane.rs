@@ -6,8 +6,8 @@
 //! needs to cross the halves, where:
 //!
 //! 1. **The value is the same in every lane EXEC has at the read.** Every
-//!    instruction that made it ran under the read's own EXEC value (the same
-//!    SSA value: no EXEC write between them) and computed it from constants
+//!    instruction that made it ran under the read's EXEC, or before the
+//!    `s_and_saveexec_b64` that narrowed it in the same block. It computed it from constants
 //!    and scalar registers alone, by plain VALU operations, so every active
 //!    lane holds the same function of the same scalars. The scalars are
 //!    root parameters and what scalar loads and scalar ALU operations make
@@ -145,6 +145,25 @@ impl Analysis<'_, '_> {
         Some((inst.read(Reg::S(EXEC))?, inst.read(Reg::S(EXEC + 1))?))
     }
 
+    /// The producer ran in every lane the read may select. Match the same
+    /// EXEC pair or a direct narrowing after the producer in its own block.
+    fn producer_covers_exec(&self, producer: (usize, usize), read: (Value, Value)) -> bool {
+        let Some(written_under) = self.exec(self.inst(producer)) else {
+            return false;
+        };
+        if written_under == read {
+            return true;
+        }
+        let Some(&site) = self.def.get(&read.0) else {
+            return false;
+        };
+        if self.def.get(&read.1) != Some(&site) || producer.0 != site.0 || producer.1 >= site.1 {
+            return false;
+        }
+        let narrow = self.inst(site);
+        narrow.name() == "s_and_saveexec_b64" && self.exec(narrow) == Some(written_under)
+    }
+
     fn on_cycle(&self, b: usize) -> bool {
         let blocks = &self.x.p.blocks;
         let mut seen = vec![false; blocks.len()];
@@ -192,7 +211,9 @@ impl Analysis<'_, '_> {
             ]
             .iter()
             .any(|n| name.contains(n));
-        if !plain || self.exec(inst) != Some(exec) || !matches!(f.dst, Some(Operand::Vector { .. }))
+        if !plain
+            || !matches!(f.dst, Some(Operand::Vector { .. }))
+            || !self.producer_covers_exec(at, exec)
         {
             return false;
         }

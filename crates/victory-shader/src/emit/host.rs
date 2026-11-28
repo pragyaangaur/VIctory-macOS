@@ -2162,10 +2162,14 @@ impl Host {
                 }
             }
             list.Close().map_err(err)?;
+            let submitted = std::time::Instant::now();
             queue.ExecuteCommandLists(&[Some(list.cast().map_err(err)?)]);
             let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).map_err(err)?;
             queue.Signal(&fence, 1).map_err(err)?;
             wait_done(dev, &fence)?;
+            if std::env::var_os("VICTORY_NARROW_EXEC_TIMING").is_some() {
+                eprintln!("NARROW_EXEC_SAMPLE_NS {}", submitted.elapsed().as_nanos());
+            }
             let mut out = Vec::new();
             for (_, size, n, rb) in &uavs {
                 let mut p = std::ptr::null_mut();
