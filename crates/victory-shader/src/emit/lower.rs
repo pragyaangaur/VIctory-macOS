@@ -674,6 +674,16 @@ fn smem_dwords(name: &str) -> Option<u32> {
     }
 }
 
+/// A plain scalar load through a root descriptor reads its title address,
+/// unlike a load of the descriptor words from a heap.
+fn scalar_root_load(native: &NativeProgram, address: Address, name: &str) -> bool {
+    smem_dwords(name).is_some()
+        && native
+            .layout
+            .get(address.param)
+            .is_some_and(|p| p.root == RootType::Descriptor)
+}
+
 /// Where a program's constant table starts in its code: where its
 /// instructions end, unless a load at a fixed offset reads below that (then
 /// at `lowest`, the lowest offset any load or descriptor names). The
@@ -723,8 +733,10 @@ impl<'a> Lower<'a> {
             matches!(i.fields, Fields::Image { .. } | Fields::Buffer { .. })
                 && (i.name().contains("store") || i.name().contains("atomic"))
         });
-        let root_memory = x.res.scalar.iter().any(|s| matches!(s.1.param, MEMORY | USER_DATA))
-            || insts().any(|i| i.name().starts_with("image_bvh"));
+        let root_memory = x.res.scalar.iter().any(|&((b, i), a)| {
+            matches!(a.param, MEMORY | USER_DATA)
+                || scalar_root_load(x.native, a, p.blocks[b].insts[i].name())
+        }) || insts().any(|i| i.name().starts_with("image_bvh"));
         let mut console_lanes = false;
         let (mut halves, mut halves_refused) = (false, None);
         let mut alike_cache: Option<HashSet<Value>> = None;
@@ -4790,7 +4802,9 @@ impl<'a> Lower<'a> {
         if let Some(a) = self.scalar.get(&site).copied().filter(|a| a.param == USER_DATA) {
             return self.user_data_smem(inst, a);
         }
-        if let Some(a) = self.scalar.get(&site).copied().filter(|a| a.param == MEMORY) {
+        if let Some(a) = self.scalar.get(&site).copied().filter(|a| {
+            a.param == MEMORY || scalar_root_load(self.x.native, *a, name)
+        }) {
             return self.memory_smem(inst, a);
         }
         let Some(rest) = name.strip_prefix("s_buffer_load_dword") else {
