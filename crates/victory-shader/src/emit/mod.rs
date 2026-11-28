@@ -148,7 +148,9 @@
 //!   reach the next 64 KiB page looks that page up too and reads its
 //!   dwords there through that page's memory, which need not be the first
 //!   page's (added 2026-11-27: through the first page's view they lay past
-//!   its end and read 0). In such a program (and one with root
+//!   its end and read 0). Plain scalar loads through a root descriptor
+//!   (`s_load_dword*`) also read its address through the page table.
+//!   In such a program (and one with root
 //!   parameters past its user SGPRs) root SRVs and UAVs are title memory
 //!   too: no root views; the shader reads their addresses as user data
 //!   (root type [`RootType::Descriptor`] in [`HostShader::user_data`],

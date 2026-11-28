@@ -4802,10 +4802,10 @@ impl<'a> Lower<'a> {
         if let Some(a) = self.scalar.get(&site).copied().filter(|a| a.param == USER_DATA) {
             return self.user_data_smem(inst, a);
         }
-        if let Some(a) = self.scalar.get(&site).copied().filter(|a| {
+        if self.scalar.get(&site).is_some_and(|a| {
             a.param == MEMORY || scalar_root_load(self.x.native, *a, name)
         }) {
-            return self.memory_smem(inst, a);
+            return self.memory_smem(inst);
         }
         let Some(rest) = name.strip_prefix("s_buffer_load_dword") else {
             return self.descriptor_data(inst, site);
@@ -5148,7 +5148,7 @@ impl<'a> Lower<'a> {
     }
 
     /// `s_load_dword*` from title memory at an address the program computes.
-    fn memory_smem(&mut self, inst: &Inst, _a: Address) -> Result<(), Why> {
+    fn memory_smem(&mut self, inst: &Inst) -> Result<(), Why> {
         let Fields::Smem {
             data: Some(Operand::Scalar { code, .. }),
             base: Operand::Scalar { code: base, .. },
@@ -5165,13 +5165,19 @@ impl<'a> Lower<'a> {
             l.i32_of(v)
         };
         let (lo, hi) = (word(self, 0)?, word(self, 1)?);
+        // Scalar memory ignores the low two bits of the base and of each
+        // offset before adding them (RDNA 2 ISA, section 7.2.1).
+        let aligned = self.s.m.i32(!3);
+        let lo = self.s.m.bin(self.cur, Bin::And, lo, aligned);
         // The base's high dword holds address bits 32-47.
         let mask = self.s.m.i32(0xFFFF);
         let hi = self.s.m.bin(self.cur, Bin::And, hi, mask);
         // The immediate is signed (21 bits), the offset register unsigned.
-        let mut extra = vec![(self.s.m.i32(offset as u32), offset < 0)];
+        let mut extra = vec![(self.s.m.i32(offset as u32 & !3), offset < 0)];
         if !matches!(soffset, Operand::Scalar { code: NULL, .. }) {
-            extra.push((self.operand(inst, &soffset)?, false));
+            let offset = self.operand(inst, &soffset)?;
+            let offset = self.s.m.bin(self.cur, Bin::And, offset, aligned);
+            extra.push((offset, false));
         }
         let (mut lo, mut hi) = (lo, hi);
         for (x, negative) in extra {
