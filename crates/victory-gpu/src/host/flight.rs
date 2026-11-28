@@ -2280,6 +2280,141 @@ void main(uint3 id : SV_DispatchThreadID) {
         seg
     }
 
+    #[test]
+    fn sampled_texture_sees_previous_submission_in_sync_mode() {
+        texture_upload_dependency(false, false);
+    }
+
+    #[test]
+    fn sampled_texture_sees_previous_submission_with_prep_ranges() {
+        texture_upload_dependency(true, false);
+    }
+
+    #[test]
+    fn sampled_texture_sees_previous_submission_through_an_alias_with_prep_ranges() {
+        texture_upload_dependency(true, true);
+    }
+
+    fn texture_upload_dependency(prep_ranges: bool, aliased: bool) {
+        use crate::compute::{Param, srv};
+        use windows::Win32::Graphics::Direct3D12::{
+            D3D12_DESCRIPTOR_HEAP_DESC, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+            D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, ID3D12DescriptorHeap,
+        };
+        use windows::core::s;
+
+        let Some(host) = host() else {
+            assert!(
+                std::env::var_os("VICTORY_REQUIRE_GPU_TESTS").is_none(),
+                "D3D12 device required for texture dependency readback"
+            );
+            eprintln!("skipped: no D3D12 device for texture dependency readback");
+            return;
+        };
+        let _mode = if prep_ranges {
+            ModeGuard::with_prep_ranges()
+        } else {
+            ModeGuard::new(false, false)
+        };
+        let (write_address, texture_address, shadow) = if aliased {
+            let (a, b) = crate::watch::tests::twin_views(1);
+            (a, b, crate::shadow::find(a as u64, crate::watch::PAGE as u64).unwrap())
+        } else {
+            let (page, address, shadow) = title_page();
+            (page as usize, address as usize, shadow)
+        };
+        const OLD: u32 = 0x1234_5678;
+        const NEW: u32 = 0xb89a_5522;
+        // SAFETY: the first dword of a new allocation in this test.
+        unsafe { (write_address as *mut u32).write(OLD) };
+
+        let words = [3u32, 0, 0, 0, 4, 0, 4, 1 | 1 << 16, 42, 1, 0, 0x100, 0, 0];
+        let iid = crate::object::guid(
+            0x696442be, 0xa72e, 0x4059, [0xbc, 0x79, 0x5b, 0x5c, 0x98, 0x04, 0x0f, 0xad],
+        );
+        let null = std::ptr::null();
+        let mut texture = null;
+        assert_eq!(
+            crate::resource::create_at_address(
+                null, texture_address as u64, words.as_ptr().cast(), 0, null, &iid, &mut texture,
+            ),
+            S_OK
+        );
+        let native_texture = crate::resource::host_resource(texture).expect("title texture host resource");
+        let (out, mapped) = host.shared_buffer(4).expect("texture shader output");
+        let (root, pso) = crate::compute::pipeline(
+            r#"
+Texture2D<uint> source : register(t0);
+RWByteAddressBuffer output : register(u0);
+[numthreads(1, 1, 1)]
+void main() {
+    output.Store(0, source.Load(int3(0, 0, 0)));
+}
+"#,
+            s!("sample_title_texture"),
+            0,
+            &[Param::Table(&[srv(0, 1)]), Param::Uav { register: 0 }],
+        ).unwrap();
+        // SAFETY: a shader-visible heap with one SRV for the live texture.
+        let heap: ID3D12DescriptorHeap = unsafe {
+            let heap: ID3D12DescriptorHeap = host.device.CreateDescriptorHeap(
+                &D3D12_DESCRIPTOR_HEAP_DESC {
+                    Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                    NumDescriptors: 1,
+                    Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+                    NodeMask: 0,
+                },
+            ).unwrap();
+            host.device.CreateShaderResourceView(
+                &native_texture, None, heap.GetCPUDescriptorHandleForHeapStart(),
+            );
+            heap
+        };
+
+        let (alloc_n, writer) = make_title_list();
+        let (alloc_next, reader) = make_title_list();
+        let q = crate::queue::create_direct_for_test();
+        let writer_host = crate::list::host_list(writer).unwrap();
+        let reader_host = crate::list::host_list(reader).unwrap();
+        let (upload, upload_ptr) = host.upload_buffer(4).expect("write source");
+        // SAFETY: a live upload allocation, and both title lists are open.
+        unsafe {
+            upload_ptr.cast::<u32>().write(NEW);
+            writer_host.list.CopyBufferRegion(
+                &shadow.buffer, shadow.offset(write_address as u64), &upload, 0, 4,
+            );
+            reader_host.list.SetDescriptorHeaps(&[Some(heap.clone())]);
+            reader_host.list.SetComputeRootSignature(&root);
+            reader_host.list.SetComputeRootDescriptorTable(0, heap.GetGPUDescriptorHandleForHeapStart());
+            reader_host.list.SetComputeRootUnorderedAccessView(1, out.GetGPUVirtualAddress());
+            reader_host.list.SetPipelineState(&pso);
+            reader_host.list.Dispatch(1, 1, 1);
+        }
+        shadow.gpu_writes(writer_host, write_address as u64, 4, false);
+        crate::texture::upload(reader_host, texture, &native_texture);
+
+        // Leave flight N unlanded until N+1 is prepared or waits for it.
+        // The host itself can still land N synchronously when it needs to.
+        TEST_PAUSE_LANDING.store(prep_ranges, Ordering::Release);
+        close_title_list(writer);
+        close_title_list(reader);
+        queue_execute(q, &[writer]);
+        let had_flight = host.has_in_flight();
+        queue_execute(q, &[reader]);
+        TEST_PAUSE_LANDING.store(false, Ordering::Release);
+        crate::queue::drain_submit(crate::queue::Why::Present);
+        // SAFETY: both lists have completed, including the GPU write's copy-back.
+        let sampled = unsafe { mapped.cast::<u32>().read() };
+        // SAFETY: this dword belongs to the texture allocation.
+        let title_word = unsafe { (texture_address as *const u32).read() };
+        for object in [writer, reader, alloc_n, alloc_next, q, texture] {
+            crate::object::release_ref(object);
+        }
+        assert_eq!(had_flight, prep_ranges, "submission N was left in flight only in ranges mode");
+        assert_eq!(title_word, NEW, "submission N copied its write back");
+        assert_eq!(sampled, NEW, "submission N+1 sampled the wrong texel");
+    }
+
     /// With `VICTORY_PREP_AHEAD=ranges`, a submission behind a flight whose
     /// shaders write other memory (which goes back when it lands) is
     /// prepared and launched while that one is in the air: two in flight.
