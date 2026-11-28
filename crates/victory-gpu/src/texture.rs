@@ -448,10 +448,8 @@ pub(crate) fn alias_copy(list: &HostList, from: This, to: This) -> bool {
 /// Has `resource`'s host copy brought up to date at the submission that
 /// runs `list`: its staging buffer detiled again if the memory changed, and
 /// then copied into the host texture by the submission's own upload list,
-/// once for all its lists (`crate::bindless::uploads`).
-///
-/// shortcut: a title copy into texture memory recorded in the same
-/// submission shows from the next one on.
+/// once for all its lists (`crate::bindless::uploads`). The submission's
+/// leading title copies run before this texture's staging reads.
 pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) {
     // shortcut: a texture the host copied into keeps the host's contents
     // even if the title later writes its memory too.
