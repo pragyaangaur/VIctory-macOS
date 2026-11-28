@@ -345,8 +345,7 @@ fn registered_physical_aliases_read_back_gpu_and_cpu_writes() {
     let (write_root, write_pipeline) = compute::pipeline(
         "RWByteAddressBuffer b : register(u0);\n\
          [numthreads(1,1,1)] void main() {\n\
-             uint prior = b.Load(0);\n\
-             b.Store(0, (prior & 0xffff00ffu) | 0x00006700u);\n\
+             b.Store(0, 0x19196719u);\n\
           }",
         windows::core::s!("physical alias writer"),
         0,
@@ -370,9 +369,10 @@ fn registered_physical_aliases_read_back_gpu_and_cpu_writes() {
     fill_title(starts[1] + 3, 1, 0xd8);
 
     let (read_root, read_pipeline) = compute::pipeline(
-        "ByteAddressBuffer a : register(t0), b : register(t1);\n\
+        "ByteAddressBuffer a : register(t0);\n\
+         ByteAddressBuffer b : register(t1);\n\
          RWByteAddressBuffer outbuf : register(u0);\n\
-         [numthreads(1,1,1)] void main() { outbuf.Store2(0, uint2(a.Load(0), b.Load(0))); }",
+         [numthreads(1,1,1)] void main() { outbuf.Store(0, a.Load(0)); outbuf.Store(4, b.Load(0)); }",
         windows::core::s!("physical alias reader"),
         0,
         &[
