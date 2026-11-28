@@ -2412,7 +2412,7 @@ impl HostHeap {
         {
             return Some(view);
         }
-        let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
+        let mut made = lock_mirror_slots(&self.made);
         // A second recorder may have replaced the slot while this thread waited.
         // SAFETY: the caller holds the heap alive until the update completes.
         let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
@@ -2472,7 +2472,7 @@ impl HostHeap {
             // binding and writing views wait on (run evict5).
             drop(made);
             prepare(&view);
-            made = self.made.lock().unwrap_or_else(|e| e.into_inner());
+            made = lock_mirror_slots(&self.made);
             // The title may have written another record there meanwhile (and
             // another thread made it): that one is the slot's.
             // SAFETY: as above.
@@ -4108,6 +4108,18 @@ pub(crate) fn raw_views_long() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| crate::under_wine() && !crate::switch::on("VICTORY_RAW_VIEWS_512MIB"))
 }
+
+#[inline]
+fn lock_mirror_slots(made: &Mutex<Vec<u64>>) -> std::sync::MutexGuard<'_, Vec<u64>> {
+    #[cfg(test)]
+    if let Some(guard) = recording_contention::lock(made) {
+        return guard;
+    }
+    made.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+#[cfg(test)]
+mod recording_contention;
 
 #[cfg(test)]
 mod tests {
