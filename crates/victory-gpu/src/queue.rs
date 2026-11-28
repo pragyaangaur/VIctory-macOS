@@ -322,11 +322,65 @@ fn start_held_timer() {
     TIMER.call_once(|| {
         let _ = std::thread::Builder::new()
             .name("victory held work".into())
-            .spawn(|| loop {
-                std::thread::sleep(std::time::Duration::from_millis(2));
-                pump_held_if_free(Why::Timer);
+            .spawn(|| {
+                let tick = HeldTick::new();
+                loop {
+                    tick.wait();
+                    pump_held_if_free(Why::Timer);
+                }
             });
     });
+}
+
+/// The held-work timer's 2 ms tick. `std::thread::sleep` makes a waitable
+/// timer for every call and closes it after (on Windows, a high-resolution
+/// one): under Wine each of those is a wineserver round trip, about 500 a
+/// second, beside the title's own server calls (a profile of the prison
+/// cell on a 24 GB M5 Pro saw `NtCreateTimer` and `NtClose` from this loop
+/// at ~11 ms a frame). One periodic timer made once and waited on does the
+/// same with one wait a tick; `sleep` stays where it cannot be made.
+#[cfg(windows)]
+struct HeldTick(Option<windows_sys::Win32::Foundation::HANDLE>);
+
+#[cfg(windows)]
+impl HeldTick {
+    const MS: u32 = 2;
+
+    fn new() -> Self {
+        use windows_sys::Win32::System::Threading::{
+            CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, CreateWaitableTimerExW, SetWaitableTimer, TIMER_ALL_ACCESS,
+        };
+        let make = |flags| {
+            // SAFETY: no name, default security; the handle is checked.
+            let t = unsafe { CreateWaitableTimerExW(std::ptr::null(), std::ptr::null(), flags, TIMER_ALL_ACCESS) };
+            (!t.is_null()).then_some(t)
+        };
+        let Some(timer) = make(CREATE_WAITABLE_TIMER_HIGH_RESOLUTION).or_else(|| make(0)) else {
+            return Self(None);
+        };
+        // First due in one tick (relative, in 100 ns units), then every tick.
+        let due: i64 = -(i64::from(Self::MS) * 10_000);
+        // SAFETY: a timer handle of ours; no completion routine.
+        let set = unsafe { SetWaitableTimer(timer, &due, Self::MS as i32, None, std::ptr::null(), 0) };
+        if set == 0 {
+            // SAFETY: the handle made above, closed once.
+            unsafe { windows_sys::Win32::Foundation::CloseHandle(timer) };
+            return Self(None);
+        }
+        Self(Some(timer))
+    }
+
+    fn wait(&self) {
+        use windows_sys::Win32::System::Threading::{INFINITE, WaitForSingleObject};
+        match self.0 {
+            // SAFETY: the periodic timer made in `new`, never closed (the
+            // thread runs for the process's life).
+            Some(timer) => unsafe {
+                WaitForSingleObject(timer, INFINITE);
+            },
+            None => std::thread::sleep(std::time::Duration::from_millis(u64::from(Self::MS))),
+        }
+    }
 }
 
 /// Pumps all currently ready segments/signals from `HELD` while holding

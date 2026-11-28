@@ -1,5 +1,6 @@
 //! Repository maintenance. Run with `cargo xtask <command>`.
 
+mod bench_compare;
 mod policy;
 mod wide_stores;
 
@@ -33,6 +34,12 @@ enum Cmd {
         /// The mapped title image in VIctory's cache (`images/victory-image-<hash>.dll`).
         image: PathBuf,
     },
+    /// Compare the A and B runs of `tools/macos/bench-ab.sh`: medians,
+    /// B - A and a bootstrap 95 % interval of it.
+    BenchCompare {
+        /// The folder of `A<n>.json` and `B<n>.json` reports.
+        dir: PathBuf,
+    },
 }
 
 fn main() -> Result<()> {
@@ -40,6 +47,7 @@ fn main() -> Result<()> {
     match Cli::parse().command {
         Cmd::Policy { staged } => policy::run(&root, staged),
         Cmd::WideStores { image } => wide_stores::run(&image),
+        Cmd::BenchCompare { dir } => bench_compare::run(&dir),
         Cmd::InstallHooks => {
             let status = Command::new("git")
                 .args(["config", "core.hooksPath", ".githooks"])

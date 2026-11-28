@@ -475,11 +475,12 @@ pub const ROOT_UAV_VIEW: u32 = 3;
 pub const ROOT_VIEW_OFFSET: u32 = 4;
 /// `RootType::Other` code of a user-data dword the host fills at a dispatch
 /// whose counts are threads, not groups (the console's `DispatchX` with its
-/// thread-dimensions flag): how many threads along x run, the lanes past
-/// that count leaving at once; 0, every lane of every group. Its
-/// [`UserData::dword`] is the group's width. Read only in translations
-/// with [`Options::thread_limits`], by compute programs of one dimension
-/// whose lanes never wait for each other (`Lower::leave_past_the_count`).
+/// thread-dimensions flag): how many threads along x run; 0, every lane of
+/// every group. Its [`UserData::dword`] is the group's width. Read only in
+/// translations with [`Options::thread_limits`], by compute programs of
+/// one dimension: the lanes past the count leave at once where no lane
+/// waits for another (`Lower::leave_past_the_count`), and elsewhere stay,
+/// outside EXEC from the entry on (`structure::structure_limited`).
 /// After DexNom/VIctory bc3cd4b0.
 pub const USER_DISPATCH_THREADS_X: u32 = 0x106;
 
@@ -599,9 +600,11 @@ pub struct Options {
     /// a read across the halves is refused. The translation differs, so
     /// the shader cache keys on it.
     pub halves_rendezvous: bool,
-    /// A compute program of one dimension whose lanes never wait for each
-    /// other reads [`USER_DISPATCH_THREADS_X`]: the lanes past a dispatch's
-    /// count of threads leave at once, as the console never starts them.
+    /// A compute program of one dimension reads
+    /// [`USER_DISPATCH_THREADS_X`]: the console never starts the lanes past
+    /// a dispatch's count of threads. They leave at once where no lane
+    /// waits for another; where lanes wait (a group barrier, 32-lane halves
+    /// passing values) they stay, outside EXEC from the entry on.
     /// The host asks for it only for programs a dispatch counted in threads
     /// ends in a part of a group of (`victory_gpu::pipeline::thread_limited`).
     pub thread_limits: bool,

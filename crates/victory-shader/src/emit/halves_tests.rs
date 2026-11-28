@@ -3766,11 +3766,12 @@ fn thread_limit(l: &lower::Lowered) -> Option<super::UserData> {
     l.user_data.iter().copied().find(|u| u.root == code)
 }
 
-/// Which programs leave the lanes past a dispatch's count of threads:
-/// those of one dimension whose lanes never wait for each other, not in
-/// 32-lane halves that pass values nor in literal halves, and only when the
-/// translation asks for it; the word is past the console's user data and
-/// names the group's width.
+/// Which programs know a dispatch's count of threads: those of one
+/// dimension, only when the translation asks for it; not literal halves.
+/// Where no lane waits for another the lanes past the count leave at the
+/// start; with a group barrier or in 32-lane halves that pass values they
+/// stay, outside EXEC. The word is past the console's user data and names
+/// the group's width.
 #[test]
 fn only_programs_whose_lanes_never_wait_leave_past_a_count_of_threads() {
     let limited = |words: &[u32], wave64, threads, host_wave32| {
@@ -3808,24 +3809,29 @@ fn only_programs_whose_lanes_never_wait_leave_past_a_count_of_threads() {
     });
     let l = lower_halves_limited(&flat, true, true, true, true).unwrap();
     assert_eq!(thread_limit(&l), None, "two dimensions");
-    // s_barrier: lanes that left would never reach it.
-    assert_eq!(
-        limited(&counted_lanes(&[0xBF8A_0000]), false, 64, true),
-        None,
+    // s_barrier: lanes that left would never reach it. They stay, outside
+    // EXEC from the entry on.
+    assert!(
+        limited(&counted_lanes(&[0xBF8A_0000]), false, 64, true).is_some(),
         "a group barrier"
     );
     // v_mbcnt reads console lanes: a wave64 group of 64 runs in halves,
-    // which pass values between them at barriers; one of 32 does not.
+    // which pass values between them at barriers (the lanes stay there
+    // too); one of 32 does not.
     let lanes = counted_lanes(&[0xD765_0003, 0x0001_00C1]);
-    assert_eq!(limited(&lanes, true, 64, true), None, "in halves");
+    assert!(limited(&lanes, true, 64, true).is_some(), "in halves");
     assert!(limited(&lanes, true, 32, true).is_some(), "one host wave");
     assert!(
         limited(&lanes, true, 64, false).is_some(),
         "one host wave64"
     );
-    // A lane read across the halves translates only as literal halves,
-    // whose group must take one path: no word there.
+    // A lane read across the halves, under a guard: in halves, the lanes
+    // stay.
     let n = native(&literal_lane_reads(false), true, 64, 0);
+    let l = lower_halves_limited(&n, true, true, true, true).expect("in halves");
+    assert!(thread_limit(&l).is_some(), "a lane read across the halves");
+    // Literal halves take EXEC as the console wave's whole: no word there.
+    let n = native(&literal_exec_dwords(), true, 64, 0);
     let l = lower_halves_limited(&n, true, true, true, true).expect("literal halves");
     assert_eq!(thread_limit(&l), None, "literal halves");
     let code: Vec<u8> = lanes.iter().flat_map(|w| w.to_le_bytes()).collect();
@@ -3876,10 +3882,22 @@ fn the_lanes_past_a_count_of_threads_do_not_run() {
         },
         View::RawUav(64),
     ];
+    // Plain (the lanes past the count leave at the start), with a group
+    // barrier, and reading console lanes (`v_mbcnt`: in halves where the
+    // host's waves are 32 lanes): in the last two the lanes stay, outside
+    // EXEC.
+    let extras: [(&str, &[u32]); 3] = [
+        ("plain", &[]),
+        ("s_barrier", &[0xBF8A_0000]),
+        ("v_mbcnt", &[0xD765_0003, 0x0001_00C1]),
+    ];
     for (adapter, host) in &hosts {
         let wave32 = host.wave32().unwrap_or(false);
-        for wave64 in [false, true] {
-            let n = native(&counted_lanes(&[]), wave64, 64, 0);
+        for (wave64, (kind, extra)) in [false, true]
+            .into_iter()
+            .flat_map(|w| extras.iter().map(move |e| (w, *e)))
+        {
+            let n = native(&counted_lanes(extra), wave64, 64, 0);
             let l = lower_halves_limited(&n, wave32, wave32, true, true).expect("translates");
             let limit = thread_limit(&l).expect("a word for the count");
             let shader = shader(l);
@@ -3889,7 +3907,7 @@ fn the_lanes_past_a_count_of_threads_do_not_run() {
                 v.validate(&mut shader.dxil.clone())
                     .expect("DXIL validation failed");
             }
-            let label = format!("{adapter} (wave64 {wave64})");
+            let label = format!("{adapter} (wave64 {wave64}, {kind})");
             let Ok((root, pso)) = host.compute_pipeline(&shader) else {
                 panic!("{label}: no pipeline");
             };
@@ -6019,6 +6037,302 @@ fn a_register_index_waterfall_matches_the_console_on_every_gpu() {
                     .into_iter()
                     .map(|m| format!("{threads} threads (mbcnt={with_mbcnt}): {m}")),
             );
+        }
+    }
+    assert!(failed.is_empty(), "{}", failed.join("\n"));
+}
+
+/// A wave64 program in groups of 64 that cannot leave the lanes past a
+/// dispatch's count of threads at the start: it has LDS, a group barrier
+/// and a loop its 32-lane halves run in lockstep. It reads EXEC as the
+/// console's last wave has it, the way GTA VI's structure builder does
+/// (`28918b7150a7aad5`, `caa78b8ca62bc3d6`):
+///
+/// - `s_bcnt1_i32_b64 s26, exec`: how many lanes the wave runs;
+/// - EXEC as two dwords (`s_mov_b64 s[20:21], exec`) and the first lane's
+///   thread id plus 1 (`v_readfirstlane_b32`);
+/// - the compiler's whole-wave sum ([`emit_reduction_body`]) of the thread
+///   id plus 1: under `s_or_saveexec_b64 s[12:13], -1` every lane of the
+///   wave runs, started or not, and `v_cndmask_b32` on the saved EXEC gives
+///   the lanes not started 0;
+/// - each lane writes its thread id plus 1 to its LDS dword, and after
+///   `s_barrier` reads the dword of lane `lane / 2`;
+/// - a `while` loop a lane stays in for `lane & 7` passes, adding the first
+///   lane left in each pass and, atomically, 1 to a counter past the lanes'
+///   dwords.
+///
+/// Each lane stores eight dwords at `(64 group + lane) * 32`: the count,
+/// EXEC's dwords, the first lane, the LDS dword read, the wave's sum, the
+/// loop's sum and its passes.
+fn counted_in_halves() -> Vec<u32> {
+    let mut w = PROLOGUE.to_vec();
+    w.extend([
+        0x3420_0085, // v_lshlrev_b32 v16, 5, v0
+        0x7E1E_0201, // v_mov_b32 v15, s1
+        0x341E_1E8B, // v_lshlrev_b32 v15, 11, v15
+        0x4A20_1F10, // v_add_nc_u32 v16, v16, v15
+        0x4A10_0081, // v_add_nc_u32 v8, 1, v0
+        0x4A06_0081, // v_add_nc_u32 v3, 1, v0
+    ]);
+    emit_reduction_body(&mut w, 0x25, 0x80); // v_add_nc_u32, 0: the sum in s15
+    w.extend([
+        0x7E0E_020F, // v_mov_b32 v7, s15
+        0xBE9A_107E, // s_bcnt1_i32_b64 s26, exec
+        0x7E02_021A, // v_mov_b32 v1, s26
+        0xBE94_047E, // s_mov_b64 s[20:21], exec
+        0x7E04_0214, // v_mov_b32 v2, s20
+        0x7E2C_0215, // v_mov_b32 v22, s21
+        0x7E0C_0508, // v_readfirstlane_b32 s6, v8
+        0x7E08_0206, // v_mov_b32 v4, s6
+        0x340A_0082, // v_lshlrev_b32 v5, 2, v0
+        0xD834_0000,
+        0x0000_0805, // ds_write_b32 v5, v8
+        S_WAITCNT_LGKM,
+        0xBF8A_0000, // s_barrier
+        0x2C12_0081, // v_lshrrev_b32 v9, 1, v0
+        0x3412_1282, // v_lshlrev_b32 v9, 2, v9
+        0xD8D8_0000,
+        0x0A00_0009, // ds_read_b32 v10, v9
+        S_WAITCNT_LGKM,
+        0x7E24_02FF,
+        0x0000_1000, // v_mov_b32 v18, 0x1000
+        0x7E26_0281, // v_mov_b32 v19, 1
+        0x7E18_0280, // v_mov_b32 v12, 0
+        0x7E1A_0280, // v_mov_b32 v13, 0
+        0x361C_0087, // v_and_b32 v14, 7, v0
+        0xBEA4_047E, // s_mov_b64 s[36:37], exec
+        0xBF82_0005, // s_branch (the test)
+        0x7E0C_0500, // v_readfirstlane_b32 s6, v0
+        0x4A1A_1A06, // v_add_nc_u32 v13, s6, v13
+        0x4A18_1881, // v_add_nc_u32 v12, 1, v12
+        0xE0C8_1000,
+        0x800A_1312, // buffer_atomic_add v19, v18, s[40:43], 0 offen
+        0x7D82_1D0C, // v_cmp_lt_u32 vcc, v12, v14
+        0x87FE_6A7E, // s_and_b64 exec, exec, vcc
+        0xBF89_FFF8, // s_cbranch_execnz (the body)
+        0xBEFE_0424, // s_mov_b64 exec, s[36:37]
+    ]);
+    for (vdata, slot) in [
+        (1, 0),
+        (2, 1),
+        (22, 2),
+        (4, 3),
+        (10, 4),
+        (7, 5),
+        (13, 6),
+        (12, 7),
+    ] {
+        w.extend(store(vdata, 4 * slot));
+    }
+    w.push(S_ENDPGM);
+    w
+}
+
+/// [`native`] for [`counted_in_halves`]: 64 threads, the group's x in `s1`
+/// (after the one user-data SGPR), LDS.
+fn native_counted_in_halves() -> NativeProgram {
+    let mut n = native(&counted_in_halves(), true, 64, 512);
+    n.io = StageIo::Cs(ComputeIo {
+        rsrc2: 1 << 1 | 1 << 7 | 1 << 15,
+        threads: [64, 1, 1],
+    });
+    n
+}
+
+#[test]
+fn the_program_counted_in_halves_is_what_its_comments_say() {
+    let words = counted_in_halves();
+    let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+    let text: Vec<String> = gfx10::decode(&code)
+        .expect("decodes")
+        .iter()
+        .map(|i| i.text(true))
+        .collect();
+    let want = [
+        "v_lshlrev_b32 v16, 5, v0",
+        "v_mov_b32 v15, s1",
+        "v_lshlrev_b32 v15, 11, v15",
+        "v_add_nc_u32 v16, v16, v15",
+        "v_add_nc_u32 v8, 1, v0",
+        "v_add_nc_u32 v3, 1, v0",
+        "s_or_saveexec_b64 s[12:13], -1",
+        "v_cndmask_b32 v1, 0, v3, s[12:13]",
+        "v_add_nc_u32 v1, v1, v1 ",
+        "v_add_nc_u32 v1, v1, v1 ",
+        "v_add_nc_u32 v1, v1, v1 ",
+        "v_add_nc_u32 v1, v1, v1 ",
+        "v_permlanex16_b32 v2, v1, 0, 0",
+        "v_add_nc_u32 v1, v2, v1",
+        "v_readlane_b32 s14, v1, 32",
+        "v_add_nc_u32 v1, s14, v1",
+        "v_readlane_b32 s15, v1, 0",
+        "s_mov_b64 exec, s[12:13]",
+        "v_mov_b32 v7, s15",
+        "s_bcnt1_i32_b64 s26, exec",
+        "v_mov_b32 v1, s26",
+        "s_mov_b64 s[20:21], exec",
+        "v_mov_b32 v2, s20",
+        "v_mov_b32 v22, s21",
+        "v_readfirstlane_b32 s6, v8",
+        "v_mov_b32 v4, s6",
+        "v_lshlrev_b32 v5, 2, v0",
+        "ds_write_b32 v5, v8",
+        "s_waitcnt lgkmcnt(0)",
+        "s_barrier",
+        "v_lshrrev_b32 v9, 1, v0",
+        "v_lshlrev_b32 v9, 2, v9",
+        "ds_read_b32 v10, v9",
+        "s_waitcnt lgkmcnt(0)",
+        "v_mov_b32 v18, lit(0x00001000)",
+        "v_mov_b32 v19, 1",
+        "v_mov_b32 v12, 0",
+        "v_mov_b32 v13, 0",
+        "v_and_b32 v14, 7, v0",
+        "s_mov_b64 s[36:37], exec",
+        "s_branch",
+        "v_readfirstlane_b32 s6, v0",
+        "v_add_nc_u32 v13, s6, v13",
+        "v_add_nc_u32 v12, 1, v12",
+        "buffer_atomic_add v19, v18, s[40:43], 0 offen",
+        "v_cmp_lt_u32 vcc, v12, v14",
+        "s_and_b64 exec, exec, vcc",
+        "s_cbranch_execnz",
+        "s_mov_b64 exec, s[36:37]",
+    ];
+    // The prologue's five words are four instructions.
+    for (n, want) in want.iter().enumerate() {
+        let got = &text[PROLOGUE.len() - 1 + n];
+        assert!(got.starts_with(want), "{n}: {got:?}, not {want:?}");
+    }
+}
+
+/// What the console stores for [`counted_in_halves`] in a dispatch of
+/// `count` threads (0: every lane of `groups` groups): eight dwords per
+/// lane, and the counter of the loop's passes.
+#[cfg(windows)]
+fn console_counted_in_halves(count: u32, groups: u32) -> (Vec<[u32; 8]>, u32) {
+    let runs = |g: u32, t: u32| count == 0 || 64 * g + t < count;
+    let mut passes = 0;
+    let lanes = (0..groups)
+        .flat_map(|g| (0..64).map(move |t| (g, t)))
+        .map(|(g, t)| {
+            if !runs(g, t) {
+                return [0; 8];
+            }
+            let live: Vec<u32> = (0..64).filter(|&l| runs(g, l)).collect();
+            let mask = live.iter().fold(0u64, |m, &l| m | 1 << l);
+            let stays = t & 7;
+            passes += stays;
+            // The first lane still in the loop in each pass.
+            let sum = (0..stays)
+                .map(|pass| *live.iter().find(|&&l| l & 7 > pass).expect("this one"))
+                .sum();
+            [
+                live.len() as u32,
+                mask as u32,
+                (mask >> 32) as u32,
+                live[0] + 1,
+                t / 2 + 1,
+                live.iter().map(|l| l + 1).sum(),
+                sum,
+                stays,
+            ]
+        })
+        .collect();
+    (lanes, passes)
+}
+
+/// The program gets the word for a dispatch's count of threads, in halves.
+#[test]
+fn a_program_with_barriers_keeps_the_lanes_past_a_count_out_of_exec() {
+    let n = native_counted_in_halves();
+    let l = lower_halves_limited(&n, true, true, true, true).expect("translates");
+    assert!(thread_limit(&l).is_some(), "a word for the count");
+    assert_eq!(l.wave_size, Some(32));
+    // Not asked for, there is none.
+    let l = lower_halves_limited(&n, true, true, true, false).expect("translates");
+    assert!(thread_limit(&l).is_none());
+}
+
+/// A dispatch counted in threads that ends in a part of a group, in a
+/// program whose lanes wait for each other: the lanes past the count are
+/// outside EXEC from the entry on, as in the console's last wave. The
+/// lanes that run store what the console's do (its count of lanes, EXEC,
+/// first lanes, LDS, the whole-wave sum over the lanes started, the loop's
+/// sum and passes), the others store nothing, and the loop's passes are
+/// counted for the lanes that run only.
+#[cfg(windows)]
+#[test]
+fn lanes_past_a_count_stay_out_of_exec_in_halves_on_every_gpu() {
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let hosts = Host::each_hardware();
+    if hosts.is_empty() {
+        eprintln!("no SM 6.6 hardware device; skipped");
+        return;
+    }
+    const GROUPS: u32 = 2;
+    let views = [
+        View::Texture(1, 1, &[[0.0; 4]]),
+        View::Buffer {
+            data: &[0; 4],
+            stride: Stride::Structured(16),
+        },
+        View::RawUav(GROUPS * 64 * 8 + 1),
+    ];
+    let mut failed = Vec::new();
+    for (adapter, host) in &hosts {
+        let wave32 = host.wave32().unwrap_or(false);
+        let n = native_counted_in_halves();
+        let l = lower_halves_limited(&n, wave32, wave32, true, true).expect("translates");
+        let limit = thread_limit(&l).expect("a word for the count");
+        let shader = shader(l);
+        if let Ok(mut v) =
+            validator::Validator::load(validator::Validator::default_path().as_deref())
+        {
+            v.validate(&mut shader.dxil.clone())
+                .expect("DXIL validation failed");
+        }
+        let Ok((root, pso)) = host.compute_pipeline(&shader) else {
+            panic!("{adapter}: no pipeline");
+        };
+        for count in [
+            0u32, 1, 2, 7, 12, 31, 32, 33, 40, 63, 64, 65, 74, 96, 127, 128,
+        ] {
+            let mut ud = vec![0; shader.user_data_dwords() as usize];
+            ud[limit.index as usize] = count;
+            let out = host
+                .dispatch(
+                    &root,
+                    &pso,
+                    &Dispatch {
+                        roots: vec![(0, Root::Constants(ud))],
+                        views: &views,
+                        samplers: &[],
+                        groups: [GROUPS, 1, 1],
+                    },
+                )
+                .unwrap_or_else(|e| panic!("{adapter}: dispatch failed: {e}"));
+            let (want, passes) = console_counted_in_halves(count, GROUPS);
+            let mut wrong = 0;
+            for (t, want) in want.iter().enumerate() {
+                let got = &out[0][t * 8..t * 8 + 8];
+                if got != want {
+                    wrong += 1;
+                    failed.push(format!(
+                        "{adapter}: count {count}: lane {t}: {got:?}, the console {want:?}"
+                    ));
+                }
+            }
+            let counted = out[0][want.len() * 8];
+            if counted != passes {
+                wrong += 1;
+                failed.push(format!(
+                    "{adapter}: count {count}: {counted} passes counted, the console {passes}"
+                ));
+            }
+            eprintln!("{adapter}: count {count}: {wrong} differ from the console");
         }
     }
     assert!(failed.is_empty(), "{}", failed.join("\n"));

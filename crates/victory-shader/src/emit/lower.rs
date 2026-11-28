@@ -401,6 +401,8 @@ struct Lower<'a> {
     loop_act_phis: Vec<(V, usize, usize)>,
     /// [`Lower::relabelled_flat`], once made.
     relabelled: Option<V>,
+    /// [`Lower::dispatched`], once made.
+    dispatched: Option<V>,
     /// Lower non-provoking per-vertex pixel reads (P10/P20) to zero and
     /// hardware-interpolate float P0 at pixel center (`Options::per_vertex_center`).
     per_vertex_center: bool,
@@ -956,6 +958,7 @@ impl<'a> Lower<'a> {
             loop_outer_active: Map::default(),
             loop_act_phis: Vec::new(),
             relabelled: None,
+            dispatched: None,
             per_vertex_center,
             group_scalars,
             cap_escaped,
@@ -1588,7 +1591,10 @@ impl<'a> Lower<'a> {
     fn run(mut self, limits: bool) -> Result<Lowered, Stop> {
         let p = self.x.p;
         self.halves_only = self.places_read_as_halves();
-        if limits && self.can_leave_past_a_count() {
+        if self.x.st.limited {
+            // The word for the count, whatever the program reads of EXEC.
+            self.dispatched();
+        } else if limits && self.can_leave_past_a_count() {
             self.leave_past_the_count();
         }
         let order = crate::ir::reverse_postorder(&p.blocks);
@@ -3290,6 +3296,7 @@ impl<'a> Lower<'a> {
             }
             Atom::Opaque(_) => Err("an opaque lane mask"),
             Atom::Constant(_) => Err("a constant lane mask"),
+            Atom::Dispatched => Ok(self.dispatched()),
         }
     }
 
@@ -11477,7 +11484,7 @@ impl<'a> Lower<'a> {
                     }
                     None
                 }
-                Atom::Constant(_) => None,
+                Atom::Constant(_) | Atom::Dispatched => None,
             };
             if v.is_some_and(|v| tainted.contains(&v)) {
                 return true;
