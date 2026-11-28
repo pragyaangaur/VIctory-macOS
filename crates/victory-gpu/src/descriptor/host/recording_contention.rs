@@ -45,8 +45,6 @@ fn benchmark_recording_contention() {
     let raw = [39, 1, 0x1688, 0, 0, 0, 4, 0, 1, 0];
     let resources = [(); 2].map(|()| crate::resource::test_buffer(256));
     let records = resources.map(|resource| {
-        let (address, len) = crate::resource::buffer_bytes(resource).expect("title buffer bytes");
-        crate::shadow::register(resource as usize, address as u64, len);
         let mut record = [0u32; 4];
         crate::descriptor::create_srv(std::ptr::null(), resource, &raw, record.as_mut_ptr() as u64);
         assert_eq!(record[0], VIEW_TAG);
@@ -72,20 +70,28 @@ fn benchmark_recording_contention() {
                         threads.push(scope.spawn(move || {
                             WAIT.set(probe.then(Wait::default));
                             let start = if shared { 0 } else { worker * BATCH };
+                            let mut missed = 0;
                             for _ in 0..WAVES {
                                 ready.wait();
                                 for index in start..start + BATCH {
-                                    assert!(heap.mirror(index, handle(index), true).is_some());
+                                    missed += usize::from(
+                                        heap.mirror(index, handle(index), true).is_none(),
+                                    );
                                 }
                                 completed.wait();
                             }
-                            WAIT.take().unwrap_or_default()
+                            (WAIT.take().unwrap_or_default(), missed)
                         }));
                     }
                     let started = Instant::now();
+                    let mut wrong_key = 0;
                     for wave in 0..WAVES {
+                        let record = records[if changing {
+                            (wave + 1) % records.len()
+                        } else {
+                            0
+                        }];
                         if changing {
-                            let record = records[(wave + 1) % records.len()];
                             for index in 0..count {
                                 // The workers access the records only between these barriers.
                                 // SAFETY: the volatile write stays in the owned slot storage.
@@ -94,17 +100,31 @@ fn benchmark_recording_contention() {
                         }
                         ready.wait();
                         completed.wait();
+                        if sample == 0 {
+                            let key = u64::from(record[2]) << 32 | u64::from(record[1]);
+                            wrong_key += heap
+                                .ready
+                                .iter()
+                                .take(count as usize)
+                                .filter(|slot| slot.load(Ordering::Acquire) != key)
+                                .count();
+                        }
                     }
                     let elapsed = started.elapsed();
                     let wait = threads
                         .into_iter()
                         .fold(Wait::default(), |mut total, worker| {
-                            let wait = worker.join().expect("recorder thread");
+                            let (wait, missed) = worker.join().expect("recorder thread");
+                            assert_eq!(missed, 0, "all records resolve during the sample");
                             total.acquisitions += wait.acquisitions;
                             total.blocked += wait.blocked;
                             total.blocked_ns += wait.blocked_ns;
                             total
                         });
+                    assert_eq!(
+                        wrong_key, 0,
+                        "every warm-up wave publishes its own exact view key"
+                    );
                     (elapsed, wait)
                 });
                 let (elapsed, wait) = workers_done;
@@ -128,6 +148,6 @@ fn benchmark_recording_contention() {
         }
     }
     resources.into_iter().for_each(|resource| {
-        crate::object::release(resource);
+        crate::object::release_ref(resource);
     });
 }
