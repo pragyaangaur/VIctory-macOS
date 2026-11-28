@@ -25,6 +25,8 @@ extern "system" fn create_device(
     victory_gpu::on_failure(host_gpu_failed);
     #[cfg(windows)]
     victory_gpu::on_physical_runs(super::xmem::physical_runs);
+    #[cfg(all(windows, feature = "diagnostics"))]
+    victory_gpu::on_physical_copy_extents(super::xmem::physical_copy_extents);
     #[cfg(windows)]
     victory_gpu::on_physical_tiles(super::xmem::physical_tiles);
     device::create(adapter, parameters, iid, out)

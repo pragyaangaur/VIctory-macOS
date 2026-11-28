@@ -796,6 +796,39 @@ pub(crate) fn physical_runs(at: usize, len: usize) -> Option<(usize, usize, usiz
     (pages > 0).then_some((pages, runs, sections.len()))
 }
 
+/// Takes one mapping snapshot for all live shadows in the copy census.
+/// The caller holds no GPU-side locks across this lookup.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn physical_copy_extents(
+    ranges: &[(usize, usize)],
+    out: &mut Vec<victory_gpu::PhysicalCopyExtent>,
+) {
+    let physical = physical();
+    out.clear();
+    for &(start, len) in ranges {
+        if len == 0 {
+            continue;
+        }
+        let end = start.saturating_add(len);
+        let first = physical
+            .views
+            .range(..=start)
+            .next_back()
+            .filter(|(base, (size, _))| start < *base + size)
+            .map_or(start, |(&base, _)| base);
+        for (&base, (size, slice)) in physical.views.range(first..end) {
+            let from = start.max(base);
+            let to = end.min(base + size);
+            out.push(victory_gpu::PhysicalCopyExtent {
+                address: from,
+                len: to - from,
+                section: Arc::as_ptr(&slice.section) as usize,
+                offset: slice.index * PAGE + (from - base),
+            });
+        }
+    }
+}
+
 /// The tiles showing title memory `[at, at + len)` (page aligned), one a
 /// page, for the GPU side's copies reading them in place
 /// (`victory_gpu::on_physical_tiles`): `None` where a page shows no section
@@ -2081,6 +2114,57 @@ mod tests {
         // Not physical memory.
         let plain = XMemVirtualAlloc(std::ptr::null_mut(), PAGE, MEM_RESERVE | MEM_COMMIT, 0, PAGE_READWRITE);
         assert_eq!(physical_runs(plain as usize, PAGE), None);
+    }
+
+    #[cfg(feature = "diagnostics")]
+    #[test]
+    fn copy_extents_follow_physical_aliases_and_remapping() {
+        let pages = allocate(3);
+        let reserve = || {
+            let at = XMemVirtualAlloc(
+                std::ptr::null_mut(),
+                3 * PAGE,
+                MEM_RESERVE | PAGES_64K,
+                0,
+                PAGE_READWRITE,
+            );
+            assert!(!at.is_null());
+            at
+        };
+        let a = reserve();
+        let b = reserve();
+        assert_eq!(XMemMapPhysicalPages(a, 3, pages.as_ptr()), a);
+        let nonconsecutive = [pages[1], pages[0]];
+        assert_eq!(XMemMapPhysicalPages(b, 2, nonconsecutive.as_ptr()), b);
+        let (a, b) = (a as usize, b as usize);
+        let ranges = [(a + PAGE + 7, 24), (b + 7, 24), (b + PAGE - 7, 15)];
+        let mut extents = Vec::new();
+        physical_copy_extents(&ranges, &mut extents);
+        let [a_first, b_first, b_tail, b_next] = extents.as_slice() else {
+            panic!("expected two aliases and a split range: {extents:?}");
+        };
+        assert_eq!(a_first.address, a + PAGE + 7);
+        assert_eq!(a_first.section, b_first.section);
+        assert_eq!((a_first.offset, a_first.len), (b_first.offset, b_first.len));
+        assert_eq!((b_tail.address, b_tail.len), (b + PAGE - 7, 7));
+        assert_eq!((b_next.address, b_next.len), (b + PAGE, 8));
+        assert_eq!(b_next.offset + PAGE + 7, a_first.offset);
+
+        let b = b as *mut c_void;
+        assert_eq!(XMemMapPhysicalPages(b, 1, &pages[2]), b);
+        physical_copy_extents(&ranges[..2], &mut extents);
+        assert_eq!(extents[0].offset + PAGE, extents[1].offset);
+        assert_eq!(XMemMapPhysicalPages(b, 2, std::ptr::null()), b);
+        physical_copy_extents(&ranges, &mut extents);
+        assert_eq!(extents.len(), 1);
+        let a = a as *mut c_void;
+        assert_eq!(XMemMapPhysicalPages(a, 3, std::ptr::null()), a);
+        assert_eq!(XMemFreePhysicalPages(3, pages.as_ptr()), 1);
+        // SAFETY: these are the fixture's unmapped placeholder reservations.
+        unsafe {
+            VirtualFree(a, 0, MEM_RELEASE);
+            VirtualFree(b, 0, MEM_RELEASE);
+        }
     }
 
     #[test]
