@@ -890,6 +890,15 @@ impl Program {
                     }),
                 },
             }]);
+            // The draws read the results as a shader resource: from what
+            // the pass left (promoted from common) to what they read, so a
+            // host (D3DMetal) orders the draws after the pass. A barrier of
+            // unordered access alone left them racing on an M2 Ultra.
+            l.ResourceBarrier(&[transition(
+                &self.results.0,
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE,
+            )]);
         }
     }
 
