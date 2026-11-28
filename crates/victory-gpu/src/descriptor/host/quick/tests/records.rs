@@ -87,7 +87,7 @@ fn metadata_pipeline() -> HostPipeline {
     .expect("lower descriptor addresses and record counts");
     assert!(host.view_addresses);
     let shader = Shader::for_test(
-        "descriptor record counts",
+        "compute",
         Translated {
             host,
             used: native.used,
@@ -96,7 +96,10 @@ fn metadata_pipeline() -> HostPipeline {
             threads: None,
         },
     );
-    HostPipeline::new(&[shader], None, |_, _| {}).expect("metadata compute pipeline")
+    HostPipeline::new(&[shader], None, |reason, code| {
+        panic!("metadata pipeline: {reason} ({code:?})")
+    })
+    .expect("metadata compute pipeline")
 }
 
 #[test]
