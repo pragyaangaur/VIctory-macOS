@@ -149,6 +149,20 @@ fn lowered_with(
     lower_halves(native, host_wave32, narrow_waves, false)
 }
 
+std::thread_local! {
+    /// `emit::Options::halves_first_meet` for the programs this thread
+    /// lowers in halves ([`with_first_meet`]).
+    static FIRST_MEET: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Runs `f` with first-lane reads meeting between the halves.
+fn with_first_meet<R>(f: impl FnOnce() -> R) -> R {
+    FIRST_MEET.with(|m| m.set(true));
+    let r = f();
+    FIRST_MEET.with(|m| m.set(false));
+    r
+}
+
 fn lower_halves(
     native: &NativeProgram,
     host_wave32: bool,
@@ -175,25 +189,26 @@ fn lower_halves_limited(
     let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("track");
     let io = io::raise(&p, native).expect("io::raise");
     let parts = lower::Parts {
-            native,
-            p: &p,
-            st: &st,
-            io: &io,
-            res: &res,
-            inputs: Vec::new(),
-            outputs: Vec::new(),
-            prims: Vec::new(),
-            mesh_stride: 0,
-            view_marks: false,
-            atomic_locks: false,
-            atomic_lock_rounds: false,
-            atomic_umax: false,
-            racy_minmax: false,
-            bias_as_gradients: false,
-            narrow_waves,
-            uav_size_level0: false,
-            halves_rendezvous: true,
-            host_wave32,
+        native,
+        p: &p,
+        st: &st,
+        io: &io,
+        res: &res,
+        inputs: Vec::new(),
+        outputs: Vec::new(),
+        prims: Vec::new(),
+        mesh_stride: 0,
+        view_marks: false,
+        atomic_locks: false,
+        atomic_lock_rounds: false,
+        atomic_umax: false,
+        racy_minmax: false,
+        bias_as_gradients: false,
+        narrow_waves,
+        uav_size_level0: false,
+        halves_rendezvous: true,
+        halves_first_meet: FIRST_MEET.with(std::cell::Cell::get),
+        host_wave32,
     };
     let threads = match &native.io {
         StageIo::Cs(cs) => cs.threads.iter().product::<u32>(),
@@ -3076,6 +3091,7 @@ fn thread_ticket_relabels_2d_and_partial_tail_groups_bijectively() {
         super::with_thread_ticket(ticket, || {
             lower::lower(&lower::Parts {
                 halves_rendezvous: false,
+                halves_first_meet: false,
                 native: prog,
                 p: &p,
                 st: &st,
@@ -3179,7 +3195,7 @@ fn check_ticket_dispatches(with_ticket: lower::Lowered, lowered_40: lower::Lower
 /// Which lanes take a divergent branch: the even ones
 /// (`v_and_b32 v3, 1, v0; v_cmp_eq_u32 vcc, 0, v3`), or those below a
 /// thread id (`v_cmp_gt_u32 vcc, n, v0`).
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 enum Side {
     Even,
     Below(u32),
@@ -3438,6 +3454,7 @@ fn lane_masks_in_divergent_code_meet_between_halves() {
         bias_as_gradients: false,
         narrow_waves: false,
         halves_rendezvous: false,
+        halves_first_meet: false,
         host_wave32: true,
     });
     let why = off.err().map(|e| e.to_string()).unwrap_or_else(|| "translated".into());
@@ -3747,6 +3764,138 @@ fn the_readfirstlane_branch_programs_are_what_their_comments_say() {
             assert!(all.contains(want), "{want:?} not in:\n{all}");
         }
     }
+}
+
+/// Lanes of an `if` by thread id: `v_cmp_gt_u32 vcc, n, v0` (below `n`)
+/// or `v_cmp_lt_u32 vcc, n, v0` (above `n`).
+#[derive(Clone, Copy, Debug)]
+enum Arm {
+    Below(u32),
+    Above(u32),
+}
+
+impl Arm {
+    fn words(self) -> [u32; 2] {
+        match self {
+            Arm::Below(n) => [0x7D88_00FF, n],
+            Arm::Above(n) => [0x7D82_00FF, n],
+        }
+    }
+
+    fn takes(self, l: u32) -> bool {
+        match self {
+            Arm::Below(n) => l < n,
+            Arm::Above(n) => l > n,
+        }
+    }
+}
+
+/// The first console wave (threads below 64: a `s_cbranch_vccnz` the same
+/// per lane and per console wave) runs a loop of three passes whose latch is an unconditional
+/// `s_branch` (capped by lowering, so the blocks beside the loop are not in
+/// step); the others run `if (arm) { v_readfirstlane_b32 s12, v4 }` with
+/// `v4` = `v0 + 7`, into `v1`; `v1` is -1 elsewhere.
+fn first_beside_a_capped_loop(arm: Arm) -> Vec<u32> {
+    let mut beside = arm.words().to_vec();
+    beside.extend([
+        S_AND_SAVEEXEC_S20_VCC,
+        s_cbranch_execz(2),
+        0x7E18_0504, // v_readfirstlane_b32 s12, v4
+        0x7E02_020C, // v_mov_b32 v1, s12
+        S_MOV_EXEC_S20,
+    ]);
+    let mut w = PROLOGUE.to_vec();
+    w.extend([
+        0x3420_0085, // v_lshlrev_b32 v16, 5, v0
+        0x4A08_0087, // v_add_nc_u32 v4, 7, v0
+        0x7E02_02C1, // v_mov_b32 v1, -1
+        0x7D88_00FF,
+        64,                                      // v_cmp_gt_u32 vcc, 64, v0
+        0xBF87_0001,                             // s_cbranch_vccnz -> the loop
+        0xBF82_0005,                             // s_branch -> beside it
+        0xBE95_0380,                             // s_mov_b32 s21, 0
+        0x8015_8115,                             // s_add_u32 s21, s21, 1
+        0xBF06_8315,                             // s_cmp_eq_u32 s21, 3
+        0xBF85_0000 | (1 + beside.len() as u32), // s_cbranch_scc1 -> the join
+        0xBF82_FFFC, // s_branch -> the loop's header (unconditional back edge)
+    ]);
+    w.extend(beside);
+    w.extend(store(1, 0));
+    w.push(S_ENDPGM);
+    w
+}
+
+/// The console's `v1` of [`first_beside_a_capped_loop`] in lane `l`.
+fn console_first_beside(l: u32, threads: u32, arm: Arm) -> u32 {
+    let wave = l & !63;
+    let end = (wave + 64).min(threads);
+    if wave == 0 || !arm.takes(l) {
+        return u32::MAX;
+    }
+    (wave..end)
+        .find(|&t| arm.takes(t))
+        .map_or(u32::MAX, |t| t + 7)
+}
+
+/// A first-lane read beside a capped loop, where no group barrier can go:
+/// refused without `halves_first_meet`; with it, the halves meet
+/// (`lower::meet`) and every lane gets the console's value: a first lane
+/// in the lower half, only in the upper one (the lower half meets no one
+/// there), in both, in a console wave with no upper half (96 threads).
+#[test]
+fn first_lane_reads_in_divergent_code_meet_between_halves() {
+    let arms = [
+        Arm::Below(80),
+        Arm::Above(111),
+        Arm::Above(70),
+        Arm::Below(200),
+        Arm::Above(160),
+    ];
+    let mut failed = Vec::new();
+    let mut refused = 0;
+    for arm in arms {
+        let words = first_beside_a_capped_loop(arm);
+        for threads in [96u32, 128, 256] {
+            let n = native(&words, true, threads, 0);
+            let off = lowered(&n, true)
+                .err()
+                .map(|e| e.to_string())
+                .unwrap_or_else(|| "translated".into());
+            if off.contains(super::lower::halves_first_across()) {
+                refused += 1;
+            }
+            let on = match with_first_meet(|| lowered(&n, true)) {
+                Ok(l) => l,
+                Err(e) => {
+                    failed.push(format!(
+                        "{arm:?} {threads}: refused with first meets: {e} (without: {off})"
+                    ));
+                    continue;
+                }
+            };
+            assert_eq!(on.wave_size, Some(32));
+            if let Ok(mut v) =
+                validator::Validator::load(validator::Validator::default_path().as_deref())
+            {
+                v.validate(&mut on.dxil.clone())
+                    .expect("DXIL validation failed");
+            }
+            #[cfg(windows)]
+            {
+                let want: Vec<u32> = (0..threads)
+                    .map(|l| console_first_beside(l, threads, arm))
+                    .collect();
+                for msg in with_first_meet(|| differences(&words, threads, 1, &want)) {
+                    failed.push(format!("{arm:?} {threads}: {msg}"));
+                }
+            }
+        }
+    }
+    assert!(failed.is_empty(), "{}", failed.join("\n"));
+    assert!(
+        refused > 0,
+        "no case is refused without first meets: the test does not reach them"
+    );
 }
 
 #[test]

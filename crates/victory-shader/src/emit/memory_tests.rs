@@ -125,6 +125,7 @@ fn typed_store_program(soffset: u8) -> Result<HostShader, crate::ShaderError> {
     let io = io::raise(&p, &native).expect("io::raise");
     let lowered = lower::lower(&lower::Parts {
         halves_rendezvous: false,
+        halves_first_meet: false,
         native: &native,
         p: &p,
         st: &st,
@@ -297,6 +298,7 @@ fn program() -> HostShader {
     let io = io::raise(&p, &native).expect("io::raise");
     let l = lower::lower(&lower::Parts {
         halves_rendezvous: false,
+        halves_first_meet: false,
         native: &native,
         p: &p,
         st: &st,
@@ -510,6 +512,7 @@ fn four_dwords_at_a_pointer() -> HostShader {
     let io = io::raise(&p, &native).expect("io::raise");
     let l = lower::lower(&lower::Parts {
         halves_rendezvous: false,
+        halves_first_meet: false,
         native: &native,
         p: &p,
         st: &st,
@@ -788,6 +791,7 @@ fn root_views_read_their_copy_and_zeros_past_it() {
         let io = io::raise(&p, native).expect("io::raise");
         lower::lower(&lower::Parts {
             halves_rendezvous: false,
+            halves_first_meet: false,
             native,
             p: &p,
             st: &st,
@@ -951,6 +955,7 @@ fn writes_through_views_mark_their_pages() {
     let io = io::raise(&p, &native).expect("io::raise");
     let l = lower::lower(&lower::Parts {
         halves_rendezvous: false,
+        halves_first_meet: false,
         native: &native,
         p: &p,
         st: &st,
@@ -1198,6 +1203,7 @@ fn heap_direct_texture_reads_mark_their_heap_index() {
         let io = io::raise(&p, &native).expect("io::raise");
         lower::lower(&lower::Parts {
             halves_rendezvous: false,
+            halves_first_meet: false,
             native: &native,
             p: &p,
             st: &st,
@@ -1334,6 +1340,7 @@ fn straddling_writes_across_256mib_and_4gib_boundaries_mark_exact_pages() {
     let io = io::raise(&p, &native).expect("io::raise");
     let l = lower::lower(&lower::Parts {
         halves_rendezvous: false,
+        halves_first_meet: false,
         native: &native,
         p: &p,
         st: &st,
@@ -1519,6 +1526,7 @@ fn early_depth_stencil_skips_occluded_read_mark_pixel_shaders() {
     let vio = io::raise(&vp, &vs_native).expect("vs io");
     let vs_lowered = lower::lower(&lower::Parts {
         halves_rendezvous: false,
+        halves_first_meet: false,
         native: &vs_native,
         p: &vp,
         st: &vst,
@@ -1622,6 +1630,7 @@ fn early_depth_stencil_skips_occluded_read_mark_pixel_shaders() {
     let pio = io::raise(&pp, &ps_native).expect("ps io");
     let ps_lowered = lower::lower(&lower::Parts {
         halves_rendezvous: false,
+        halves_first_meet: false,
         native: &ps_native,
         p: &pp,
         st: &pst,
@@ -2123,6 +2132,7 @@ fn lower_test_cs(native: &NativeProgram, view_marks: bool) -> (lower::Lowered, H
     let io = io::raise(&p, native).expect("io::raise");
     let l = lower::lower(&lower::Parts {
         halves_rendezvous: false,
+        halves_first_meet: false,
         native,
         p: &p,
         st: &st,
@@ -2572,6 +2582,7 @@ fn wave_coalesced_pixel_marks_handle_partial_quads_and_all_helper_waves() {
     let vio = io::raise(&vp, &vs_native).expect("vs io");
     let vs_lowered = lower::lower(&lower::Parts {
         halves_rendezvous: false,
+        halves_first_meet: false,
         native: &vs_native,
         p: &vp,
         st: &vst,
@@ -2707,6 +2718,7 @@ fn wave_coalesced_pixel_marks_handle_partial_quads_and_all_helper_waves() {
     let pio = io::raise(&pp, &ps_native).expect("ps io");
     let ps_lowered = lower::lower(&lower::Parts {
         halves_rendezvous: false,
+        halves_first_meet: false,
         native: &ps_native,
         p: &pp,
         st: &pst,

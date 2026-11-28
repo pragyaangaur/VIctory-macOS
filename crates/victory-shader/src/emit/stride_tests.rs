@@ -235,6 +235,7 @@ fn build(
     let io = io::raise(&p, &native).expect("io::raise");
     let lowered = lower::lower(&lower::Parts {
         halves_rendezvous: false,
+        halves_first_meet: false,
         native: &native,
         p: &p,
         st: &st,

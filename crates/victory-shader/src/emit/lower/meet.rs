@@ -16,7 +16,8 @@
 //!
 //! # Where
 //!
-//! A site is an exchange (a lane mask's ballot, [`MeetSite::Mask`]) in a
+//! A site is an exchange (a lane mask's ballot, [`MeetSite::Mask`], or a
+//! first-lane read's two words, [`MeetSite::First`]) in a
 //! block that is not [`in_step`]. Its region `R` is that of the outermost
 //! divergent branch around it whose branch block `B` is in step
 //! ([`meet_regions`]): the blocks only the lanes taking one side of `B`'s
@@ -105,6 +106,10 @@ pub(crate) enum MeetSite {
     /// The ballot of the lane mask with this low dword, taken right after
     /// the instruction writing it.
     Mask(Value),
+    /// A `v_readfirstlane_b32` writing this value, at the instruction:
+    /// word 0 whether the half has an active lane there, word 1 its first
+    /// active lane's value (`Options::halves_first_meet`).
+    First(Value, u8),
 }
 
 /// A divergent region whose branch block is in step ([`meet_regions`]).
@@ -135,7 +140,14 @@ pub(super) struct Meet {
 /// entered only from the branch, left only to one block or the end, and,
 /// where the branch block is in a cycle, left to a block in step (where a
 /// group barrier goes). A block in two such regions is in none.
-pub(super) fn meet_regions(p: &Program, st: &Structured, step: &[bool]) -> Meet {
+///
+/// With `tails` (`Options::halves_first_meet`) a region with cycles still
+/// counts, its sites only in the blocks before every cycle (the acyclic
+/// part Kahn's sort reaches): what a cycle reaches never leads back there,
+/// so a lane that takes an edge into it is done with every site (counted on
+/// that edge, [`Lower::meet_leave`]), and the sites' order stays the one
+/// topological order the deadlock argument needs.
+pub(super) fn meet_regions(p: &Program, st: &Structured, step: &[bool], tails: bool) -> Meet {
     let n = st.exits.len();
     let mut meet = Meet {
         regions: Vec::new(),
@@ -207,9 +219,11 @@ pub(super) fn meet_regions(p: &Program, st: &Structured, step: &[bool]) -> Meet 
                 }
             }
         }
-        if sorted != blocks.len() {
+        if sorted != blocks.len() && !tails {
             continue;
         }
+        // The blocks downstream of a cycle: never a site's.
+        let tail: Vec<usize> = blocks.iter().copied().filter(|&b| ins[b] > 0).collect();
         // The branch block in a cycle: reached again from its successors.
         let mut seen = vec![false; n];
         let mut stack = succ(d);
@@ -234,7 +248,7 @@ pub(super) fn meet_regions(p: &Program, st: &Structured, step: &[bool]) -> Meet 
             reach.insert(u, r);
         }
         let k = meet.regions.len();
-        for &b in &blocks {
+        for &b in blocks.iter().filter(|b| !tail.contains(b)) {
             if meet.region_of[b].is_some() {
                 conflict[b] = true;
             }
@@ -303,7 +317,11 @@ impl Lower<'_> {
         };
         let mut sites: Vec<(usize, usize, MeetSite)> = Vec::new();
         for &site in self.meet_plan {
-            let MeetSite::Mask(lo) = site;
+            let (lo, after) = match site {
+                MeetSite::Mask(lo) => (lo, 1),
+                // At the read itself, which writes it.
+                MeetSite::First(w, _) => (w, 0),
+            };
             let Some(&b) = self.def_block.get(&lo) else {
                 continue;
             };
@@ -311,7 +329,7 @@ impl Lower<'_> {
                 continue;
             };
             // Right after the instruction writing it (a phi: at the start).
-            let at = self.def_index.get(&lo).map_or(0, |&i| i + 1);
+            let at = self.def_index.get(&lo).map_or(0, |&i| i + after);
             sites.push((b, at, site));
         }
         sites.sort_unstable();
@@ -454,7 +472,10 @@ impl Lower<'_> {
             .count();
         let due: Vec<MeetSite> = list.drain(..n).map(|(_, s)| s).collect();
         for site in due {
-            let MeetSite::Mask(lo) = site;
+            // A first-lane read meets where it is lowered (`first_meet`).
+            let MeetSite::Mask(lo) = site else {
+                continue;
+            };
             if self.ballots.contains_key(&lo) {
                 continue;
             }
@@ -618,6 +639,57 @@ impl Lower<'_> {
             Some(active) => active,
             None => self.s.m.bool(true),
         }
+    }
+
+    /// A first-lane read of `a` (written as `w`) in divergent code, with
+    /// `active` its lanes: the console wave's first active lane's value,
+    /// met between the halves. `None` where it cannot meet; in a first
+    /// pass the site is noted and a stand-in returned.
+    pub(super) fn first_meet(
+        &mut self,
+        w: Value,
+        a: V,
+        active: Option<V>,
+    ) -> Option<Result<V, Why>> {
+        if !self.x.halves_first_meet {
+            return None;
+        }
+        let (has, value) = (MeetSite::First(w, 0), MeetSite::First(w, 1));
+        if !self.meet_layout.slots.contains_key(&has)
+            || !self.meet_layout.slots.contains_key(&value)
+        {
+            let b = self.cur_ir;
+            if self.meet_later(has, b) && self.meet_later(value, b) {
+                return Some(Ok(self.s.m.i32(0)));
+            }
+            return None;
+        }
+        let own = self.first_lane_in_wave(a, active);
+        let c = self.cur;
+        let (zero, one) = (self.s.m.i32(0), self.s.m.i32(1));
+        let here = match active {
+            None => one,
+            Some(act) => {
+                let i32t = self.s.t.i32;
+                let four = self.s.m.named_struct("dx.types.fouri32", vec![i32t; 4]);
+                let r = self
+                    .s
+                    .op(c, "waveActiveBallot", Attr::NoUnwind, four, 116, &[act]);
+                self.s.flags |= flags::WAVE_OPS;
+                let lanes = self.s.m.extract(c, r, 0);
+                let any = self.s.m.cmp(c, pred::NE, lanes, zero);
+                self.s.m.select(c, any, one, zero)
+            }
+        };
+        let r = (|| {
+            let (lo_here, _) = self.meet_halves(has, here, zero)?;
+            let (lo, hi) = self.meet_halves(value, own, zero)?;
+            let c = self.cur;
+            let zero = self.s.m.i32(0);
+            let lower = self.s.m.cmp(c, pred::NE, lo_here, zero);
+            Ok(self.s.m.select(c, lower, lo, hi))
+        })();
+        Some(r)
     }
 
     /// What each half of this lane's console wave gives as `own` at the

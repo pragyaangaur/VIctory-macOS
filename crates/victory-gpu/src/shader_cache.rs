@@ -204,6 +204,13 @@ fn halves_rendezvous() -> bool {
     *ON.get_or_init(|| std::env::var("VICTORY_HALVES_RENDEZVOUS").as_deref() != Ok("0"))
 }
 
+/// `VICTORY_HALVES_FIRST_MEET=1`: first-lane reads in divergent code meet
+/// between the halves too (`victory_shader::emit::Options::halves_first_meet`).
+fn halves_first_meet() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| crate::switch::on("VICTORY_HALVES_FIRST_MEET"))
+}
+
 /// Whether 64-thread wave64 shaders keep only the per-lane translation.
 fn literal_halves_disabled() -> bool {
     static OFF: OnceLock<bool> = OnceLock::new();
@@ -357,6 +364,9 @@ pub(crate) fn translation_build(options: victory_shader::emit::Options) -> &'sta
         if apart {
             h.update(b"no halves rendezvous");
         }
+        if options.host_wave32 && options.halves_rendezvous && options.halves_first_meet {
+            h.update(b"halves first-lane meets");
+        }
         if cap_barriers {
             h.update(b"cap barriers refused");
         }
@@ -386,6 +396,7 @@ pub(crate) fn runtime_options() -> victory_shader::emit::Options {
         per_vertex_center: false,
         uav_size_level0: uav_size_level0(),
         halves_rendezvous: halves_rendezvous(),
+        halves_first_meet: halves_first_meet(),
         // Only for the pipelines a dispatch counted in threads needs it
         // for (`crate::pipeline::thread_limited`).
         thread_limits: false,
@@ -851,6 +862,32 @@ fn decode(bytes: &[u8]) -> Option<Result<HostShader, String>> {
 
 #[cfg(test)]
 mod tests {
+    /// Probe, by hand: translates every container in
+    /// `VICTORY_PROBE_SHADERS` (a folder of `<hash>.bin` files from the
+    /// cache's `shader-containers`) with the run's options and prints why
+    /// each fails.
+    #[test]
+    #[ignore = "a probe over shaders copied by hand"]
+    fn probe_translate_folder() {
+        let Some(dir) = std::env::var_os("VICTORY_PROBE_SHADERS") else {
+            return;
+        };
+        let mut paths: Vec<_> = std::fs::read_dir(dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.path())
+            .collect();
+        paths.sort();
+        for p in paths {
+            let bytes = std::fs::read(&p).unwrap();
+            let name = p.file_name().unwrap().to_string_lossy()[..16].to_owned();
+            match victory_shader::emit::translate_with(&bytes, runtime_options()) {
+                Ok(_) => println!("probe {name}: translates"),
+                Err(e) => println!("probe {name}: {e}"),
+            }
+        }
+    }
+
     use super::*;
 
     /// The rounds are on wherever the locks are, `VICTORY_ATOMIC_LOCK_ROUNDS=0`

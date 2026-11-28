@@ -68,6 +68,7 @@ fn build_with(words: &[u32], buffers: bool, nonuniform: u32) -> HostShader {
     let io = io::raise(&p, &native).expect("io::raise");
     let lowered = lower::lower(&lower::Parts {
         halves_rendezvous: false,
+        halves_first_meet: false,
         native: &native,
         p: &p,
         st: &st,

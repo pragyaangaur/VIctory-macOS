@@ -139,6 +139,7 @@ fn lower(native: &NativeProgram) -> Result<HostShader, ShaderError> {
     let io = io::raise(&p, native).expect("io::raise");
     let lowered = lower::lower(&lower::Parts {
         halves_rendezvous: false,
+        halves_first_meet: false,
         native,
         p: &p,
         st: &st,

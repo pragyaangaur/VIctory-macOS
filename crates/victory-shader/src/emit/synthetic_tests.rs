@@ -136,6 +136,7 @@ fn lowered(native: &NativeProgram) -> Result<lower::Lowered, crate::ShaderError>
     let io = io::raise(&p, native).expect("io::raise");
     lower::lower(&lower::Parts {
         halves_rendezvous: false,
+        halves_first_meet: false,
         native,
         p: &p,
         st: &st,
@@ -1027,6 +1028,7 @@ fn pops_wait_loop_exits_immediately_for_inactive_lanes() {
         let io = io::raise(&p, native).expect("io");
         let l = lower::lower(&lower::Parts {
             halves_rendezvous: false,
+            halves_first_meet: false,
             native,
             p: &p,
             st: &st,

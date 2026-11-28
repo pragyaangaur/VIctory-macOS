@@ -61,6 +61,12 @@ pub(crate) use retry::{lower_literal, lower_pruned};
 
 type Why = &'static str;
 
+/// [`halves::FIRST_ACROSS`], for tests outside `lower`.
+#[cfg(test)]
+pub(super) fn halves_first_across() -> &'static str {
+    halves::FIRST_ACROSS
+}
+
 #[cfg(test)]
 thread_local! {
     /// Set by a test that probes the value analysis behind a refusal, which
@@ -222,6 +228,9 @@ pub(crate) struct Parts<'a> {
     /// In halves, the two halves of a console wave meet in divergent code
     /// ([`Options::halves_rendezvous`](super::Options), `lower::meet`).
     pub halves_rendezvous: bool,
+    /// With [`Lower::halves_rendezvous`]: first-lane reads meet too
+    /// ([`Options::halves_first_meet`](super::Options)).
+    pub halves_first_meet: bool,
     /// See [`Options::narrow_waves`](super::Options).
     pub narrow_waves: bool,
     /// A size query on a writable image asks for level 0, not an undefined
@@ -896,7 +905,7 @@ impl<'a> Lower<'a> {
         let (step, cap_escaped, group_scalars) = step_and_cap(p, x.st, halves);
         let one_host_wave = s.threads.is_some_and(|t| t.iter().product::<u32>() <= 32);
         let meet = (halves && !one_host_wave && x.halves_rendezvous)
-            .then(|| meet::meet_regions(p, x.st, &step));
+            .then(|| meet::meet_regions(p, x.st, &step, x.halves_first_meet));
         let mut l = Lower {
             s,
             x,
@@ -7616,6 +7625,13 @@ impl<'a> Lower<'a> {
                 let alone = inst.writes.first().is_some_and(|w| self.first_alone.contains(&w.1));
                 if self.halves && !self.one_host_wave() && is_vec && !is_alike && !alone {
                     if !self.across_here() {
+                        let w = inst.writes.first().map(|w| w.1);
+                        if let Some(w) = w.filter(|_| self.x.halves_first_meet) {
+                            let a = s(self, 0)?;
+                            if let Some(r) = self.first_meet(w, a, guard) {
+                                return self.write_i(inst, r?, None);
+                            }
+                        }
                         return Err(halves::FIRST_ACROSS);
                     }
                     let a = s(self, 0)?;
