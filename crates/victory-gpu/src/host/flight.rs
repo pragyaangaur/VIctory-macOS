@@ -367,6 +367,11 @@ pub(crate) enum Early {
 /// launched while it still was, then one per [`Early`].
 const AHEAD_SLOTS: usize = 2 + Early::CpuRead as usize + 1;
 
+/// Fence-wait microseconds incurred by preparation, indexed by the early
+/// landing reason. Copy-back and callbacks after the fence are excluded.
+#[cfg(feature = "diagnostics")]
+static AHEAD_WAIT_US: [AtomicU64; AHEAD_SLOTS - 2] = [const { AtomicU64::new(0) }; AHEAD_SLOTS - 2];
+
 /// Preparations behind a flight that was not quiet but whose writes were
 /// known (`VICTORY_PREP_AHEAD=ranges`), since the last frame report.
 static BEHIND_BY_RANGES: AtomicU64 = AtomicU64::new(0);
@@ -522,7 +527,7 @@ pub(crate) fn land_ahead(why: Early) {
         AHEAD[2 + why as usize].fetch_add(1, Ordering::Relaxed);
         PREPARING_AHEAD.with(|c| c.set(None));
         AHEAD_OF.with(|w| w.borrow_mut().take());
-        host.finish_flight_locked(submitted, None, None);
+        host.finish_flight_locked_for(submitted, None, None, Some(why));
     }
 }
 
@@ -635,6 +640,10 @@ pub(crate) fn log_frame(frames: f64) {
     let (flights, us) = take_flight_times();
     let worker = crate::queue::take_worker_us();
     let ahead = AHEAD.each_ref().map(|a| a.swap(0, Ordering::Relaxed));
+    #[cfg(feature = "diagnostics")]
+    let ahead_wait = AHEAD_WAIT_US
+        .each_ref()
+        .map(|a| a.swap(0, Ordering::Relaxed));
     if flights == 0 {
         return;
     }
@@ -696,6 +705,21 @@ pub(crate) fn log_frame(frames: f64) {
             per(ahead[10]),
             per(ahead[11]),
         );
+        #[cfg(feature = "diagnostics")]
+        {
+            let title_copy = ahead_wait[Early::TitleCopy as usize];
+            let buffer_overlap = ahead_wait[Early::Overlap as usize];
+            let cpu_read = ahead_wait[Early::CpuRead as usize];
+            let other = ahead_wait.iter().sum::<u64>() - title_copy - buffer_overlap - cpu_read;
+            tracing::info!(
+                "prep-ahead GPU fence wait ms/frame: title copies {:.2}, overlapping buffer work {:.2}, \
+                 CPU reads {:.2}, other {:.2}",
+                ms(title_copy),
+                ms(buffer_overlap),
+                ms(cpu_read),
+                ms(other),
+            );
+        }
     }
 }
 
@@ -1192,6 +1216,16 @@ impl Host {
         only_if_fence: Option<u64>,
         waited_at: Option<std::time::Instant>,
     ) -> bool {
+        self.finish_flight_locked_for(submitted, only_if_fence, waited_at, None)
+    }
+
+    fn finish_flight_locked_for(
+        &self,
+        submitted: &mut u64,
+        only_if_fence: Option<u64>,
+        waited_at: Option<std::time::Instant>,
+        reason: Option<Early>,
+    ) -> bool {
         let mut landed_any = false;
         loop {
             let flight = {
@@ -1211,7 +1245,7 @@ impl Host {
             let Some(flight) = flight else {
                 return landed_any;
             };
-            self.land(submitted, flight, waited_at.filter(|_| !landed_any));
+            self.land(submitted, flight, waited_at.filter(|_| !landed_any), reason);
             landed_any = true;
             if only_if_fence.is_some() {
                 return true;
@@ -1220,12 +1254,26 @@ impl Host {
     }
 
     /// Lands `flight`, taken from the front of `Host::flight`'s flights.
-    fn land(&self, submitted: &mut u64, flight: InFlight, waited_at: Option<std::time::Instant>) {
+    fn land(
+        &self,
+        submitted: &mut u64,
+        flight: InFlight,
+        waited_at: Option<std::time::Instant>,
+        _reason: Option<Early>,
+    ) {
         let gpu_done = if flight.waited {
             // SAFETY: plain fence completion query.
             if unsafe { self.fence.GetCompletedValue() } < flight.fence_value {
+                #[cfg(feature = "diagnostics")]
+                let started = _reason.map(|_| std::time::Instant::now());
                 self.wait_for(flight.fence_value);
-                std::time::Instant::now()
+                let done = std::time::Instant::now();
+                #[cfg(feature = "diagnostics")]
+                if let Some((reason, started)) = _reason.zip(started) {
+                    AHEAD_WAIT_US[reason as usize]
+                        .fetch_add(done.duration_since(started).as_micros() as u64, Ordering::Relaxed);
+                }
+                done
             } else {
                 waited_at.unwrap_or_else(std::time::Instant::now)
             }
