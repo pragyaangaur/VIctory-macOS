@@ -4433,6 +4433,14 @@ void main(uint3 id : SV_DispatchThreadID) {
         };
         let base = copy.marks.expect("tracked memory gets mark bits") as usize;
         assert_eq!(copy.mark_entry(p as u64 + PAGE as u64 + 8), Some((base as u32 + 1, 8)));
+        // Held as a submission holds it, from the copy taking the pages to
+        // their copy-back: the bitmap is shared, and another test's
+        // submission refreshes every dirty copy its page tables reach,
+        // this one too, which put the title's bytes over the shader's in
+        // page 1 between the title's writes and the copy-back. A real
+        // submission ahead lands first (`flight::before_refresh`); this one
+        // has no flight to land.
+        let quiet = host().and_then(|h| h.quiet());
         copy.update(p, len);
         copy.writing(p, len, true);
         assert_eq!(copy.before.lock().unwrap().len(), 0, "no snapshot");
@@ -4447,10 +4455,7 @@ void main(uint3 id : SV_DispatchThreadID) {
             title(PAGE + 40).write_volatile(0x11);
             title(2 * PAGE + 50).write_volatile(0x22);
         }
-        // The shaders marked pages 0 and 1. The bitmap is shared: held as a
-        // submission holds it, or another test's copy-back (or submission)
-        // can take these bits and put the pages back after the reads below.
-        let quiet = host().and_then(|h| h.quiet());
+        // The shaders marked pages 0 and 1.
         let bits = b.data as *mut u32;
         for n in [base, base + 1] {
             // SAFETY: a dword of the mapped bitmap.
