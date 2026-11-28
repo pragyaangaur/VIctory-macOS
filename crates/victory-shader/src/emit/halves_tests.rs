@@ -3963,7 +3963,7 @@ fn a_first_lane_read_in_a_loop_matches_the_console_on_every_gpu() {
 }
 
 /// `v_readfirstlane_b32 s12, v4` inside an `s_and_saveexec_b64` region
-/// whose EXEC is `mask_words`'s, of `v4 = f32(s14) + 1.0` made there, with
+/// whose EXEC is `mask_words`'s, of `v4 = f32(s14) + 1.0` made there or before narrowing EXEC, with
 /// `s14` the first dword of the SRV buffer at table dword 8 (a scalar load,
 /// as in GTA VI's reciprocals of constant-buffer divisors): the same in
 /// every lane EXEC has. `inside`: `v2 = s12` under the region's EXEC (only
@@ -3973,6 +3973,7 @@ fn readfirstlane_of_a_scalar_in_branch(
     mask_words: &[u32],
     with_mbcnt: bool,
     inside: bool,
+    producer_before_narrowing: bool,
 ) -> Vec<u32> {
     let mut w = PROLOGUE.to_vec();
     w.extend([
@@ -3991,16 +3992,21 @@ fn readfirstlane_of_a_scalar_in_branch(
             0x0001_00C1, // v_mbcnt_lo_u32_b32 v1, -1, 0
         ]);
     }
-    w.extend(mask_words);
-    w.push(0xBE80_246A); // s_and_saveexec_b64 s[0:1], vcc
-    let region = [
+    let producer = [
         0x7E08_0C0E, // v_cvt_f32_u32 v4, s14
         0x0608_08F2, // v_add_f32 v4, 1.0, v4
-        0x7E18_0504, // v_readfirstlane_b32 s12, v4
     ];
-    let skip = region.len() as u32 + u32::from(inside);
+    if producer_before_narrowing {
+        w.extend(producer);
+    }
+    w.extend(mask_words);
+    w.push(0xBE80_246A); // s_and_saveexec_b64 s[0:1], vcc
+    let skip = 1 + u32::from(!producer_before_narrowing) * 2 + u32::from(inside);
     w.push(0xBF88_0000 | skip); // s_cbranch_execz (past the region)
-    w.extend(region);
+    if !producer_before_narrowing {
+        w.extend(producer);
+    }
+    w.push(0x7E18_0504); // v_readfirstlane_b32 s12, v4
     if inside {
         w.push(0x7E04_020C); // v_mov_b32 v2, s12
     }
@@ -4016,7 +4022,7 @@ fn readfirstlane_of_a_scalar_in_branch(
 #[test]
 fn the_scalar_readfirstlane_programs_are_what_their_comments_say() {
     for inside in [false, true] {
-        let words = readfirstlane_of_a_scalar_in_branch(&MASK_LANES_40_41, true, inside);
+        let words = readfirstlane_of_a_scalar_in_branch(&MASK_LANES_40_41, true, inside, false);
         let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
         let all = gfx10::decode(&code)
             .expect("decodes")
@@ -4049,10 +4055,10 @@ fn the_scalar_readfirstlane_programs_are_what_their_comments_say() {
 #[test]
 fn a_first_lane_read_only_active_lanes_see_is_made_in_each_half() {
     for mask in [&MASK_LANES_8_9, &MASK_LANES_40_41, &MASK_LANES_12_44] {
-        let inside = readfirstlane_of_a_scalar_in_branch(mask, true, true);
+        let inside = readfirstlane_of_a_scalar_in_branch(mask, true, true, false);
         let alone = lowered(&native(&inside, true, 64, 0), true).expect("read alone in halves");
         assert_eq!(alone.wave_size, Some(32));
-        let outside = readfirstlane_of_a_scalar_in_branch(mask, true, false);
+        let outside = readfirstlane_of_a_scalar_in_branch(mask, true, false, false);
         let across = lowered(&native(&outside, true, 64, 0), true).expect("read across in halves");
         // At least two exchanges (the value, the ballot) of two barriers.
         assert!(
@@ -4085,7 +4091,7 @@ fn a_first_lane_read_only_active_lanes_see_matches_the_console_on_every_gpu() {
         ("empty", &MASK_EMPTY, none),
     ] {
         for with_mbcnt in [false, true] {
-            let words = readfirstlane_of_a_scalar_in_branch(mask, with_mbcnt, true);
+            let words = readfirstlane_of_a_scalar_in_branch(mask, with_mbcnt, true, false);
             let want: Vec<u32> = (0..64).map(|l| if active(l) { value } else { 0 }).collect();
             let found = differences_with_buffer(
                 true,
@@ -4106,6 +4112,109 @@ fn a_first_lane_read_only_active_lanes_see_matches_the_console_on_every_gpu() {
         }
     }
     assert!(failed.is_empty(), "{}", failed.join("\n"));
+}
+
+/// The producer changes only lanes 40 and 41, then restores EXEC. The
+/// first-lane read opens an independent region on lanes 12 and 44, which
+/// both still hold their original lane ID. They must agree on lane 12.
+fn readfirstlane_after_an_unrelated_narrowing() -> Vec<u32> {
+    let mut words = readfirstlane_of_a_scalar_in_branch(&MASK_LANES_12_44, true, true, true);
+    let producer = words
+        .iter()
+        .position(|&word| word == 0x7E08_0C0E)
+        .expect("scalar-derived producer");
+    words.splice(
+        producer..producer,
+        [
+            0x7E08_0300, // v_mov_b32 v4, v0
+            MASK_LANES_40_41[0],
+            MASK_LANES_40_41[1],
+            0xBE98_246A, // s_and_saveexec_b64 s[24:25], vcc
+        ],
+    );
+    words.insert(producer + 6, 0xBEFE_0418); // s_mov_b64 exec, s[24:25]
+    words
+}
+
+/// The VALU producer runs under the EXEC saved by the read's narrowing
+/// instruction. The read is safe within each half only where all its users
+/// still run under the narrower EXEC.
+#[test]
+fn a_first_lane_read_under_narrower_exec_reuses_the_producer() {
+    for mask in [&MASK_LANES_8_9, &MASK_LANES_40_41, &MASK_LANES_12_44] {
+        for with_mbcnt in [false, true] {
+            let lower = |inside, wider| {
+                let words = readfirstlane_of_a_scalar_in_branch(mask, with_mbcnt, inside, wider);
+                lowered(&native(&words, true, 64, 0), true).expect("translated shader")
+            };
+            let same_exec = lower(true, false);
+            let wider_exec = lower(true, true);
+            let escaping = lower(false, true);
+            assert_eq!(
+                (wider_exec.wave_size, wider_exec.barriers),
+                (same_exec.wave_size, same_exec.barriers),
+                "the wider producer and same-EXEC control should have the same barriers"
+            );
+            assert!(escaping.barriers > wider_exec.barriers);
+            if with_mbcnt && *mask == MASK_LANES_12_44 {
+                let unrelated = readfirstlane_after_an_unrelated_narrowing();
+                let emitted = lowered(&native(&unrelated, true, 64, 0), true)
+                    .expect("unrelated narrowing stays exact");
+                assert!(emitted.barriers > wider_exec.barriers);
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn a_first_lane_read_under_narrower_exec_matches_the_console_on_every_gpu() {
+    if std::env::var_os("VICTORY_REQUIRE_GPU_TESTS").is_some() {
+        assert!(!Host::each_hardware().is_empty(), "required hardware GPU");
+    }
+    let value = (41.0f32 + 1.0).to_bits();
+    let cases: [(&[u32], fn(u32) -> bool); 4] = [
+        (&MASK_LANES_8_9, |lane| lane >> 1 == 4),
+        (&MASK_LANES_40_41, |lane| lane >> 1 == 20),
+        (&MASK_LANES_12_44, |lane| lane & 31 == 12),
+        (&MASK_EMPTY, |_| false),
+    ];
+    for (mask, active) in cases {
+        for with_mbcnt in [false, true] {
+            let words = readfirstlane_of_a_scalar_in_branch(mask, with_mbcnt, true, true);
+            let expected: Vec<_> = (0..64)
+                .map(|lane| if active(lane) { value } else { 0 })
+                .collect();
+            let diffs = differences_with_buffer(
+                true,
+                &words,
+                64,
+                1,
+                &expected,
+                0,
+                false,
+                false,
+                &[41, 0, 0, 0],
+            );
+            assert!(diffs.is_empty(), "{}", diffs.join("\n"));
+        }
+    }
+    let unrelated = readfirstlane_after_an_unrelated_narrowing();
+    let expected: Vec<_> = (0..64)
+        .map(|lane| if lane & 31 == 12 { 12 } else { 0 })
+        .collect();
+    let diffs = differences_with_buffer(
+        true,
+        &unrelated,
+        64,
+        1,
+        &expected,
+        0,
+        false,
+        false,
+        &[41, 0, 0, 0],
+    );
+    assert!(diffs.is_empty(), "{}", diffs.join("\n"));
 }
 
 /// A first-lane read of a value a multiply-accumulate made, in an
