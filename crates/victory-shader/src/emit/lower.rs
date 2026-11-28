@@ -444,6 +444,9 @@ struct Lower<'a> {
     /// The results of first-lane reads each host half makes by itself
     /// ([`first_lane::read_alone`], [`first_lane::index_waterfalls`]).
     first_alone: HashSet<Value>,
+    /// Per counted loop header, the predicate it was entered under (`None`:
+    /// no predicate, or entries under different ones).
+    loop_entry_active: Map<usize, Option<V>>,
     /// Pixel: an ordered section (POPS), whose UAVs the host makes
     /// rasterizer-ordered views.
     pops: bool,
@@ -980,6 +983,7 @@ impl<'a> Lower<'a> {
                 HashSet::new()
             },
             first_alone,
+            loop_entry_active: Map::default(),
             pops: matches!(x.native.io, StageIo::Ps { db_shader_control, .. }
                 if db_shader_control & 1 << 16 != 0),
             depth_before_shader: matches!(x.native.io, StageIo::Ps { db_shader_control, .. }
@@ -11288,6 +11292,41 @@ impl<'a> Lower<'a> {
                 } else {
                     cond
                 };
+                // In halves predication, a lane outside the predicate the loop
+                // was entered under never was in it on the console (a skip-
+                // guard body runs in every lane): it takes the way out instead
+                // of the loop's own test, which it need never meet (it would
+                // spin to the iteration limit and leave the program). Lanes
+                // that left the predicate inside the loop (a break) stay, as
+                // the lockstep exchanges need (#655).
+                let header = |l: &Self, to: usize| {
+                    if back(l, to) {
+                        Some(to)
+                    } else if let LaneExit::Jump(h) = l.x.st.exits[to]
+                        && back(l, h)
+                    {
+                        Some(h)
+                    } else {
+                        None
+                    }
+                };
+                let entry = |l: &Self, h: usize| l.loop_entry_active.get(&h).copied().flatten();
+                let cond = match (header(self, taken), header(self, not_taken)) {
+                    (Some(h), None) => match entry(self, h) {
+                        Some(act) => self.s.m.bin(self.cur, Bin::And, cond, act),
+                        None => cond,
+                    },
+                    (None, Some(h)) => match entry(self, h) {
+                        Some(act) => {
+                            let t = self.s.m.bool(true);
+                            let outside = self.s.m.bin(self.cur, Bin::Xor, act, t);
+                            self.s.m.bin(self.cur, Bin::Or, cond, outside)
+                        }
+                        None => cond,
+                    },
+                    _ => cond,
+                };
+
                 // Critical edges get a block of their own, so loops have
                 // dedicated exits and preheaders as DXC emits them.
                 let (t, f) = (self.edge(b, taken), self.edge(b, not_taken));
@@ -11322,10 +11361,22 @@ impl<'a> Lower<'a> {
 
     /// A forward edge into loop header `to` (from DXIL block `via`) starts
     /// its count at 0.
-    fn enter_loop(&mut self, _from: usize, to: usize, via: usize) {
+    fn enter_loop(&mut self, from: usize, to: usize, via: usize) {
         if let Some((_, incoming)) = self.counters.get_mut(&to) {
             let z = self.s.m.i32(0);
             incoming.push((z, via));
+            // The predicate the loop is entered under, where there is one
+            // entry (`exit`: lanes outside it never were in the loop).
+            let act = self.pred_active(from);
+            match self.loop_entry_active.get(&to) {
+                None => {
+                    self.loop_entry_active.insert(to, act);
+                }
+                Some(&known) if known != act => {
+                    self.loop_entry_active.insert(to, None);
+                }
+                Some(_) => {}
+            }
         }
     }
 
