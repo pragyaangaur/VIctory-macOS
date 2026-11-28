@@ -1,0 +1,36 @@
+name: Ahmet CrossOver build
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths: &build_paths
+      - 'ports/ahmet-macos/**'
+      - 'tools/macos/package-ahmet.sh'
+      - 'docs/ahmet-macos.md'
+      - '.github/workflows/ahmet-macos.yml'
+  push:
+    branches: [main, 'port/ahmet-*']
+    paths: *build_paths
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install the Windows GNU toolchain
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends g++-mingw-w64-x86-64
+          rustup toolchain install 1.98.1 --profile minimal --target x86_64-pc-windows-gnu
+      - name: Build the CrossOver package
+        run: bash tools/macos/package-ahmet.sh "$RUNNER_TEMP/dist"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: VIctory-Ahmet-CrossOver
+          path: ${{ runner.temp }}/dist/VIctory-Ahmet-CrossOver.tar.gz
+          if-no-files-found: error
+          compression-level: 0

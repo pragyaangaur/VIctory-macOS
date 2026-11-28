@@ -117,6 +117,9 @@ Once `game_dir` in `victory.toml` points at your copy of the game (below), `tool
 
 ## Running the game
 
+For Ahmet Dedeler’s complete CrossOver build, including its own renderer,
+launcher and optional Wine patches, see [Ahmet’s build for Apple Silicon](docs/ahmet-macos.md).
+
 Put your own copy of the Xbox Series build in a folder, set `game_dir` in `victory.toml` to that folder, and start it. Every package's files must sit directly in that folder, so `appdata0.rpf` is at `<game_dir>/appdata0.rpf` and not in an `appdata0` subfolder. With one subfolder per package the title asserts early at `+0x2237178`, and `victory` now stops before that and says which file is misplaced (#24).
 
 ```bash

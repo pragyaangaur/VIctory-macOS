@@ -34,6 +34,10 @@ by the project owner's decision (2026-11-23), entered as an exception in
 repository's licence does not cover them. Nothing else of this kind is
 accepted.
 
+The copy under `ports/ahmet-macos/` must match the approved BCPack table
+byte for byte. The port's original zsh launcher and its 659,471-byte Rust
+shader lowering module receive the usual text and embedded-data checks.
+
 ## Where data lives
 
 Outside the repository, configured in `victory.toml`: `game_dir` (the

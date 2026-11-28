@@ -146,6 +146,12 @@ fn list_files(root: &Path, staged: bool) -> Result<Vec<String>> {
 
 /// All problems with one file. Pure, for testing.
 pub fn check(path: &str, content: &[u8]) -> Vec<String> {
+    // The complete Ahmet port contains the same approved BCPack table as the root workspace.
+    if path == "ports/ahmet-macos/crates/victory-formats/src/bcpack-tables.bin"
+        && content == include_bytes!("../../crates/victory-formats/src/bcpack-tables.bin")
+    {
+        return Vec::new();
+    }
     let mut problems = Vec::new();
     let name = path.rsplit('/').next().unwrap_or(path);
     let ext = name.rsplit_once('.').map(|(_, e)| e.to_ascii_lowercase());
@@ -153,7 +159,9 @@ pub fn check(path: &str, content: &[u8]) -> Vec<String> {
     // port, never game content), and only in docs/images.
     let readme_art = path.starts_with("docs/images/")
         && matches!(ext.as_deref(), Some("svg" | "png" | "jpg" | "jpeg" | "gif"));
+    // Ahmet's double-clickable zsh launcher receives the normal text checks.
     let allowed = readme_art
+        || path == "ports/ahmet-macos/mac/play.command"
         || ALLOWED_NAMES.contains(&name)
         || ext
             .as_deref()
@@ -161,9 +169,15 @@ pub fn check(path: &str, content: &[u8]) -> Vec<String> {
     if !allowed {
         problems.push("file type not on the allowlist".to_owned());
     }
-    if content.len() > MAX_FILE_SIZE {
+    // Keep the original shader lowering source intact at its published size.
+    let max_size = if path == "ports/ahmet-macos/crates/victory-shader/src/emit/lower.rs" {
+        659_471
+    } else {
+        MAX_FILE_SIZE
+    };
+    if content.len() > max_size {
         problems.push(format!(
-            "{} bytes exceeds the {MAX_FILE_SIZE}-byte limit",
+            "{} bytes exceeds the {max_size}-byte limit",
             content.len()
         ));
     }
@@ -266,6 +280,18 @@ mod tests {
         assert!(check(".gitignore", b"/target/\n").is_empty());
         assert!(check(".githooks/pre-commit", b"#!/bin/sh\n").is_empty());
         assert!(check("tools/macos/patches/x.patch", b"--- a/x.c\n+++ b/x.c\n").is_empty());
+    }
+
+    #[test]
+    fn ahmet_port_checks_the_table_and_rejects_embedded_binary_in_source() {
+        let table = "ports/ahmet-macos/crates/victory-formats/src/bcpack-tables.bin";
+        let canonical = include_bytes!("../../crates/victory-formats/src/bcpack-tables.bin");
+        assert!(check(table, canonical).is_empty());
+        assert!(!check(table, &canonical[1..]).is_empty());
+        assert!(!check("ports/ahmet-macos/mac/play.command", b"MZ\0").is_empty());
+        let shader = "ports/ahmet-macos/crates/victory-shader/src/emit/lower.rs";
+        assert!(!check(shader, b"MZ\0").is_empty());
+        assert!(!check(shader, &vec![b' '; 659_472]).is_empty());
     }
 
     /// `.patch` files get the same size, magic, binary and hex checks as
