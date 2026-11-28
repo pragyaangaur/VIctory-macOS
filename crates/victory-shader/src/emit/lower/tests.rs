@@ -2747,6 +2747,174 @@ fn buffer_load_readfirstlane_loop_is_in_step() {
     );
 }
 
+/// A uniform branch on a number kept in VCC_HI: `source` puts a group-wide
+/// value in s21, the program shifts it into VCC_HI, adds that to the
+/// offset of an `s_buffer_load_dword`, and branches on the loaded dword.
+fn vcc_hi_offset(source: &[u32]) -> Vec<u32> {
+    let mut w = vec![
+        0xBE84_0300, // s_mov_b32 s4, s0
+        0xBE85_0380, // s_mov_b32 s5, 0
+    ];
+    w.extend(smem(2, 44, 4, 0x20, None)); // s_load_dwordx4 s[44:47], s[4:5], 0x20
+    w.push(0xBF8C_C07F); // s_waitcnt lgkmcnt(0)
+    w.extend(source);
+    w.extend([
+        0x8F6B_8215, // s_lshl_b32 vcc_hi, s21, 2
+        0x8817_806B, // s_or_b32 s23, vcc_hi, 0
+    ]);
+    w.extend(smem(8, 24, 44, 0, Some(23))); // s_buffer_load_dword s24, s[44:47], s23
+    w.extend([
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0xBF07_8018, // s_cmp_lg_u32 s24, 0
+        0xBF84_0001, // s_cbranch_scc0 1
+        0x7E06_0281, // v_mov_b32 v3, 1
+        S_ENDPGM,
+    ]);
+    w
+}
+
+/// A branch on VCC_HI after `def` puts something in VCC: `s_cmp_lg_u32
+/// vcc_hi, 0` and an `s_cbranch_scc0` over one vector move.
+fn vcc_hi_branch(def: &[u32]) -> Vec<u32> {
+    let mut w = vec![
+        0xBE84_0300, // s_mov_b32 s4, s0
+        0xBE85_0300, // s_mov_b32 s5, s0
+    ];
+    w.extend(def);
+    w.extend([
+        0xBF07_806B, // s_cmp_lg_u32 vcc_hi, 0
+        0xBF84_0001, // s_cbranch_scc0 1
+        0x7E06_0281, // v_mov_b32 v3, 1
+        S_ENDPGM,
+    ]);
+    w
+}
+
+/// The (a)/(b)/(c)/(d) programs below, by their instructions' names.
+fn names(words: &[u32]) -> Vec<&'static str> {
+    wave64(words)
+        .blocks
+        .iter()
+        .flat_map(|b| b.insts.iter().map(|i| i.name()))
+        .collect()
+}
+
+#[test]
+fn the_vcc_scratch_programs_are_what_their_comments_say() {
+    let first = vcc_hi_offset(&[
+        0x7E06_0280, // v_mov_b32 v3, 0
+        0xE030_1000,
+        0x800B_0403, // buffer_load_dword v4, v3, s[44:47], 0 offen
+        0xBF8C_3F70, // s_waitcnt vmcnt(0)
+        0x7E2A_0504, // v_readfirstlane_b32 s21, v4
+    ]);
+    let n = names(&first);
+    for want in [
+        "s_lshl_b32",
+        "s_or_b32",
+        "s_buffer_load_dword",
+        "s_cmp_lg_u32",
+        "s_cbranch_scc0",
+        "v_readfirstlane_b32",
+    ] {
+        assert!(n.contains(&want), "{want} missing from {n:?}");
+    }
+    for (def, want) in [
+        (vec![0x7D88_0085], "v_cmp_gt_u32"),
+        (vec![0x87EA_047E], "s_and_b64"),
+        (vec![0xBE8A_047E, 0xBEEA_040A], "s_mov_b64"),
+    ] {
+        let n = names(&vcc_hi_branch(&def));
+        assert!(n.contains(&want), "{want} missing from {n:?}");
+    }
+    let p = wave64(&vcc_hi_branch(&[0x87EA_047E]));
+    let and = p.blocks[0].insts.iter().find(|i| i.name() == "s_and_b64").unwrap();
+    assert!(and.reads.iter().any(|r| r.0 == ir::Reg::S(ir::EXEC)));
+    assert!(and.writes.iter().any(|w| w.0 == ir::Reg::S(ir::VCC + 1)));
+}
+
+/// (a) A first-lane value the compiler keeps in VCC_HI as a spare SGPR, on
+/// its way into a scalar load's offset, is data, not a lane mask: in literal
+/// wave64 halves the branch on the loaded dword is group-uniform and every
+/// block is in step.
+#[test]
+fn a_first_lane_number_in_vcc_hi_keeps_literal_halves_in_step() {
+    let w = vcc_hi_offset(&[
+        0x7E06_0280, // v_mov_b32 v3, 0
+        0xE030_1000,
+        0x800B_0403, // buffer_load_dword v4, v3, s[44:47], 0 offen
+        0xBF8C_3F70, // s_waitcnt vmcnt(0)
+        0x7E2A_0504, // v_readfirstlane_b32 s21, v4
+    ]);
+    let p = wave64(&w);
+    let st = structure::split_literal(&p).unwrap();
+    let step = super::in_step(&p, &st);
+    assert!(step.iter().all(|&s| s), "{step:?}");
+}
+
+/// A number from user data kept in VCC_HI is group-uniform in per-lane
+/// halves too.
+#[test]
+fn a_uniform_number_in_vcc_hi_is_group_uniform() {
+    let w = vcc_hi_offset(&[0xBE95_0300]); // s_mov_b32 s21, s0
+    let p = wave64(&w);
+    let st = structure::structure(&p).unwrap();
+    let step = super::in_step(&p, &st);
+    assert!(step.iter().all(|&s| s), "{step:?}");
+}
+
+/// Per-lane wave64 halves: whether every block of `def` then a branch on
+/// VCC_HI is in step.
+fn vcc_hi_branch_in_step(def: &[u32]) -> bool {
+    let p = wave64(&vcc_hi_branch(def));
+    let st = structure::structure(&p).unwrap();
+    assert!(!st.literal);
+    super::in_step(&p, &st).iter().all(|&s| s)
+}
+
+/// (b) A `v_cmp` result in VCC is a lane mask, whatever scalar op reads it.
+#[test]
+fn a_compare_mask_in_vcc_is_not_group_uniform() {
+    assert!(!vcc_hi_branch_in_step(&[
+        0x7D88_0085, // v_cmp_gt_u32 vcc, 5, v0
+    ]));
+    assert!(!vcc_hi_branch_in_step(&[
+        0x7D88_0085, // v_cmp_gt_u32 vcc, 5, v0
+        0x8F6B_816B, // s_lshl_b32 vcc_hi, vcc_hi, 1
+    ]));
+}
+
+/// (c) A 64-bit scalar write of VCC from EXEC: VCC_HI holds the upper 32
+/// lanes' bits, which differ between the host halves.
+#[test]
+fn exec_anded_into_vcc_is_not_group_uniform() {
+    assert!(!vcc_hi_branch_in_step(&[
+        0x87EA_047E, // s_and_b64 vcc, exec, s[4:5]
+    ]));
+}
+
+/// (d) A copy of EXEC saved early and moved into VCC later is still EXEC.
+#[test]
+fn a_saved_exec_moved_into_vcc_is_not_group_uniform() {
+    assert!(!vcc_hi_branch_in_step(&[
+        0xBE8A_047E, // s_mov_b64 s[10:11], exec
+        0x8006_8104, // s_add_u32 s6, s4, 1
+        0xBEEA_040A, // s_mov_b64 vcc, s[10:11]
+    ]));
+}
+
+/// A 64-bit scalar write of VCC is left out even from uniform sources: the
+/// rule admits 32-bit writes of one VCC dword only.
+#[test]
+fn a_64_bit_write_of_vcc_is_not_taken_as_a_number() {
+    assert!(!vcc_hi_branch_in_step(&[
+        0xBEEA_0404, // s_mov_b64 vcc, s[4:5]
+    ]));
+    assert!(vcc_hi_branch_in_step(&[
+        0xBEEB_0304, // s_mov_b32 vcc_hi, s4
+    ]));
+}
+
 /// SMEM `op` (`s_load_dword*` 0-4, `s_buffer_load_dword*` 8-12) of
 /// `s[sdata..]` from `s[sbase..]` at `offset`, plus SGPR `soffset` if any.
 fn smem(op: u32, sdata: u32, sbase: u32, offset: u32, soffset: Option<u32>) -> [u32; 2] {

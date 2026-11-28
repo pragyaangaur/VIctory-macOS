@@ -678,16 +678,12 @@ impl Layout {
         let (lo, hi) = if linear {
             (0, m.width as usize * n)
         } else {
-            let (mut lo, mut hi) = (usize::MAX, 0usize);
-            for x in 0..m.width {
-                let c = self.column(m, x) as usize;
-                lo = lo.min(c);
-                hi = hi.max(c + n);
-            }
-            if lo >= hi {
-                return None;
-            }
-            (lo, hi)
+            // The swizzle places successive X bits in increasing address-bit
+            // order. Column offsets therefore increase even across blocks.
+            (
+                self.column(m, 0) as usize,
+                self.column(m, m.width - 1) as usize + n,
+            )
         };
         let start = |z: u32, y: u32| {
             let (s, inner) = self.split(first + z);
@@ -704,11 +700,25 @@ impl Layout {
                 .is_some_and(|r| r.0 < b)
         };
         let (mut y0, mut y1) = (u32::MAX, 0);
+        let tiled_mip = !linear && m.tail.is_none();
+        let band_height = if tiled_mip { self.block[1] } else { 1 };
+        let block_bytes = self.alignment as usize;
         for z in 0..m.depth {
-            for y in 0..m.height {
-                let at = start(z, y);
-                if hit(at + lo, at + hi) {
-                    (y0, y1) = (y0.min(y), y1.max(y + 1));
+            for first_y in (0..m.height).step_by(band_height as usize) {
+                if tiled_mip {
+                    // A full band occupies one row of blocks. Strip the
+                    // within-block Y and Z bits to test its enclosing span.
+                    let base = start(z, first_y) & !(block_bytes - 1);
+                    let end = base + (m.pitch / self.block[0]) as usize * block_bytes;
+                    if !hit(base, end) {
+                        continue;
+                    }
+                }
+                for y in first_y..(first_y + band_height).min(m.height) {
+                    let at = start(z, y);
+                    if hit(at + lo, at + hi) {
+                        (y0, y1) = (y0.min(y), y1.max(y + 1));
+                    }
                 }
             }
         }
@@ -1566,12 +1576,81 @@ mod tests {
         assert!(odd_start > 0);
     }
 
+    #[test]
+    fn tiled_dirty_bands_match_a_scan_of_element_addresses() {
+        for (dimension, swizzle) in [
+            (Dimension::Tex2d, Swizzle::SW_256B_D),
+            (Dimension::Tex2d, Swizzle::SW_4KB_D),
+            (Dimension::Tex2d, Swizzle::SW_64KB_D),
+            (Dimension::Tex3d, Swizzle::SW_4KB_S),
+            (Dimension::Tex3d, Swizzle::SW_64KB_S),
+        ] {
+            for element_bytes in [1, 2, 4, 8, 16] {
+                let l = Layout::new(&Desc {
+                    dimension,
+                    depth: 3,
+                    ..desc(259, 137, 7, element_bytes, swizzle)
+                })
+                .unwrap();
+                let slice = u32::from(dimension == Dimension::Tex2d);
+                for (mip, m) in l.mips.iter().enumerate() {
+                    let rows: Vec<_> = (0..m.depth)
+                        .flat_map(|z| (0..m.height).map(move |y| (z, y)))
+                        .map(|(z, y)| {
+                            let offsets = (0..m.width).map(|x| {
+                                l.offset(mip as u32, x, y, slice + z).unwrap() as usize
+                            });
+                            let lo = offsets.clone().min().unwrap();
+                            let hi = offsets.max().unwrap() + element_bytes as usize;
+                            (y, lo, hi)
+                        })
+                        .collect();
+                    let (_, first, _) = rows[0];
+                    let (_, middle, _) = rows[rows.len() / 2];
+                    let (_, _, end) = rows[rows.len() - 1];
+                    for ranges in [
+                        &[][..],
+                        &[(first, first + 1)],
+                        &[(middle, middle + 1)],
+                        &[(end - 1, end)],
+                        &[(first, first + 1), (end - 1, end)],
+                        &[(0, l.size as usize)],
+                    ] {
+                        let mut y0 = m.height;
+                        let mut y1 = 0;
+                        for &(y, lo, hi) in &rows {
+                            if ranges.iter().any(|&(a, b)| lo < b && a < hi) {
+                                (y0, y1) = (y0.min(y), y1.max(y + 1));
+                            }
+                        }
+                        let expected = if y0 < y1 {
+                            let (mut lo, mut hi) = (usize::MAX, 0);
+                            for &(_, a, b) in rows.iter().filter(|r| (y0..y1).contains(&r.0)) {
+                                (lo, hi) = (lo.min(a), hi.max(b));
+                            }
+                            (y0..y1, lo..hi)
+                        } else {
+                            (0..0, 0..0)
+                        };
+                        assert_eq!(
+                            l.touched_rows(mip as u32, slice, ranges),
+                            Some(expected),
+                            "{dimension:?} {swizzle:?}, {element_bytes} B, mip {mip}, {ranges:?}",
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     /// Timing (run with --release --ignored --nocapture): one 64 KiB page
     /// written into mip 0 of a 4096x4096 BC7 texture, detiled whole (as a
     /// changed subresource is without the rows) and as its touched rows.
     #[test]
     #[ignore]
     fn detile_the_rows_of_one_written_page_of_a_4k_bc7_texture() {
+        use std::hint::black_box;
+
         let d = Desc {
             block: 4,
             ..desc(4096, 4096, 13, 16, Swizzle::SW_64KB_S)
@@ -1581,11 +1660,23 @@ mod tests {
         let tiled: Vec<u8> = (0..l.size as usize).map(|i| (i * 31) as u8).collect();
         let row = m.width as usize * 16;
         let mut linear = vec![0u8; row * m.height as usize];
-        let from = (l.mips[0].offset as usize
-            + (m.width as usize * 16 * m.height as usize) / 2)
+        let from = (l.mips[0].offset as usize + (m.width as usize * 16 * m.height as usize) / 2)
             / 65536
             * 65536;
         let ranges = [(from, from + 65536)];
+        let queries = 20_000;
+        let t = std::time::Instant::now();
+        for _ in 0..queries {
+            black_box(
+                black_box(&l)
+                    .touched_rows(0, 0, black_box(&ranges))
+                    .unwrap(),
+            );
+        }
+        println!(
+            "BC7 4096x4096 mip 0 dirty-row query: {:?}",
+            t.elapsed() / queries
+        );
         let runs = 20;
         let t = std::time::Instant::now();
         for _ in 0..runs {

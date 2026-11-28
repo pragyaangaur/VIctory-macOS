@@ -23,6 +23,7 @@ use crate::structure::{Atom, Bool, LaneExit, Map, Set, Structured};
 mod atomics;
 mod barriers;
 mod bvh;
+mod descriptor_records;
 mod f64;
 mod first_lane;
 /// Format loads that move 16-bit halves without the d16 form, a child
@@ -465,6 +466,10 @@ struct Lower<'a> {
     balloting: Set<Value>,
     /// Block writing each value.
     def_block: Map<Value, usize>,
+    /// Index in its block of the instruction writing each value (phis have
+    /// none): [`Lower::def_site`] without walking the block, which made
+    /// lowering quadratic in a long block's length.
+    def_index: Map<Value, usize>,
     /// IR block being lowered.
     cur_ir: usize,
     /// Whole-wave sections by block and start index.
@@ -981,6 +986,18 @@ impl<'a> Lower<'a> {
                         .chain(block.phis.iter().map(move |phi| (phi.value, b)))
                 })
                 .collect(),
+            def_index: {
+                let mut at = Map::default();
+                for block in &p.blocks {
+                    for (i, inst) in block.insts.iter().enumerate() {
+                        for w in &inst.writes {
+                            // The first writer, as a walk from the start finds.
+                            at.entry(w.1).or_insert(i);
+                        }
+                    }
+                }
+                at
+            },
             cur_ir: 0,
             sections: HashMap::new(),
             section_out: Set::default(),
@@ -2378,12 +2395,7 @@ impl<'a> Lower<'a> {
         {
             return Err("a register joining a lane mask and data, read as data");
         }
-        let &b = self.def_block.get(&lo).ok_or(ELSEWHERE)?;
-        let inst = p.blocks[b]
-            .insts
-            .iter()
-            .find(|i| i.writes.iter().any(|w| w.1 == lo))
-            .ok_or(ELSEWHERE)?;
+        let (b, _, inst) = self.def_site(lo).ok_or(ELSEWHERE)?;
         let Fields::Sop {
             dst: Some(Operand::Scalar { code, .. }),
             src,
@@ -3345,11 +3357,7 @@ impl<'a> Lower<'a> {
                 .find(|q| q.reg == h)
                 .map(|q| q.value);
         }
-        let b = *self.def_block.get(&lo)?;
-        let inst = p.blocks[b]
-            .insts
-            .iter()
-            .find(|i| i.writes.iter().any(|w| w.1 == lo))?;
+        let (_, _, inst) = self.def_site(lo)?;
         let &(reg, _) = inst.writes.iter().find(|w| w.1 == lo)?;
         inst.write(pick(reg)?)
     }
@@ -4931,7 +4939,10 @@ impl<'a> Lower<'a> {
                 .find_map(|&(s, _)| use_of(s))
         });
         let Some((at, first)) = use_at else {
-            return self.view_addresses(inst, site, code, count);
+            return match self.unused_buffer(site) {
+                Some(props) => self.buffer_records(inst, site, code, count, props),
+                None => self.view_addresses(inst, site, code, count),
+            };
         };
         let src = Source::Loaded { load: site, first };
         let used = self.used_kind(&src);
@@ -5146,8 +5157,8 @@ impl<'a> Lower<'a> {
     /// key, in registers, before any of them locks. One pass a group: the
     /// lowest lane remaining leads, the lanes on its texel contribute to
     /// two wave maxima — the group's high dword, then the low dwords of
-    /// its best — and the lead takes the result while they leave. The
-    /// loop is wave-uniform: `remaining` is the ballot the caller took
+    /// its best — and the lead takes the result while they leave. A
+    /// singleton already holds its maximum. The loop is wave-uniform: `remaining` is the ballot the caller took
     /// where its guard was live, and every other edge carries another
     /// ballot, so every lane runs it alike and the wave operations inside
     /// see the participating set. A wave wider than 32 lanes has bits the
@@ -5161,11 +5172,11 @@ impl<'a> Lower<'a> {
         let k = |l: &mut Self, v: u32| l.s.m.i32(v);
         let (zero, one) = (k(self, 0), k(self, 1));
         let (yes, no) = (self.s.m.bool(true), self.s.m.bool(false));
-        let mut blocks = [0; 3];
+        let mut blocks = [0; 5];
         for b in &mut blocks {
             *b = self.s.m.new_block();
         }
-        let [head, body, done] = blocks;
+        let [head, body, reduce, next, done] = blocks;
         self.s.m.terminate(c, Term::Br(head));
         let remaining = self.s.m.phi(head, i32t);
         let rep = self.s.m.phi(head, i1);
@@ -5173,18 +5184,9 @@ impl<'a> Lower<'a> {
         let ghi = self.s.m.phi(head, i32t);
         let more = self.s.m.cmp(head, pred::NE, remaining, zero);
         self.s.m.terminate(head, Term::CondBr(more, body, done));
-        // The lead: the lowest lane remaining, by halving.
-        let mut x = remaining;
-        let mut lead = zero;
-        for b in [16u32, 8, 4, 2, 1] {
-            let (mask, step) = (k(self, (1 << b) - 1), k(self, b));
-            let low = self.s.m.bin(body, Bin::And, x, mask);
-            let has = self.s.m.cmp(body, pred::NE, low, zero);
-            let up = self.s.m.bin(body, Bin::Add, lead, step);
-            lead = self.s.m.select(body, has, lead, up);
-            let high = self.s.m.bin(body, Bin::LShr, x, step);
-            x = self.s.m.select(body, has, low, high);
-        }
+        // The body is reached only with a nonempty ballot, so FirstbitLo
+        // returns the lowest numbered lane remaining.
+        let lead = self.unary_bits(body, 32, remaining);
         // The group: the lanes remaining on the lead's texel.
         let mut same = yes;
         for &ck in cs.iter().take(coords) {
@@ -5201,41 +5203,51 @@ impl<'a> Lower<'a> {
         let four = self.s.m.named_struct("dx.types.fouri32", vec![i32t; 4]);
         let group = self.s.op(body, "waveActiveBallot", Attr::NoUnwind, four, 116, &[same]);
         let group = self.s.m.extract(body, group, 0);
+        // The ballot is uniform. A single lane already has its own maximum.
+        let lower = self.s.m.bin(body, Bin::Sub, group, one);
+        let rest = self.s.m.bin(body, Bin::And, group, lower);
+        let multiple = self.s.m.cmp(body, pred::NE, rest, zero);
+        self.s.m.terminate(body, Term::CondBr(multiple, reduce, next));
         // The group's maximum key, in two maxima.
         let (kind, unsigned) = (self.s.m.i8(3), self.s.m.i8(1));
-        let offer_hi = self.s.m.select(body, same, ghi, zero);
+        let offer_hi = self.s.m.select(reduce, same, ghi, zero);
         let g_hi = self.s.op(
-            body,
+            reduce,
             "waveActiveOp.i32",
             Attr::NoUnwind,
             i32t,
             119,
             &[offer_hi, kind, unsigned],
         );
-        let best = self.s.m.cmp(body, pred::EQ, ghi, g_hi);
-        let same_lo = self.s.m.select(body, same, glo, zero);
-        let offer_lo = self.s.m.select(body, best, same_lo, zero);
+        let best = self.s.m.cmp(reduce, pred::EQ, ghi, g_hi);
+        let same_lo = self.s.m.select(reduce, same, glo, zero);
+        let offer_lo = self.s.m.select(reduce, best, same_lo, zero);
         let g_lo = self.s.op(
-            body,
+            reduce,
             "waveActiveOp.i32",
             Attr::NoUnwind,
             i32t,
             119,
             &[offer_lo, kind, unsigned],
         );
+        self.s.m.terminate(reduce, Term::Br(next));
+        let selected_lo = self.s.m.phi(next, i32t);
+        let selected_hi = self.s.m.phi(next, i32t);
+        self.s.m.set_phi(selected_lo, vec![(glo, body), (g_lo, reduce)]);
+        self.s.m.set_phi(selected_hi, vec![(ghi, body), (g_hi, reduce)]);
         // The lead takes the group's key; the group leaves.
-        let am = self.s.m.cmp(body, pred::EQ, me, lead);
-        let nlo = self.s.m.select(body, am, g_lo, glo);
-        let nhi = self.s.m.select(body, am, g_hi, ghi);
-        let nrep = self.s.m.bin(body, Bin::Or, rep, am);
+        let am = self.s.m.cmp(next, pred::EQ, me, lead);
+        let nlo = self.s.m.select(next, am, selected_lo, glo);
+        let nhi = self.s.m.select(next, am, selected_hi, ghi);
+        let nrep = self.s.m.bin(next, Bin::Or, rep, am);
         let not_group = k(self, u32::MAX);
-        let flip = self.s.m.bin(body, Bin::Xor, group, not_group);
-        let left = self.s.m.bin(body, Bin::And, remaining, flip);
-        self.s.m.terminate(body, Term::Br(head));
-        self.s.m.set_phi(remaining, vec![(present, c), (left, body)]);
-        self.s.m.set_phi(rep, vec![(no, c), (nrep, body)]);
-        self.s.m.set_phi(glo, vec![(vlo, c), (nlo, body)]);
-        self.s.m.set_phi(ghi, vec![(vhi, c), (nhi, body)]);
+        let flip = self.s.m.bin(next, Bin::Xor, group, not_group);
+        let left = self.s.m.bin(next, Bin::And, remaining, flip);
+        self.s.m.terminate(next, Term::Br(head));
+        self.s.m.set_phi(remaining, vec![(present, c), (left, next)]);
+        self.s.m.set_phi(rep, vec![(no, c), (nrep, next)]);
+        self.s.m.set_phi(glo, vec![(vlo, c), (nlo, next)]);
+        self.s.m.set_phi(ghi, vec![(vhi, c), (nhi, next)]);
         self.cur = done;
         let lo = self.s.m.cast(done, Cast::ZExt, glo, i64t);
         let hi = self.s.m.cast(done, Cast::ZExt, ghi, i64t);
@@ -10444,11 +10456,7 @@ impl<'a> Lower<'a> {
             let io = self.x.io.inputs.iter().any(|i| i.0 == v);
             return (vgpr && !io).then_some(true);
         };
-        let (i, inst) = p.blocks[b]
-            .insts
-            .iter()
-            .enumerate()
-            .find(|(_, i)| i.writes.iter().any(|w| w.1 == v))?;
+        let (_, i, inst) = self.def_site(v)?;
         let Fields::Valu(f) = &inst.fields else {
             return None;
         };
@@ -11580,11 +11588,9 @@ impl<'a> Lower<'a> {
     /// The block, instruction index, and instruction writing `v`.
     fn def_site(&self, v: Value) -> Option<(usize, usize, &'a Inst)> {
         let b = *self.def_block.get(&v)?;
-        let (i, inst) = self.x.p.blocks[b]
-            .insts
-            .iter()
-            .enumerate()
-            .find(|(_, inst)| inst.writes.iter().any(|w| w.1 == v))?;
+        let i = *self.def_index.get(&v)?;
+        let inst = self.x.p.blocks[b].insts.get(i)?;
+        debug_assert!(inst.writes.iter().any(|w| w.1 == v));
         Some((b, i, inst))
     }
 

@@ -956,6 +956,9 @@ pub(crate) struct HostTexture {
     /// When the title last used it: presented frame and milliseconds since
     /// the first stamp ([`HostTexture::stamp`]).
     last: [std::sync::atomic::AtomicU64; 2],
+    /// Host submissions handed to the queue when it was made
+    /// (`crate::host::submissions_begun`): see [`HostTexture::fresh`].
+    made_in: u64,
 }
 
 #[cfg(windows)]
@@ -991,7 +994,16 @@ impl HostTexture {
             key: None,
             placement: None,
             last: [crate::queue::presented().into(), now_ms().into()],
+            made_in: crate::host::submissions_begun(),
         }
+    }
+
+    /// Whether a submission handed to the queue before it was made may
+    /// still run (`VICTORY_SHOW_AFTER`, `crate::descriptor::host`): lists
+    /// already on the GPU read heap slots by index, and a slot changed to
+    /// this texture now would be read by them.
+    pub(crate) fn fresh(&self) -> bool {
+        self.made_in > crate::host::submissions_done()
     }
 
     /// Whether its contents come from title memory: the host GPU does not

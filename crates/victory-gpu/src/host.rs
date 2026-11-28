@@ -860,6 +860,133 @@ pub(crate) mod tests {
         }
     }
 
+    /// While [`ShowAfterScene`] lives, this thread takes `VICTORY_SHOW_AFTER`
+    /// as `on` and holds the submission lock, so the submission counters
+    /// change only as the test says (one submission begun, then run); both
+    /// are put back when it goes.
+    struct ShowAfterScene<'a> {
+        // Dropped before the lock: what is made under it (a view heap) does
+        // not take the lock again (`Host::quiet`) while this is held.
+        _holding: Holding,
+        _one: std::sync::MutexGuard<'a, u64>,
+        done: u64,
+    }
+
+    impl ShowAfterScene<'_> {
+        fn new(host: &Host, on: bool) -> ShowAfterScene<'_> {
+            let one = host.submitted.lock().unwrap_or_else(|e| e.into_inner());
+            let holding = Holding::enter();
+            crate::descriptor::host::set_show_after(Some(on));
+            let done = SUBMISSIONS_DONE.load(Ordering::Acquire);
+            SUBMISSIONS_BEGUN.store(done, Ordering::Release);
+            ShowAfterScene { _holding: holding, _one: one, done }
+        }
+
+        /// A submission is handed to the queue and still runs.
+        fn begin(&self) {
+            SUBMISSIONS_BEGUN.store(self.done + 1, Ordering::Release);
+        }
+
+        /// That submission has run: none runs any more.
+        fn finish(&self) {
+            SUBMISSIONS_DONE.store(self.done + 1, Ordering::Release);
+        }
+    }
+
+    impl Drop for ShowAfterScene<'_> {
+        fn drop(&mut self) {
+            // Back to `*submitted`, which the lock kept as it was.
+            SUBMISSIONS_DONE.store(self.done, Ordering::Release);
+            SUBMISSIONS_BEGUN.store(self.done, Ordering::Release);
+            crate::descriptor::host::set_show_after(None);
+        }
+    }
+
+    /// A title heap of 4 view slots with a 12x1 RGBA8 placed texture viewed
+    /// at slot 0, made in it; and a way to write a view of another texture
+    /// of the same memory there (`n` 1, 2, ...: its offset), as the title
+    /// would. Placed textures are kept by address and description for the
+    /// process (`resource::texture_at`), so the memory is never freed and
+    /// the width is one no other test uses: a texture another test made at
+    /// a reused address would not be new.
+    fn show_after_heap() -> (&'static crate::descriptor::Heap, impl Fn(u64)) {
+        let memory: &'static [u8] = Vec::leak(vec![0u8; 1 << 17]);
+        let null = std::ptr::null();
+        let heap_desc: [u32; 8] = [0, 4, 1, 0, 0, 0, 0, 0];
+        let mut heap = null;
+        let iid = crate::object::guid(0x8efb471d, 0x616c, 0x4f49, [0x90, 0xf7, 0x12, 0x7b, 0xb7, 0x63, 0xfa, 0x51]);
+        assert_eq!(crate::descriptor::create_heap(null, heap_desc.as_ptr().cast(), &iid, &mut heap), 0);
+        let title_heap = crate::descriptor::heap(heap);
+        let base = memory.as_ptr() as u64;
+        let start = title_heap.start;
+        let write = move |n: u64| {
+            let words: [u32; 14] = [3, 0, 0, 0, 12, 0, 1, 1 | 1 << 16, 28, 1, 0, 0x100, 0, 0];
+            let address = base + n * (1 << 13);
+            let mut view = [0u32; 16];
+            view[..6].copy_from_slice(&[28, 4, 0x1688, 0, 0, 1]);
+            (view[10], view[11]) = (address as u32, (address >> 32) as u32);
+            crate::descriptor::create_placed_srv(std::ptr::null(), &words, &view, start);
+        };
+        write(0);
+        let heap_host = title_heap.host().expect("a host view heap");
+        assert!(heap_host.mirror(0, start, true).is_some());
+        assert!(heap_host.texture_slot_made_from(0, start), "the first texture shown");
+        (title_heap, write)
+    }
+
+    /// `VICTORY_SHOW_AFTER=1`: a slot whose new record views a texture made
+    /// while a submission runs keeps showing what it showed (lists on the
+    /// GPU read it by index), and is made from the new record at the next
+    /// submission's preparation, when none runs.
+    #[test]
+    fn show_after_holds_a_slot_of_a_fresh_texture_until_the_next_submission() {
+        let Some(host) = host() else { return };
+        let scene = ShowAfterScene::new(host, true);
+        let (title_heap, write) = show_after_heap();
+        let heap_host = title_heap.host().expect("a host view heap");
+        scene.begin();
+        write(1);
+        assert!(heap_host.mirror(0, title_heap.start, true).is_some(), "the new view, for the draw's list");
+        assert!(heap_host.is_held(0), "held while the submission runs");
+        assert!(!heap_host.texture_slot_made_from(0, title_heap.start), "the slot still shows the first texture");
+        scene.finish();
+        assert_eq!(heap_host.show_held(), 1);
+        assert!(!heap_host.is_held(0));
+        assert!(heap_host.texture_slot_made_from(0, title_heap.start), "the new texture shown");
+    }
+
+    /// Without the switch a slot is made at once, as before.
+    #[test]
+    fn show_after_off_makes_a_slot_of_a_fresh_texture_at_once() {
+        let Some(host) = host() else { return };
+        let scene = ShowAfterScene::new(host, false);
+        let (title_heap, write) = show_after_heap();
+        let heap_host = title_heap.host().expect("a host view heap");
+        scene.begin();
+        write(1);
+        assert!(heap_host.mirror(0, title_heap.start, true).is_some());
+        assert!(!heap_host.is_held(0));
+        assert!(heap_host.texture_slot_made_from(0, title_heap.start), "made at once");
+    }
+
+    /// A held slot the title wrote again before the next submission is not
+    /// made from the record it was held for: that write is the slot's.
+    #[test]
+    fn show_after_drops_a_held_slot_the_title_wrote_again() {
+        let Some(host) = host() else { return };
+        let scene = ShowAfterScene::new(host, true);
+        let (title_heap, write) = show_after_heap();
+        let heap_host = title_heap.host().expect("a host view heap");
+        scene.begin();
+        write(1);
+        assert!(heap_host.mirror(0, title_heap.start, true).is_some());
+        assert!(heap_host.is_held(0));
+        write(2);
+        scene.finish();
+        assert_eq!(heap_host.show_held(), 0, "the record held for is gone");
+        assert!(!heap_host.is_held(0));
+    }
+
     /// The idle rule against the heap reads that thrashed (run evict1): a
     /// texture shaders read through the heap in every frame stays over more
     /// frames and time than the idle limits; one read once is given up. A
@@ -2237,6 +2364,7 @@ impl Host {
             .unwrap_or(&[]);
         for (i, group) in groups.iter().enumerate() {
             *submitted += 1;
+            SUBMISSIONS_BEGUN.store(*submitted, Ordering::Release);
             let started = std::time::Instant::now();
             #[cfg(feature = "diagnostics")]
             crate::resource::life::note(0, crate::resource::life::SUBMITTED, *submitted, 0);
@@ -2411,6 +2539,9 @@ impl Host {
         #[cfg(feature = "diagnostics")]
         let syncing = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::SyncHeapsUs);
         crate::descriptor::sync_heaps();
+        // Slots left as they were while the last submission ran, because
+        // the texture they now view was made meanwhile (`VICTORY_SHOW_AFTER`).
+        crate::descriptor::show_held();
         #[cfg(feature = "diagnostics")]
         drop(syncing);
         // Textures heap-indexing shaders may read, and textures read through
@@ -2918,6 +3049,7 @@ impl Host {
     /// own. Under the submission lock.
     fn runs(&self, submitted: &mut u64, mark: &Mark) -> bool {
         *submitted += 1;
+        SUBMISSIONS_BEGUN.store(*submitted, Ordering::Release);
         mark.arm(*submitted);
         let queue = self.queue();
         // SAFETY: a closed list; the fence and event are ours.
@@ -3465,15 +3597,16 @@ impl HostList {
         depth: &std::sync::Arc<crate::resource::HostTexture>,
         side: u8,
         writes: bool,
+        whole: bool,
     ) -> Option<bool> {
         let mut twins = self.twins.lock().unwrap_or_else(|e| e.into_inner());
         match twins.entry(std::sync::Arc::as_ptr(depth) as usize) {
             std::collections::hash_map::Entry::Vacant(v) => {
-                v.insert(crate::twin::Use::new(depth, side, writes));
+                v.insert(crate::twin::Use::new(depth, side, writes, whole));
                 None
             }
             std::collections::hash_map::Entry::Occupied(mut o) => {
-                let copy = o.get_mut().again(side, writes);
+                let copy = o.get_mut().again(side, writes, whole);
                 if copy.is_some() || writes {
                     self.changed_something();
                 }
@@ -5866,6 +5999,7 @@ impl Meter {
                 crate::texture::ALIAS_COPIES.swap(0, Ordering::Relaxed) as f64 / report_frames,
                 crate::twin::COPIES.swap(0, Ordering::Relaxed) as f64 / report_frames,
             );
+            crate::twin::log(report_frames);
             crate::draw::table_memo_line(report_frames);
             // How long the threads that ran held work were held by it: a
             // title thread waits there instead of going on with its frame.
@@ -6399,6 +6533,18 @@ pub(super) static SUBMISSIONS_DONE: std::sync::atomic::AtomicU64 =
 /// Number of completed host submissions so far.
 pub(crate) fn submissions_done() -> u64 {
     SUBMISSIONS_DONE.load(Ordering::Acquire)
+}
+
+/// Host submission count when the latest one was handed to the queue
+/// (`Host::execute`, Flight-1 and the queue check): stored before its lists
+/// go to the queue, under `Host::submitted`.
+pub(super) static SUBMISSIONS_BEGUN: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Number of host submissions handed to the queue so far. While it is
+/// ahead of [`submissions_done`], the GPU may still run the newest ones.
+pub(crate) fn submissions_begun() -> u64 {
+    SUBMISSIONS_BEGUN.load(Ordering::Acquire)
 }
 
 /// How many host submissions a retired GPU object or recycled command list

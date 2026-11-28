@@ -12,7 +12,9 @@
 //!    lane holds the same function of the same scalars. The scalars are
 //!    root parameters and what scalar loads and scalar ALU operations make
 //!    of them: what each host half computes for itself in every halves
-//!    translation, none of them made from a lane mask or a lane's value.
+//!    translation, none of them made from a lane mask or a lane's value. A
+//!    multiply-accumulate (`v_mac_f32`, `v_fmac_f32`) adds to its old
+//!    destination, which is held to the same as its operands.
 //! 2. **Only lanes EXEC has at the read see the result.** A half with no
 //!    active lane reads a lane of its own that does not hold the value; that
 //!    is harmless only if no lane outside the read's EXEC ever sees what it
@@ -185,14 +187,26 @@ impl Analysis<'_, '_> {
             && f.carry.is_none()
             && f.opsel == 0
             && ![
-                "lane", "cndmask", "mbcnt", "_co_", "interp", "mac", "dot", "cmp", "16", "mix",
-                "perm", "sad", "msad", "qsad",
+                "lane", "cndmask", "mbcnt", "_co_", "interp", "dot", "cmp", "16", "mix", "perm",
+                "sad", "msad", "qsad",
             ]
             .iter()
             .any(|n| name.contains(n));
         if !plain || self.exec(inst) != Some(exec) || !matches!(f.dst, Some(Operand::Vector { .. }))
         {
             return false;
+        }
+        // A multiply-accumulate adds to its old destination: an operand too.
+        if name.contains("mac") {
+            let Some(Operand::Vector { reg, .. }) = f.dst else {
+                return false;
+            };
+            if !inst
+                .read(Reg::V(reg))
+                .is_some_and(|old| self.active_alike(old, exec, memo))
+            {
+                return false;
+            }
         }
         f.src.iter().all(|op| match *op {
             Operand::Const(c) => c < 251,

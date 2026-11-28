@@ -19,7 +19,9 @@
 //! depth gets no twin. Upgrade when a frame trace shows such a use, or the
 //! copies (counted on the frame-rate line) cost.
 
+use std::cell::Cell;
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering::Relaxed};
 
 use windows::Win32::Graphics::Direct3D12::*;
@@ -45,6 +47,66 @@ const RESOLVE_DEST: u32 = 0x1000;
 /// Copies between a depth texture and its twin since the last frame-rate
 /// line (either way, within lists and at submission).
 pub(crate) static COPIES: AtomicU64 = AtomicU64::new(0);
+
+/// Since the last frame-rate line: copies into the depth texture and into
+/// the twin, the bytes they moved (the twin's side), and the copies into
+/// the depth texture a whole clear made pointless (`CLEARED`: owed before
+/// a clear of every plane of a one-subresource texture; `SKIPPED`: of
+/// those, left out, with `VICTORY_TWIN_CLEAR_SKIP=1`).
+static INTO_DEPTH: AtomicU64 = AtomicU64::new(0);
+static INTO_TWIN: AtomicU64 = AtomicU64::new(0);
+static BYTES: AtomicU64 = AtomicU64::new(0);
+static CLEARED: AtomicU64 = AtomicU64::new(0);
+static SKIPPED: AtomicU64 = AtomicU64::new(0);
+
+/// `VICTORY_TWIN_CLEAR_SKIP=1`: a clear that overwrites a whole depth
+/// texture needs none of its older contents, so the copy into it from a
+/// newer twin is left out.
+fn clear_skip() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| crate::switch::on("VICTORY_TWIN_CLEAR_SKIP"))
+}
+
+thread_local! {
+    /// While the use being routed is a clear without rectangles
+    /// (`overwriting`): its flags (1 depth, 2 stencil); else 0.
+    static WHOLE: Cell<u32> = const { Cell::new(0) };
+}
+
+/// Runs `f`, the transition for a clear without rectangles of the planes
+/// `flags` names (1 depth, 2 stencil): if those are all the texture has and
+/// it has one subresource per plane, the use overwrites all of it.
+pub(crate) fn overwriting<R>(flags: u32, f: impl FnOnce() -> R) -> R {
+    WHOLE.with(|w| w.set(flags & 3));
+    let r = f();
+    WHOLE.with(|w| w.set(0));
+    r
+}
+
+/// Whether a clear of the planes `flags` names overwrites a texture whose
+/// twin has `planes` planes and `routes` subresources in all.
+fn covers(flags: u32, planes: usize, routes: usize) -> bool {
+    let need = if planes > 1 { 3 } else { 1 };
+    flags & need == need && routes == planes
+}
+
+/// The twin copy line, after the frame-rate line's total.
+pub(crate) fn log(frames: f64) {
+    let [depth, twin, bytes, cleared, skipped] =
+        [&INTO_DEPTH, &INTO_TWIN, &BYTES, &CLEARED, &SKIPPED].map(|c| c.swap(0, Relaxed));
+    if depth + twin + cleared == 0 {
+        return;
+    }
+    tracing::info!(
+        "depth twin copies: {:.1}/frame into depth, {:.1}/frame into twins, {:.1} MB/frame; \
+         {:.1}/frame into depth before a whole clear, {:.1}/frame of them left out (VICTORY_TWIN_CLEAR_SKIP)",
+        depth as f64 / frames,
+        twin as f64 / frames,
+        bytes as f64 / frames / 1e6,
+        cleared as f64 / frames,
+        skipped as f64 / frames,
+    );
+}
 
 pub(crate) struct Twin {
     /// The colour texture of each plane the depth texture has (depth, then
@@ -83,6 +145,8 @@ struct Route {
 pub(crate) struct Use {
     first: u8,
     last: Option<u8>,
+    /// The first use overwrites the whole depth texture (`Use::new`).
+    whole: bool,
     depth: Arc<HostTexture>,
 }
 
@@ -320,7 +384,9 @@ fn integer(format: u32) -> bool {
 pub(crate) fn route(list: &HostList, depth: &Arc<HostTexture>, twin: &Twin, wanted: u32) -> bool {
     let side = if wanted & UNORDERED_ACCESS != 0 { TWIN } else { DEPTH };
     let writes = side == TWIN || wanted & (DEPTH_WRITE | RENDER_TARGET | COPY_DEST | RESOLVE_DEST) != 0;
-    if let Some(to_depth) = list.twin_use(depth, side, writes)
+    // A whole clear: one subresource per plane, so its view covers it all.
+    let whole = side == DEPTH && writes && covers(WHOLE.with(Cell::get), twin.planes.len(), twin.routes.len());
+    if let Some(to_depth) = list.twin_use(depth, side, writes, whole)
         && twin.copy(&list.list, depth, to_depth, &mut |t, w| list.move_texture(t, w))
     {
         list.need_rebind();
@@ -337,15 +403,31 @@ pub(crate) fn route(list: &HostList, depth: &Arc<HostTexture>, twin: &Twin, want
 }
 
 impl Use {
-    pub(crate) fn new(depth: &Arc<HostTexture>, side: u8, writes: bool) -> Self {
-        Use { first: side, last: writes.then_some(side), depth: depth.clone() }
+    /// `whole`: the use overwrites every byte of the depth texture (a
+    /// whole clear), so a copy owed into it is pointless.
+    pub(crate) fn new(depth: &Arc<HostTexture>, side: u8, writes: bool, whole: bool) -> Self {
+        Use { first: side, last: writes.then_some(side), whole, depth: depth.clone() }
     }
 
     /// A later use in the list needing `side`: whether a copy must be
     /// recorded first (true: into the depth texture).
-    pub(crate) fn again(&mut self, side: u8, writes: bool) -> Option<bool> {
-        again(self.first, &mut self.last, side, writes)
+    pub(crate) fn again(&mut self, side: u8, writes: bool, whole: bool) -> Option<bool> {
+        let copy = again(self.first, &mut self.last, side, writes);
+        cleared(copy, whole, clear_skip())
     }
+}
+
+/// A copy owed before a use: left out (`None`) if the use overwrites it
+/// all and `skip` is on; counted as pointless either way.
+fn cleared(copy: Option<bool>, whole: bool, skip: bool) -> Option<bool> {
+    if copy == Some(true) && whole {
+        CLEARED.fetch_add(1, Relaxed);
+        if skip {
+            SKIPPED.fetch_add(1, Relaxed);
+            return None;
+        }
+    }
+    copy
 }
 
 /// [`Use::again`] on its first side and the side it left newer.
@@ -388,7 +470,7 @@ pub(crate) fn at_submission<'a>(uses: impl Iterator<Item = &'a Use>) -> Vec<(Arc
         let Some(Some(twin)) = u.depth.twin.get() else { continue };
         let (to_depth, after) = submitted(u.first, u.last, twin.newer.load(Relaxed));
         twin.newer.store(after, Relaxed);
-        if let Some(to_depth) = to_depth {
+        if let Some(to_depth) = cleared(to_depth, u.whole, clear_skip()) {
             copies.push((u.depth.clone(), to_depth));
         }
     }
@@ -466,6 +548,17 @@ impl Twin {
             l.ResourceBarrier(&[state(COPY_SOURCE as i32, 0)]);
         }
         COPIES.fetch_add(1, Relaxed);
+        if to_depth { &INTO_DEPTH } else { &INTO_TWIN }.fetch_add(1, Relaxed);
+        let moved: u64 = self
+            .routes
+            .iter()
+            .map(|r| {
+                u64::from(r.twin.Footprint.RowPitch)
+                    * u64::from(r.twin.Footprint.Height)
+                    * u64::from(r.twin.Footprint.Depth)
+            })
+            .sum();
+        BYTES.fetch_add(moved, Relaxed);
         #[cfg(feature = "diagnostics")]
         {
             use crate::copystat::{C, add};
@@ -588,6 +681,26 @@ mod tests {
         assert_eq!(again(DEPTH, &mut last, DEPTH, false), None);
         assert_eq!(again(DEPTH, &mut last, TWIN, true), Some(false));
         assert_eq!(last, Some(TWIN));
+    }
+
+    /// A clear overwrites a texture only with every plane it has and one
+    /// subresource per plane; only then is a copy into depth left out, and
+    /// only with the switch on.
+    #[test]
+    fn whole_clears_leave_out_the_copy_into_depth() {
+        assert!(covers(1, 1, 1));
+        assert!(!covers(1, 2, 2), "depth only, stencil kept");
+        assert!(covers(3, 2, 2));
+        assert!(!covers(3, 1, 4), "mips or slices the view may not cover");
+        assert!(!covers(0, 1, 1), "not a clear");
+        assert_eq!(cleared(Some(true), true, false), Some(true));
+        assert_eq!(cleared(Some(true), true, true), None);
+        assert_eq!(cleared(Some(true), false, true), Some(true));
+        assert_eq!(cleared(Some(false), true, true), Some(false), "a copy into the twin stays");
+        assert_eq!(cleared(None, true, true), None);
+        // Left out, the list still leaves the depth side newer.
+        let (copy, after) = submitted(DEPTH, Some(DEPTH), TWIN);
+        assert_eq!((cleared(copy, true, true), after), (None, DEPTH));
     }
 
     /// A list that writes a depth texture through its twin and then reads

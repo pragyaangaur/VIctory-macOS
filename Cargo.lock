@@ -802,6 +802,7 @@ dependencies = [
  "miniz_oxide",
  "rayon",
  "sha2",
+ "smallvec",
  "tempfile",
  "tracing",
  "tracing-subscriber",

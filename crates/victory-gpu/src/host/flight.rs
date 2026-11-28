@@ -223,6 +223,7 @@ impl Host {
             .unwrap_or(&[]);
 
         *submitted += 1;
+        super::SUBMISSIONS_BEGUN.store(*submitted, Ordering::Release);
         let fence_value = *submitted;
         #[cfg(feature = "diagnostics")]
         crate::resource::life::note(0, crate::resource::life::SUBMITTED, fence_value, 0);
