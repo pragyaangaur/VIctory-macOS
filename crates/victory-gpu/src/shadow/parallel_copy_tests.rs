@@ -237,3 +237,71 @@ fn marked_copy_back_serializes_mirrored_title_views() {
 fn marked_copy_back_serializes_subranges_of_one_tracked_page() {
     assert_eq!(exercise(Layout::SharesPage), (false, true));
 }
+
+/// One physical section with two title addresses, acquired through the
+/// registered-buffer lookup used by descriptor binding.
+#[test]
+#[ignore = "requires D3D12 and times title buffer shadow refreshes"]
+fn benchmark_mirrored_registered_buffers() {
+    const SAMPLES: usize = 9;
+    const PASSES: usize = 100;
+    let _quiet = host().expect("D3D12 host for buffer copies").quiet();
+    let memory = GuestMemory::mirrored();
+    let second = memory.mirror.unwrap();
+    let starts = [memory.base, second];
+    let copies = starts.map(|at| {
+        register(at, at as u64, COPY_LEN as u64);
+        find(at as u64, COPY_LEN as u64).expect("registered title buffer shadow")
+    });
+    let [a, b] = &copies;
+    let allocated: u64 = copies
+        .iter()
+        .map(|copy| {
+            // SAFETY: a live host buffer held by the shadow.
+            unsafe { copy.buffer.GetDesc().Width }
+        })
+        .sum();
+    assert_ne!(a.gpu(starts[0] as u64), b.gpu(starts[1] as u64));
+    assert_eq!(allocated, 2 * COPY_LEN as u64);
+    assert!(crate::watch::aliased(starts[0], COPY_LEN));
+    for sample in 0..=SAMPLES {
+        let mut bytes = 0;
+        let mut refreshed = 0;
+        let mut elapsed = std::time::Duration::ZERO;
+        for pass in 0..PASSES {
+            let written = (pass + sample * PASSES) as u8;
+            fill_title(starts[pass % starts.len()], COPY_LEN, written);
+            let started = std::time::Instant::now();
+            for (&at, copy) in starts.iter().zip(&copies) {
+                let copied = copy.update(at, COPY_LEN);
+                refreshed += usize::from(copied != 0);
+                bytes += copied;
+            }
+            elapsed += started.elapsed();
+            let expected = [u32::from_ne_bytes([written; 4]); 2];
+            for (&at, copy) in starts.iter().zip(&copies) {
+                assert_eq!(copy.read_host(at as u64, 2), expected);
+                assert_eq!(copy.read_host((at + COPY_LEN - 8) as u64, 2), expected);
+            }
+        }
+        assert_eq!(refreshed, PASSES * starts.len());
+        if sample > 0 {
+            eprintln!(
+                "physical_alias sample={sample} passes={PASSES} physical_bytes={COPY_LEN} allocated_bytes={allocated} refreshed={refreshed} refreshed_bytes={bytes} elapsed_ns={}",
+                elapsed.as_nanos()
+            );
+        }
+    }
+    // A GPU-equivalent byte write through one copy must preserve a
+    // neighboring CPU write through its other title alias during copy-back.
+    a.writing(starts[0], PAGE, false);
+    fill_title(starts[1] + 3, 1, 0xd8);
+    a.write_host(starts[0] as u64 + 2, &[0x67]);
+    assert_eq!(a.copy_back(starts[0], PAGE), PAGE);
+    b.update(starts[1], PAGE);
+    let value = b.read_host(starts[1] as u64, 1)[0];
+    assert_eq!(value.to_ne_bytes()[2..], [0x67, 0xd8]);
+    for at in starts {
+        unregister(at, at as u64);
+    }
+}
