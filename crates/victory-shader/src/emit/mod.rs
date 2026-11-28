@@ -154,16 +154,16 @@
 //!   (root type [`RootType::Descriptor`] in [`HostShader::user_data`],
 //!   dword 0 the address's low dword, 1 the high), and the host must have
 //!   a copy holding each such address.
-//! * **View addresses** ([`HostShader::view_addresses`]): a buffer
-//!   descriptor's dwords 0-1 read as numbers (the BVH SRV's base address)
-//!   and an image descriptor's dwords 1-3 read only for sizes come from the
-//!   root SRV `t1` in [`MEMORY_SPACE`]: per resource-heap index, four
-//!   dwords, a console descriptor's first four as far as the host knows
-//!   them: a buffer view's title address (high dword bits 0-15; stride bits
-//!   0), a texture view's width and height - 1 (dword 1 bits 30-31, dword 2
-//!   bits 0-13 and 14-29), first and last level (dword 3 bits 12-15, 16-19)
-//!   and type (bits 28-31) with an identity swizzle; zeros for anything
-//!   else.
+//! * **View addresses** ([`HostShader::view_addresses`]): words a program
+//!   reads as numbers from a buffer or image descriptor come from the root
+//!   SRV `t1` in [`MEMORY_SPACE`]. A 16-byte header contains the slot
+//!   count in dword 3, followed by four dwords per resource-heap index.
+//!   A buffer view holds its title address (high dword bits 0-15, stride
+//!   bits 0) and record count (dword 2, bytes for raw views and elements
+//!   for typed and structured views). A texture view holds width and
+//!   height - 1 (dword 1 bits 30-31, dword 2 bits 0-13 and 14-29), first
+//!   and last level (dword 3 bits 12-15, 16-19) and type (bits 28-31)
+//!   with an identity swizzle. Empty slots read zero.
 //! * **Write marks** ([`HostShader::view_marks`], with
 //!   [`Options::view_marks`]; added 2026-11-25): every store or atomic
 //!   through an unordered buffer view from the heap (tables, the heap

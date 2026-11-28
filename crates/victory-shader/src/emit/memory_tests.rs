@@ -381,10 +381,11 @@ fn title_memory_is_read_and_written_at_computed_addresses() {
     let value = 0xCAFE_F00D;
     // Heap index 1 (the memory's view) has the title address, index 2 a
     // texture's size fields.
-    let mut view_addresses = vec![0u32; 4 * 5];
-    view_addresses[4..6].copy_from_slice(&[TITLE as u32, (TITLE >> 32) as u32]);
+    let mut view_addresses = vec![0u32; 4 * 6];
+    view_addresses[3] = 5;
+    view_addresses[8..10].copy_from_slice(&[TITLE as u32, (TITLE >> 32) as u32]);
     let image = [0xC000_0000, 0x0957_C0F9, 0x9004_2FAC];
-    view_addresses[9..12].copy_from_slice(&image);
+    view_addresses[13..16].copy_from_slice(&image);
     let mut ran = 0;
     for (label, warp) in [("hardware", false), ("warp", true)] {
         let Ok(host) = Host::new(warp) else {

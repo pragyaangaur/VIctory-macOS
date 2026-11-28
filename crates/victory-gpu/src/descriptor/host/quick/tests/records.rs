@@ -142,7 +142,7 @@ fn gpu_reads_record_counts_from_tables_and_heaps_after_both_sync_modes() {
 
     for quick in [false, true] {
         let heap = HostHeap::new(false, SLOTS).expect("view heap");
-        let view_addresses = heap.view_addresses().expect("metadata buffer");
+        let (_, view_addresses) = heap.view_addresses().expect("metadata buffer");
         crate::descriptor::create_srv(null, source, &raw(4, 13), at(0));
         crate::descriptor::create_srv(null, source, &structured(4, 9), at(2));
         crate::descriptor::create_srv(null, source, &typed, at(3));
@@ -184,7 +184,8 @@ fn gpu_reads_record_counts_from_tables_and_heaps_after_both_sync_modes() {
             (3, fields(address + 24, 257)), // typed: elements
             (4, fields(address + 48, 4)),   // placed raw
             (5, fields(address + 16, 12)),  // raw UAV
-            (6, [0; 3]),                    // null
+            (6, [0; 3]),
+            (1 << 21, [0; 3]), // null
         ] {
             dispatch(slot, table, view);
         }
@@ -201,5 +202,13 @@ fn gpu_reads_record_counts_from_tables_and_heaps_after_both_sync_modes() {
     assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
     crate::object::release_ref(result);
     crate::object::release_ref(source);
-    eprintln!("executed 16 descriptor metadata GPU dispatches, checked 112 dwords");
+    eprintln!("executed 18 descriptor metadata GPU dispatches, checked 126 dwords");
+}
+
+#[test]
+fn record_count_uses_the_full_descriptor_word() {
+    assert_eq!(record_count(0, true), Some(0));
+    assert_eq!(record_count(u32::MAX, false), Some(u32::MAX));
+    assert_eq!(record_count(u32::MAX / 4, true), Some(u32::MAX - 3));
+    assert_eq!(record_count(u32::MAX / 4 + 1, true), None);
 }
