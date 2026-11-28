@@ -1296,6 +1296,8 @@ mod schedule;
 mod placed_uav_tests;
 #[cfg(all(test, windows))]
 mod thread_dispatch_tests;
+#[cfg(all(test, windows))]
+mod prewarm_cache_test;
 
 /// Keeps compiled host pipelines, and the list of title pipelines to start
 /// early, in `dir` (a folder of the cache) across runs.

@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use victory_shader::emit::host::{self, Host};
 use victory_shader::emit::{self, validator::Validator};
 use victory_shader::structure::{self, Atom, LaneExit};
@@ -333,17 +333,26 @@ pub fn run(
 /// same code, so a run finds it translated or refused. With `pipelines`,
 /// then the shader pack's pipelines go into the pipeline library
 /// (`prebuild`).
-pub fn warm(paths: Vec<PathBuf>, jobs: Option<usize>, pipelines: bool) -> Result<()> {
+pub fn warm(
+    paths: Vec<PathBuf>,
+    jobs: Option<usize>,
+    pipelines: bool,
+    pipeline_selection: Option<PathBuf>,
+) -> Result<()> {
     let paths = crate::default_paths(paths)?;
-    let shaders = victory_core::Config::load()?.cache_subdir("shaders")?;
-    let Some(dir) = victory_gpu::shader_cache::use_shader_cache(shaders.clone()) else {
-        anyhow::bail!("no shader cache in {}", shaders.display());
-    };
     let threads = thread_count(jobs);
-    // The pre-build's key listing (diagnostics) translates nothing.
-    if pipelines && std::env::var_os("VICTORY_PREBUILD_KEYS").is_some() {
-        return crate::prebuild::run(&paths, threads);
+    let keys_only = std::env::var_os("VICTORY_PREBUILD_KEYS").is_some();
+    if let Some(file) = pipeline_selection {
+        anyhow::ensure!(!keys_only, "unset VICTORY_PREBUILD_KEYS to pre-build a selection");
+        // The selected pipelines translate their own shaders as needed.
+        let keys = crate::prebuild::read_selection(&file)?;
+        return crate::prebuild::run(&paths, threads, Some(&keys));
     }
+    // The pre-build's key listing translates nothing.
+    if pipelines && keys_only {
+        return crate::prebuild::run(&paths, threads, None);
+    }
+    let dir = open_shader_cache()?;
     let started = std::time::Instant::now();
     let seen = Mutex::new(HashSet::new());
     // Containers already cached, translated now, refused now.
@@ -435,9 +444,16 @@ pub fn warm(paths: Vec<PathBuf>, jobs: Option<usize>, pipelines: bool) -> Result
         started.elapsed().as_secs_f64()
     );
     if pipelines {
-        crate::prebuild::run(&paths, threads)?;
+        crate::prebuild::run(&paths, threads, None)?;
     }
     Ok(())
+}
+
+/// Opens the same translated-shader cache as a run.
+pub(crate) fn open_shader_cache() -> Result<PathBuf> {
+    let shaders = victory_core::Config::load()?.cache_subdir("shaders")?;
+    victory_gpu::shader_cache::use_shader_cache(shaders.clone())
+        .with_context(|| format!("no shader cache in {}", shaders.display()))
 }
 
 /// Shows on stderr how far `workers` are through `file`'s `jobs` (`next`

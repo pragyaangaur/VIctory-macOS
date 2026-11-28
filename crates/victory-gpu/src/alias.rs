@@ -22,6 +22,7 @@ use windows_sys::Win32::System::Memory::{
 use crate::backend::HostMemory;
 use crate::host::host;
 use crate::watch::PAGE;
+use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
 
 #[cfg(any(test, feature = "diagnostics"))]
 use windows::Win32::Graphics::Direct3D12::*;
@@ -276,6 +277,20 @@ pub fn enabled() -> bool {
 
 /// Probes once whether `mach_vm_remap` onto a D3DMetal write-back L0 buffer
 /// works and whether fresh buffers arrive zero-initialized.
+/// D3DMetal places a buffer inside a larger one, at a 256-byte multiple, once
+/// small buffers are alive: on an M1 Max nearly every 64 KiB to 64 MiB buffer
+/// then came back mid-page. Remapping from there would share the pages around
+/// the buffer and shift the title's bytes by that offset, so this takes `len`
+/// bytes from a padded buffer's first byte on a 16 KiB (Apple Silicon page)
+/// boundary, and says how far in that is.
+fn shared_aligned(h: &crate::host::Host, len: usize) -> Option<(ID3D12Resource, *mut u8, usize)> {
+    const ALIGN: usize = 16 << 10;
+    let (buffer, mem) = h.shared_buffer((len + ALIGN) as u64)?;
+    let skip = (mem as usize).next_multiple_of(ALIGN) - mem as usize;
+    // SAFETY: `skip < ALIGN`, so `len` bytes from there are in the buffer.
+    Some((buffer, unsafe { mem.add(skip) }, skip))
+}
+
 fn supported() -> Option<bool> {
     static PROBE: OnceLock<Option<bool>> = OnceLock::new();
     *PROBE.get_or_init(|| {
@@ -284,7 +299,7 @@ fn supported() -> Option<bool> {
             return None;
         }
         let h = host()?;
-        let (buffer, gpu_mem) = h.shared_buffer(PAGE as u64)?;
+        let (buffer, gpu_mem, _) = shared_aligned(h, PAGE)?;
         // SAFETY: `gpu_mem` is our `PAGE`-byte mapped buffer.
         let zeroed = unsafe {
             gpu_mem.cast::<u64>().read_volatile() == 0
@@ -303,7 +318,7 @@ fn supported() -> Option<bool> {
         if title.is_null() {
             return None;
         }
-        // SAFETY: `title` and `gpu_mem` are both `PAGE`-aligned and `PAGE` bytes.
+        // SAFETY: `title` and `gpu_mem` are both page-aligned and `PAGE` bytes.
         let r = unsafe {
             mach::remap_shared(
                 title as u64,
@@ -492,7 +507,7 @@ pub fn alias_region(base: usize, len: usize, preserve_contents: bool) -> bool {
     let Some(h) = host() else {
         return false;
     };
-    let Some((buffer, gpu_mem)) = h.shared_buffer(len as u64) else {
+    let Some((buffer, gpu_mem, skip)) = shared_aligned(h, len) else {
         return false;
     };
     // SAFETY: `base` and `gpu_mem` are `len`-byte owned mappings.
@@ -522,8 +537,15 @@ pub fn alias_region(base: usize, len: usize, preserve_contents: bool) -> bool {
         format!("aliased title buffer {base:#x}+{len:#x}")
     });
     // SAFETY: `buffer` is alive.
-    let gpu = unsafe { buffer.GetGPUVirtualAddress() };
-    let shadow = crate::shadow::Shadow::new_aliased(buffer, gpu_mem, gpu, base as u64, len as u64);
+    let gpu = unsafe { buffer.GetGPUVirtualAddress() } + skip as u64;
+    let shadow = crate::shadow::Shadow::new_aliased(
+        buffer,
+        gpu_mem,
+        gpu,
+        base as u64,
+        len as u64,
+        skip as u64,
+    );
     crate::shadow::register_aliased(shadow);
     if len >= 16 << 20 {
         tracing::info!(
@@ -786,13 +808,23 @@ mod tests {
                 // SAFETY: inside `alloc`.
                 unsafe { alloc.ptr.add(off + i).write_volatile(b) };
             }
-            let got = gpu_read(&h.device, &shadow.buffer, off as u64, PAGE);
+            let got = gpu_read(
+                &h.device,
+                &shadow.buffer,
+                shadow.offset(alloc.ptr as u64 + off as u64),
+                PAGE,
+            );
             for (i, &b) in got.iter().enumerate() {
                 assert_eq!(b, (i as u8).wrapping_mul(31) ^ round);
             }
 
             let new: Vec<u8> = (0..PAGE).map(|i| (i as u8) ^ round ^ 0xc3).collect();
-            gpu_write(&h.device, &shadow.buffer, (len - PAGE) as u64, &new);
+            gpu_write(
+                &h.device,
+                &shadow.buffer,
+                shadow.offset((alloc.ptr as usize + len - PAGE) as u64),
+                &new,
+            );
             // SAFETY: inside `alloc`.
             let cpu = unsafe { std::slice::from_raw_parts(alloc.ptr.add(len - PAGE), PAGE) };
             assert_eq!(cpu, &new[..]);
@@ -889,6 +921,45 @@ mod tests {
         );
     }
 
+    /// With small buffers alive, D3DMetal hands out bigger ones mid-page;
+    /// the title's bytes must still be where the GPU reads them.
+    #[test]
+    fn aliasing_holds_when_d3dmetal_places_the_buffer_mid_page() {
+        if !crate::watch::rosetta() {
+            return;
+        }
+        let Some(h) = host() else {
+            return;
+        };
+        let _small: Vec<_> = (0..8)
+            .map(|i| h.shared_buffer(256 << (i % 5)).unwrap())
+            .collect();
+        let len = 2 * PAGE;
+        let init = |p: *mut u8| {
+            // SAFETY: `p` has `len` bytes.
+            unsafe { p.add(PAGE + 8).write(0x3c) }
+        };
+        let alloc = AliasedAlloc::new(len, Some(&init), true);
+        let shadow = crate::shadow::find(alloc.ptr as u64, len as u64).expect("aliased shadow");
+        // SAFETY: `alloc.ptr` has `len` bytes.
+        unsafe {
+            assert_eq!(alloc.ptr.add(PAGE + 8).read_volatile(), 0x3c);
+            alloc.ptr.add(len - 1).write_volatile(0xc3);
+        }
+        let at = shadow.offset(alloc.ptr as u64);
+        assert_eq!(
+            gpu_read(&h.device, &shadow.buffer, at + (PAGE + 8) as u64, 1),
+            vec![0x3c]
+        );
+        assert_eq!(
+            gpu_read(&h.device, &shadow.buffer, at + len as u64 - 1, 1),
+            vec![0xc3]
+        );
+        gpu_write(&h.device, &shadow.buffer, at, &[0x99]);
+        // SAFETY: as above.
+        assert_eq!(unsafe { alloc.ptr.read_volatile() }, 0x99);
+    }
+
     #[test]
     fn aliased_memory_supports_virtual_query_and_write_guard() {
         if !crate::watch::rosetta() {
@@ -945,7 +1016,12 @@ mod tests {
             assert!(hit, "VirtualProtect write guard did not fault");
         }
         assert_eq!(
-            gpu_read(&h.device, &shadow.buffer, (PAGE + 100) as u64, 1),
+            gpu_read(
+                &h.device,
+                &shadow.buffer,
+                shadow.offset(alloc.ptr as u64 + (PAGE + 100) as u64),
+                1
+            ),
             vec![0x77]
         );
     }

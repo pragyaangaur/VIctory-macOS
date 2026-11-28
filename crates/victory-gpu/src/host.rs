@@ -5,6 +5,8 @@
 //! overlap them with per-submission fences once more than clears run.
 
 mod flight;
+#[cfg(test)]
+pub(crate) use flight::{Gate, ModeGuard};
 pub(crate) use flight::{async_submit_enabled, flight1_enabled};
 
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -98,6 +100,7 @@ pub(crate) struct Host {
     /// ([`Host::lost`]).
     queue: Mutex<ID3D12CommandQueue>,
     pub(crate) depth_bounds_supported: bool,
+    enhanced_barriers_supported: bool,
     fence: ID3D12Fence,
     /// The last value signalled on `fence`, behind the submission lock.
     submitted: Mutex<u64>,
@@ -403,6 +406,19 @@ fn create() -> windows::core::Result<Host> {
             // none): bounds that should reject a draw leave it whole, as when
             // the host has no test, and the plain pipeline states are safer.
             && !crate::under_wine();
+        let mut options12 = D3D12_FEATURE_DATA_D3D12_OPTIONS12::default();
+        let enhanced_barriers_supported = device
+            .CheckFeatureSupport(
+                D3D12_FEATURE_D3D12_OPTIONS12,
+                (&raw mut options12).cast(),
+                size_of_val(&options12) as u32,
+            )
+            .is_ok()
+            && options12.EnhancedBarriersSupported.as_bool();
+        tracing::info!(
+            enhanced_barriers = enhanced_barriers_supported,
+            "host enhanced barriers"
+        );
         let messages = debug
             .then(|| device.cast::<ID3D12InfoQueue>().ok())
             .flatten();
@@ -453,6 +469,7 @@ fn create() -> windows::core::Result<Host> {
             device,
             queue: Mutex::new(queue),
             depth_bounds_supported,
+            enhanced_barriers_supported,
             fence,
             submitted: Mutex::new(0),
             mark: OnceLock::new(),
@@ -858,6 +875,133 @@ pub(crate) mod tests {
             assert!(crate::descriptor::read_textures(&slots).contains(&raw), "its texture named");
             assert!(!crate::shadow::reads_since().contains(&0), "the marks cleared");
         }
+    }
+
+    /// While [`ShowAfterScene`] lives, this thread takes `VICTORY_SHOW_AFTER`
+    /// as `on` and holds the submission lock, so the submission counters
+    /// change only as the test says (one submission begun, then run); both
+    /// are put back when it goes.
+    struct ShowAfterScene<'a> {
+        // Dropped before the lock: what is made under it (a view heap) does
+        // not take the lock again (`Host::quiet`) while this is held.
+        _holding: Holding,
+        _one: std::sync::MutexGuard<'a, u64>,
+        done: u64,
+    }
+
+    impl ShowAfterScene<'_> {
+        fn new(host: &Host, on: bool) -> ShowAfterScene<'_> {
+            let one = host.submitted.lock().unwrap_or_else(|e| e.into_inner());
+            let holding = Holding::enter();
+            crate::descriptor::host::set_show_after(Some(on));
+            let done = SUBMISSIONS_DONE.load(Ordering::Acquire);
+            SUBMISSIONS_BEGUN.store(done, Ordering::Release);
+            ShowAfterScene { _holding: holding, _one: one, done }
+        }
+
+        /// A submission is handed to the queue and still runs.
+        fn begin(&self) {
+            SUBMISSIONS_BEGUN.store(self.done + 1, Ordering::Release);
+        }
+
+        /// That submission has run: none runs any more.
+        fn finish(&self) {
+            SUBMISSIONS_DONE.store(self.done + 1, Ordering::Release);
+        }
+    }
+
+    impl Drop for ShowAfterScene<'_> {
+        fn drop(&mut self) {
+            // Back to `*submitted`, which the lock kept as it was.
+            SUBMISSIONS_DONE.store(self.done, Ordering::Release);
+            SUBMISSIONS_BEGUN.store(self.done, Ordering::Release);
+            crate::descriptor::host::set_show_after(None);
+        }
+    }
+
+    /// A title heap of 4 view slots with a 12x1 RGBA8 placed texture viewed
+    /// at slot 0, made in it; and a way to write a view of another texture
+    /// of the same memory there (`n` 1, 2, ...: its offset), as the title
+    /// would. Placed textures are kept by address and description for the
+    /// process (`resource::texture_at`), so the memory is never freed and
+    /// the width is one no other test uses: a texture another test made at
+    /// a reused address would not be new.
+    fn show_after_heap() -> (&'static crate::descriptor::Heap, impl Fn(u64)) {
+        let memory: &'static [u8] = Vec::leak(vec![0u8; 1 << 17]);
+        let null = std::ptr::null();
+        let heap_desc: [u32; 8] = [0, 4, 1, 0, 0, 0, 0, 0];
+        let mut heap = null;
+        let iid = crate::object::guid(0x8efb471d, 0x616c, 0x4f49, [0x90, 0xf7, 0x12, 0x7b, 0xb7, 0x63, 0xfa, 0x51]);
+        assert_eq!(crate::descriptor::create_heap(null, heap_desc.as_ptr().cast(), &iid, &mut heap), 0);
+        let title_heap = crate::descriptor::heap(heap);
+        let base = memory.as_ptr() as u64;
+        let start = title_heap.start;
+        let write = move |n: u64| {
+            let words: [u32; 14] = [3, 0, 0, 0, 12, 0, 1, 1 | 1 << 16, 28, 1, 0, 0x100, 0, 0];
+            let address = base + n * (1 << 13);
+            let mut view = [0u32; 16];
+            view[..6].copy_from_slice(&[28, 4, 0x1688, 0, 0, 1]);
+            (view[10], view[11]) = (address as u32, (address >> 32) as u32);
+            crate::descriptor::create_placed_srv(std::ptr::null(), &words, &view, start);
+        };
+        write(0);
+        let heap_host = title_heap.host().expect("a host view heap");
+        assert!(heap_host.mirror(0, start, true).is_some());
+        assert!(heap_host.texture_slot_made_from(0, start), "the first texture shown");
+        (title_heap, write)
+    }
+
+    /// `VICTORY_SHOW_AFTER=1`: a slot whose new record views a texture made
+    /// while a submission runs keeps showing what it showed (lists on the
+    /// GPU read it by index), and is made from the new record at the next
+    /// submission's preparation, when none runs.
+    #[test]
+    fn show_after_holds_a_slot_of_a_fresh_texture_until_the_next_submission() {
+        let Some(host) = host() else { return };
+        let scene = ShowAfterScene::new(host, true);
+        let (title_heap, write) = show_after_heap();
+        let heap_host = title_heap.host().expect("a host view heap");
+        scene.begin();
+        write(1);
+        assert!(heap_host.mirror(0, title_heap.start, true).is_some(), "the new view, for the draw's list");
+        assert!(heap_host.is_held(0), "held while the submission runs");
+        assert!(!heap_host.texture_slot_made_from(0, title_heap.start), "the slot still shows the first texture");
+        scene.finish();
+        assert_eq!(heap_host.show_held(), 1);
+        assert!(!heap_host.is_held(0));
+        assert!(heap_host.texture_slot_made_from(0, title_heap.start), "the new texture shown");
+    }
+
+    /// Without the switch a slot is made at once, as before.
+    #[test]
+    fn show_after_off_makes_a_slot_of_a_fresh_texture_at_once() {
+        let Some(host) = host() else { return };
+        let scene = ShowAfterScene::new(host, false);
+        let (title_heap, write) = show_after_heap();
+        let heap_host = title_heap.host().expect("a host view heap");
+        scene.begin();
+        write(1);
+        assert!(heap_host.mirror(0, title_heap.start, true).is_some());
+        assert!(!heap_host.is_held(0));
+        assert!(heap_host.texture_slot_made_from(0, title_heap.start), "made at once");
+    }
+
+    /// A held slot the title wrote again before the next submission is not
+    /// made from the record it was held for: that write is the slot's.
+    #[test]
+    fn show_after_drops_a_held_slot_the_title_wrote_again() {
+        let Some(host) = host() else { return };
+        let scene = ShowAfterScene::new(host, true);
+        let (title_heap, write) = show_after_heap();
+        let heap_host = title_heap.host().expect("a host view heap");
+        scene.begin();
+        write(1);
+        assert!(heap_host.mirror(0, title_heap.start, true).is_some());
+        assert!(heap_host.is_held(0));
+        write(2);
+        scene.finish();
+        assert_eq!(heap_host.show_held(), 0, "the record held for is gone");
+        assert!(!heap_host.is_held(0));
     }
 
     /// The idle rule against the heap reads that thrashed (run evict1): a
@@ -1491,6 +1635,13 @@ pub(crate) struct HostList {
     allocator: ID3D12CommandAllocator,
     pub(crate) list: ID3D12GraphicsCommandList,
     pub(crate) depth_bounds: Option<ID3D12GraphicsCommandList1>,
+    /// Cached `ID3D12GraphicsCommandList7` for `list` when the host supports
+    /// Enhanced Barriers (`D3D12_FEATURE_D3D12_OPTIONS12`), avoiding per-draw
+    /// `QueryInterface`.
+    pub(crate) list7: Option<ID3D12GraphicsCommandList7>,
+    /// Cached `ID3D12GraphicsCommandList7` for `prelude.1` when Enhanced
+    /// Barriers are supported.
+    pub(crate) prelude7: Option<ID3D12GraphicsCommandList7>,
     /// Monotonic epoch bumped whenever texture state, twin state, deferred
     /// dedup sets, or the list itself resets ([`HostList::changed_something`]).
     epoch: std::sync::atomic::AtomicU64,
@@ -1548,8 +1699,13 @@ pub(crate) struct HostList {
     /// shader-writable word, zeroed when the list is submitted.
     budget: OnceLock<Option<(ID3D12Resource, usize)>>,
     /// Clamped indirect arguments (`crate::indirect`), reused by each
-    /// inline execution in turn; replaced by a bigger one when too small.
+    /// inline execution in turn in legacy sync mode; replaced by a bigger one
+    /// when too small.
     arguments: Mutex<Option<ID3D12Resource>>,
+    /// Bump-allocated disjoint 16-byte-aligned inline argument slices used in
+    /// narrow clamp sync mode (`VICTORY_CLAMP_SYNC=1`) so consecutive inline
+    /// clamps have zero WAR hazard against earlier `ExecuteIndirect` calls.
+    inline_arguments: Mutex<ArgumentArena>,
     /// Indirect clamps hoisted into `prelude`, their bump-allocated argument
     /// buffers, and the list's GPU-write hazard tracker.
     clamps: Mutex<HoistedClamps>,
@@ -1565,6 +1721,10 @@ pub(crate) struct HostList {
     /// and at the end, and where they are read back.
     #[cfg(feature = "diagnostics")]
     stamps: OnceLock<Option<(ID3D12QueryHeap, ID3D12Resource)>>,
+    /// With `VICTORY_GPU_TIMING_CUTS`: the one kind and pipeline of the
+    /// list's draws or dispatches, once it has any (`crate::timing_cuts`).
+    #[cfg(feature = "diagnostics")]
+    timed: Mutex<Option<crate::timing_cuts::Timed>>,
 }
 
 // SAFETY: D3D12 objects are free-threaded; a host list is recorded by the
@@ -1603,7 +1763,109 @@ pub(crate) fn dred_on() -> bool {
 #[cfg(feature = "diagnostics")]
 fn timing() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| crate::switch::on("VICTORY_GPU_TIMING"))
+    *ON.get_or_init(|| crate::switch::on("VICTORY_GPU_TIMING") || timing_cuts_on())
+}
+
+/// Whether a few pipelines at a time get host lists of their own, so that
+/// a timed list of theirs runs one pipeline and its wall time is that
+/// pipeline's (`VICTORY_GPU_TIMING_CUTS`, diagnostics builds; turns the
+/// timing on): GPU time per pipeline where timestamps do not advance, as
+/// under D3DMetal. See `crate::timing_cuts`.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn timing_cuts_on() -> bool {
+    *timing_cuts() != crate::timing_cuts::Mode::Off
+}
+
+#[cfg(feature = "diagnostics")]
+fn timing_cuts() -> &'static crate::timing_cuts::Mode {
+    static MODE: OnceLock<crate::timing_cuts::Mode> = OnceLock::new();
+    MODE.get_or_init(|| {
+        let mode = crate::timing_cuts::mode_of(std::env::var("VICTORY_GPU_TIMING_CUTS").ok().as_deref());
+        if mode != crate::timing_cuts::Mode::Off {
+            tracing::info!(
+                ?mode,
+                "VICTORY_GPU_TIMING_CUTS: host lists of their own for a few pipelines at a time, each list \
+                 run and timed on its own"
+            );
+        }
+        mode
+    })
+}
+
+/// A sweep's pipelines and where it is (`VICTORY_GPU_TIMING_CUTS=sweep`).
+#[cfg(feature = "diagnostics")]
+static SWEEP: Mutex<Option<crate::timing_cuts::Sweep>> = Mutex::new(None);
+
+/// Whether the title pipeline `this` gets host lists of its own now: it
+/// has a listed shader (remembered per pipeline, which the title makes
+/// once and keeps), or the sweep is at it.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn timing_cut_own(this: usize) -> bool {
+    use crate::timing_cuts::Mode;
+    if this == 0 {
+        return false;
+    }
+    match timing_cuts() {
+        Mode::Off => false,
+        Mode::Sweep(_) => SWEEP
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get_or_insert_with(Default::default)
+            .times(this),
+        Mode::Listed(listed) => {
+            static SEEN: Mutex<Option<std::collections::HashMap<usize, bool>>> = Mutex::new(None);
+            let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+            *seen
+                .get_or_insert_with(Default::default)
+                .entry(this)
+                .or_insert_with(|| {
+                    crate::timing_cuts::lists(
+                        listed,
+                        &crate::pipeline::shaders_of(this as crate::object::This),
+                    )
+                })
+        }
+    }
+}
+
+/// The timed lists' wall time by pipeline since the last frame-rate line
+/// (`VICTORY_GPU_TIMING_CUTS`).
+#[cfg(feature = "diagnostics")]
+static GPU_WALLS: Mutex<Option<crate::timing_cuts::Walls>> = Mutex::new(None);
+
+/// Logs [`GPU_WALLS`] over `frames` frames: the 40 pipelines that cost most
+/// above the lists' floor, each per frame it had lists in.
+#[cfg(feature = "diagnostics")]
+fn log_gpu_walls(frames: f64) {
+    let Some(walls) = GPU_WALLS.lock().unwrap_or_else(|e| e.into_inner()).take() else {
+        return;
+    };
+    let (lists, ms, floor, rows) = walls.report(frames);
+    let sweep = match timing_cuts() {
+        crate::timing_cuts::Mode::Sweep(n) => {
+            let mut sweep = SWEEP.lock().unwrap_or_else(|e| e.into_inner());
+            let (now, live) = sweep.get_or_insert_with(Default::default).advance(*n);
+            format!("; the sweep goes on with {now} of the {live} pipelines drawn with")
+        }
+        _ => String::new(),
+    };
+    tracing::info!(
+        "GPU wall time by pipeline: {lists:.1} timed lists/frame, {ms:.1} ms/frame; a list's floor {floor:.3} ms \
+         (tenth percentile); {} lines{sweep}",
+        rows.len()
+    );
+    for r in rows.iter().take(40) {
+        tracing::info!(
+            "  GPU wall {:.2} ms ({:.2} above the floor) in {:.1} lists, {:.1} commands a frame, \
+             in {} frames: {}",
+            r.ms,
+            r.above,
+            r.lists,
+            r.commands,
+            r.frames,
+            r.label
+        );
+    }
 }
 
 /// On D3DMetal, a separate native queue call before a deferred UAV-to-SRV
@@ -1832,12 +2094,87 @@ impl WriteHazard {
 }
 
 #[derive(Default)]
-struct HoistedClamps {
+struct ArgumentArena {
     chunks: Vec<ArgumentChunk>,
     current: usize,
     used: u64,
     touched: usize,
     oversized: Vec<ID3D12Resource>,
+}
+
+impl ArgumentArena {
+    fn alloc(
+        &mut self,
+        host: &Host,
+        bytes: u64,
+        label: &str,
+    ) -> Option<(ID3D12Resource, u64, u64)> {
+        let size = bytes.max(16).checked_next_multiple_of(16)?;
+        if size > ARGUMENT_CHUNK_MAX {
+            let (buffer, _) = host.shared_buffer(size)?;
+            name(&buffer, || format!("{label} {size:#x}"));
+            // SAFETY: a live buffer.
+            let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+            self.oversized.push(buffer.clone());
+            return Some((buffer, 0, gpu));
+        }
+        while let Some(chunk) = self.chunks.get(self.current) {
+            if size <= chunk.capacity - self.used {
+                break;
+            }
+            self.current += 1;
+            self.used = 0;
+        }
+        if self.current == self.chunks.len() {
+            let next = self
+                .chunks
+                .last()
+                .map_or(ARGUMENT_CHUNK_FIRST, |c| (2 * c.capacity).min(ARGUMENT_CHUNK_MAX));
+            let capacity = size
+                .next_multiple_of(ARGUMENT_CHUNK_FIRST)
+                .max(next)
+                .min(ARGUMENT_CHUNK_MAX);
+            let (buffer, _) = host.shared_buffer(capacity)?;
+            name(&buffer, || format!("{label} {capacity:#x}"));
+            // SAFETY: a live buffer.
+            let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+            self.chunks.push(ArgumentChunk {
+                buffer,
+                gpu,
+                capacity,
+            });
+            self.used = 0;
+        }
+        let current = self.current;
+        let at = self.used;
+        let chunk = &self.chunks[current];
+        let result = (chunk.buffer.clone(), at, chunk.gpu + at);
+        self.used = at + size;
+        self.touched = self.touched.max(current + 1);
+        Some(result)
+    }
+
+    fn touched_buffers(&self) -> Vec<ID3D12Resource> {
+        let mut out = Vec::with_capacity(self.touched + self.oversized.len());
+        out.extend(self.chunks.iter().take(self.touched).map(|c| c.buffer.clone()));
+        out.extend(self.oversized.iter().cloned());
+        out
+    }
+
+    fn reset(&mut self) -> (Vec<ArgumentChunk>, Vec<ID3D12Resource>) {
+        let kept = (self.touched + 1).min(self.chunks.len());
+        let spent_chunks = self.chunks.split_off(kept);
+        let spent_oversized = std::mem::take(&mut self.oversized);
+        self.current = 0;
+        self.used = 0;
+        self.touched = 0;
+        (spent_chunks, spent_oversized)
+    }
+}
+
+#[derive(Default)]
+struct HoistedClamps {
+    arena: ArgumentArena,
     pending: Vec<crate::indirect::PendingClamp>,
     budget_gpu: u64,
     hazard: WriteHazard,
@@ -1848,10 +2185,7 @@ struct HoistedClamps {
 
 impl HoistedClamps {
     fn touched_buffers(&self) -> Vec<ID3D12Resource> {
-        let mut out = Vec::with_capacity(self.touched + self.oversized.len());
-        out.extend(self.chunks.iter().take(self.touched).map(|c| c.buffer.clone()));
-        out.extend(self.oversized.iter().cloned());
-        out
+        self.arena.touched_buffers()
     }
 }
 
@@ -2092,9 +2426,19 @@ impl HostGpu for Host {
             prelude.Close()?;
             let id = NEXT_LIST.fetch_add(1, Ordering::Relaxed);
             name(&list, || list_name(id));
+            let list7 = self
+                .enhanced_barriers()
+                .then(|| list.cast::<ID3D12GraphicsCommandList7>().ok())
+                .flatten();
+            let prelude7 = self
+                .enhanced_barriers()
+                .then(|| prelude.cast::<ID3D12GraphicsCommandList7>().ok())
+                .flatten();
             Ok(HostList {
                 allocator,
                 depth_bounds: self.depth_bounds_supported.then(|| list.cast()).transpose()?,
+                list7,
+                prelude7,
                 list,
                 epoch: std::sync::atomic::AtomicU64::new(next_epoch()),
                 deferred_epoch: std::sync::atomic::AtomicU64::new(next_epoch()),
@@ -2115,6 +2459,7 @@ impl HostGpu for Host {
                 id,
                 budget: OnceLock::new(),
                 arguments: Mutex::new(None),
+                inline_arguments: Mutex::default(),
                 clamps: Mutex::default(),
                 marked: std::sync::atomic::AtomicBool::new(false),
                 #[cfg(feature = "diagnostics")]
@@ -2123,6 +2468,8 @@ impl HostGpu for Host {
                 targets: Mutex::default(),
                 #[cfg(feature = "diagnostics")]
                 stamps: OnceLock::new(),
+                #[cfg(feature = "diagnostics")]
+                timed: Mutex::default(),
             })
         }
     }
@@ -2157,6 +2504,12 @@ impl HostGpu for Host {
 }
 
 impl Host {
+    /// Whether the host device reports D3D12 Enhanced Barriers support
+    /// (`D3D12_FEATURE_D3D12_OPTIONS12::EnhancedBarriersSupported`).
+    pub(crate) fn enhanced_barriers(&self) -> bool {
+        self.enhanced_barriers_supported
+    }
+
     /// Runs closed lists and waits for them, inserting a global UAV barrier
     /// command list before each `runs[i]` where `barrier_before.get(i) == Some(&true)`.
     /// Drains any queued async-submit work and any active Flight-1 submission
@@ -2237,6 +2590,7 @@ impl Host {
             .unwrap_or(&[]);
         for (i, group) in groups.iter().enumerate() {
             *submitted += 1;
+            SUBMISSIONS_BEGUN.store(*submitted, Ordering::Release);
             let started = std::time::Instant::now();
             #[cfg(feature = "diagnostics")]
             crate::resource::life::note(0, crate::resource::life::SUBMITTED, *submitted, 0);
@@ -2301,6 +2655,19 @@ impl Host {
                     started.elapsed(),
                     &runs[i].slowest(frequency, usize::MAX).unwrap_or_default(),
                 );
+            }
+            #[cfg(feature = "diagnostics")]
+            if gpu_timing && timing_cuts_on() {
+                let timed = runs[i].timed.lock().unwrap_or_else(|e| e.into_inner());
+                GPU_WALLS
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .get_or_insert_with(Default::default)
+                    .add(
+                        started.elapsed().as_secs_f64() * 1e3,
+                        timed.as_ref(),
+                        crate::queue::presented(),
+                    );
             }
             #[cfg(feature = "diagnostics")]
             if groups.len() > 1 && started.elapsed() > std::time::Duration::from_millis(50) {
@@ -2411,6 +2778,9 @@ impl Host {
         #[cfg(feature = "diagnostics")]
         let syncing = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::SyncHeapsUs);
         crate::descriptor::sync_heaps();
+        // Slots left as they were while the last submission ran, because
+        // the texture they now view was made meanwhile (`VICTORY_SHOW_AFTER`).
+        crate::descriptor::show_held();
         #[cfg(feature = "diagnostics")]
         drop(syncing);
         // Textures heap-indexing shaders may read, and textures read through
@@ -2918,6 +3288,7 @@ impl Host {
     /// own. Under the submission lock.
     fn runs(&self, submitted: &mut u64, mark: &Mark) -> bool {
         *submitted += 1;
+        SUBMISSIONS_BEGUN.store(*submitted, Ordering::Release);
         mark.arm(*submitted);
         let queue = self.queue();
         // SAFETY: a closed list; the fence and event are ours.
@@ -3335,8 +3706,11 @@ impl HostList {
         self.notes.lock().unwrap_or_else(|e| e.into_inner()).clear();
         #[cfg(feature = "diagnostics")]
         self.targets.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        #[cfg(feature = "diagnostics")]
+        self.timed.lock().unwrap_or_else(|e| e.into_inner()).take();
         self.trim_scratch();
         self.reset_hoisted_clamps();
+        self.reset_inline_arguments();
         self.marked.store(false, Ordering::Relaxed);
         // SAFETY: the list is not executing.
         let reset = unsafe {
@@ -3465,15 +3839,23 @@ impl HostList {
         depth: &std::sync::Arc<crate::resource::HostTexture>,
         side: u8,
         writes: bool,
+        whole: bool,
+        stores: bool,
     ) -> Option<bool> {
         let mut twins = self.twins.lock().unwrap_or_else(|e| e.into_inner());
         match twins.entry(std::sync::Arc::as_ptr(depth) as usize) {
             std::collections::hash_map::Entry::Vacant(v) => {
-                v.insert(crate::twin::Use::new(depth, side, writes));
+                let u = v.insert(crate::twin::Use::new(depth, side, writes, whole));
+                if stores {
+                    u.store();
+                }
                 None
             }
             std::collections::hash_map::Entry::Occupied(mut o) => {
-                let copy = o.get_mut().again(side, writes);
+                let copy = o.get_mut().again(side, writes, whole);
+                if stores {
+                    o.get_mut().store();
+                }
                 if copy.is_some() || writes {
                     self.changed_something();
                 }
@@ -3852,6 +4234,7 @@ impl HostList {
                 if !pending_clamps.is_empty() {
                     crate::indirect::record_batch(
                         list,
+                        self.narrow_clamp_sync_prelude(),
                         clamp_budget,
                         &clamp_buffers,
                         &pending_clamps,
@@ -3906,6 +4289,51 @@ impl HostList {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .push((what, range));
+        }
+    }
+
+    /// With `VICTORY_GPU_TIMING_CUTS`: whether a draw or dispatch of `key`
+    /// (`crate::timing_cuts::key`) belongs in a host list after this one,
+    /// which runs another kind or pipeline.
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn timed_cuts(&self, (key, compute): (usize, bool)) -> bool {
+        let timed = self.timed.lock().unwrap_or_else(|e| e.into_inner());
+        crate::timing_cuts::cuts(timed.as_ref(), key, compute)
+    }
+
+    /// Counts a draw or dispatch of `key` about to be recorded into the
+    /// list, whose kind and pipeline it gives the list if it is the first
+    /// (`name`: the pipeline's shaders).
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn timed_command(
+        &self,
+        (key, compute): (usize, bool),
+        name: impl FnOnce() -> String,
+    ) {
+        let mut timed = self.timed.lock().unwrap_or_else(|e| e.into_inner());
+        match timed.as_mut() {
+            Some(t) => t.commands += 1,
+            None => {
+                *timed = Some(crate::timing_cuts::Timed {
+                    key,
+                    compute,
+                    commands: 1,
+                    name: name(),
+                })
+            }
+        }
+    }
+
+    /// Takes back the last [`HostList::timed_command`]: its command went
+    /// into the next host list after all (a cut for an indirect clamp).
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn timed_command_moved(&self) {
+        let mut timed = self.timed.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(t) = timed.as_mut() {
+            t.commands = t.commands.saturating_sub(1);
+            if t.commands == 0 {
+                *timed = None;
+            }
         }
     }
 
@@ -4139,56 +4567,56 @@ impl HostList {
         make: impl FnOnce(u64) -> crate::indirect::PendingClamp,
     ) -> Option<(ID3D12Resource, u64)> {
         let budget_gpu = self.budget()?;
-        let size = bytes.max(16).checked_next_multiple_of(16)?;
         let host = host()?;
         let mut clamps = self.clamps.lock().unwrap_or_else(|e| e.into_inner());
-        let (buffer, offset, dst_gpu) = if size > ARGUMENT_CHUNK_MAX {
-            let (buffer, _) = host.shared_buffer(size)?;
-            name(&buffer, || format!("hoisted indirect arguments {size:#x}"));
-            // SAFETY: a live buffer.
-            let gpu = unsafe { buffer.GetGPUVirtualAddress() };
-            clamps.oversized.push(buffer.clone());
-            (buffer, 0, gpu)
-        } else {
-            while let Some(chunk) = clamps.chunks.get(clamps.current) {
-                if size <= chunk.capacity - clamps.used {
-                    break;
-                }
-                clamps.current += 1;
-                clamps.used = 0;
-            }
-            if clamps.current == clamps.chunks.len() {
-                let next = clamps
-                    .chunks
-                    .last()
-                    .map_or(ARGUMENT_CHUNK_FIRST, |c| (2 * c.capacity).min(ARGUMENT_CHUNK_MAX));
-                let capacity = size
-                    .next_multiple_of(ARGUMENT_CHUNK_FIRST)
-                    .max(next)
-                    .min(ARGUMENT_CHUNK_MAX);
-                let (buffer, _) = host.shared_buffer(capacity)?;
-                name(&buffer, || format!("hoisted indirect arguments {capacity:#x}"));
-                // SAFETY: a live buffer.
-                let gpu = unsafe { buffer.GetGPUVirtualAddress() };
-                clamps.chunks.push(ArgumentChunk { buffer, gpu, capacity });
-                clamps.used = 0;
-            }
-            let current = clamps.current;
-            let at = clamps.used;
-            let chunk = &clamps.chunks[current];
-            let result = (chunk.buffer.clone(), at, chunk.gpu + at);
-            clamps.used = at + size;
-            clamps.touched = clamps.touched.max(current + 1);
-            result
-        };
+        let (buffer, offset, dst_gpu) =
+            clamps.arena.alloc(host, bytes, "hoisted indirect arguments")?;
         clamps.budget_gpu = budget_gpu;
         clamps.pending.push(make(dst_gpu));
         Some((buffer, offset))
     }
 
+    /// Whether scoped Enhanced Barriers (`VICTORY_CLAMP_SYNC=1`) are active
+    /// for indirect clamps on this list.
+    pub(crate) fn narrow_clamp_sync(&self) -> bool {
+        crate::indirect::clamp_sync_enabled() && self.list7.is_some() && self.prelude7.is_some()
+    }
+
+    /// Cached `ID3D12GraphicsCommandList7` for `self.list` when narrow clamp
+    /// sync is active.
+    pub(crate) fn narrow_clamp_sync_list(&self) -> Option<&ID3D12GraphicsCommandList7> {
+        self.narrow_clamp_sync()
+            .then_some(self.list7.as_ref())
+            .flatten()
+    }
+
+    /// Cached `ID3D12GraphicsCommandList7` for `self.prelude.1` when narrow
+    /// clamp sync is active.
+    pub(crate) fn narrow_clamp_sync_prelude(&self) -> Option<&ID3D12GraphicsCommandList7> {
+        self.narrow_clamp_sync()
+            .then_some(self.prelude7.as_ref())
+            .flatten()
+    }
+
+    /// Bump-allocates a disjoint 16-byte-aligned inline argument slice from
+    /// this list's inline scratch arena (zero WAR hazard across consecutive
+    /// inline clamps in narrow sync mode).
+    pub(crate) fn inline_argument_slice(&self, bytes: u64) -> Option<(ID3D12Resource, u64, u64)> {
+        let host = host()?;
+        let mut arena = self
+            .inline_arguments
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        arena.alloc(host, bytes, "inline indirect arguments")
+    }
+
     /// Transitions hoisted indirect argument buffers back to `COMMON` at the
     /// end of `list.list` so the list can be re-submitted or reset cleanly.
+    /// No-op when narrow clamp sync is active (buffers stay in `COMMON`).
     fn hoisted_clamps_close(&self) {
+        if self.narrow_clamp_sync() {
+            return;
+        }
         let buffers = {
             let clamps = self.clamps.lock().unwrap_or_else(|e| e.into_inner());
             if clamps.pending.is_empty() {
@@ -4225,14 +4653,24 @@ impl HostList {
             clamps.budget_gpu = 0;
             clamps.hazard.clear();
             clamps.cut = false;
-            let kept = (clamps.touched + 1).min(clamps.chunks.len());
-            let spent_chunks = clamps.chunks.split_off(kept);
-            let spent_oversized = std::mem::take(&mut clamps.oversized);
-            clamps.current = 0;
-            clamps.used = 0;
-            clamps.touched = 0;
-            (spent_chunks, spent_oversized)
+            clamps.arena.reset()
         };
+        if !spent_chunks.is_empty() {
+            release_later(Box::new(spent_chunks));
+        }
+        if !spent_oversized.is_empty() {
+            release_later(Box::new(spent_oversized));
+        }
+    }
+
+    /// Resets the inline indirect argument scratch arena after the list
+    /// finishes running, keeping recently used chunks for zero-allocation reuse.
+    fn reset_inline_arguments(&self) {
+        let (spent_chunks, spent_oversized) = self
+            .inline_arguments
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .reset();
         if !spent_chunks.is_empty() {
             release_later(Box::new(spent_chunks));
         }
@@ -4486,6 +4924,14 @@ impl HostList {
         }
         // SAFETY: a live buffer.
         Some(unsafe { buffer.GetGPUVirtualAddress() })
+    }
+
+    /// The indirect-work budget word consumed by the list's last execution.
+    #[cfg(test)]
+    pub(crate) fn budget_used(&self) -> Option<u32> {
+        let (_, data) = self.budget.get()?.as_ref()?;
+        // SAFETY: the list's own mapped budget word, read after execution finishes.
+        Some(unsafe { (*data as *const u32).read_volatile() })
     }
 
     /// The list's argument buffer, at least `bytes` long, common between
@@ -5866,6 +6312,7 @@ impl Meter {
                 crate::texture::ALIAS_COPIES.swap(0, Ordering::Relaxed) as f64 / report_frames,
                 crate::twin::COPIES.swap(0, Ordering::Relaxed) as f64 / report_frames,
             );
+            crate::twin::log(report_frames);
             crate::draw::table_memo_line(report_frames);
             // How long the threads that ran held work were held by it: a
             // title thread waits there instead of going on with its frame.
@@ -5918,6 +6365,7 @@ impl Meter {
                 let drops = crate::pipeline::take_drops();
                 crate::frame::log();
                 log_gpu_times(report_frames);
+                log_gpu_walls(report_frames);
                 crate::copystat::log(report_frames);
                 crate::bindless::log(report_frames);
                 crate::heap_worker::log(report_frames);
@@ -6401,6 +6849,18 @@ pub(crate) fn submissions_done() -> u64 {
     SUBMISSIONS_DONE.load(Ordering::Acquire)
 }
 
+/// Host submission count when the latest one was handed to the queue
+/// (`Host::execute`, Flight-1 and the queue check): stored before its lists
+/// go to the queue, under `Host::submitted`.
+pub(super) static SUBMISSIONS_BEGUN: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Number of host submissions handed to the queue so far. While it is
+/// ahead of [`submissions_done`], the GPU may still run the newest ones.
+pub(crate) fn submissions_begun() -> u64 {
+    SUBMISSIONS_BEGUN.load(Ordering::Acquire)
+}
+
 /// How many host submissions a retired GPU object or recycled command list
 /// stays alive after the submission current when it was retired (`16` ~= 2
 /// frames; `VICTORY_BURY_LAG=0` drops right after the current submission).
@@ -6689,6 +7149,40 @@ pub(crate) fn uav_barrier() -> D3D12_RESOURCE_BARRIER {
                 pResource: std::mem::ManuallyDrop::new(None),
             }),
         },
+    }
+}
+
+/// Records a single Enhanced `D3D12_GLOBAL_BARRIER` on `cmd7`.
+///
+/// D3DMetal `MPL` does not track buffers bound via root descriptors
+/// (`SetComputeRootShaderResourceView`/`SetComputeRootUnorderedAccessView`) or
+/// bindless heaps in per-`MTLBuffer` barrier maps; a global barrier routes
+/// straight to `MPLCommandList::GlobalBarrierImpl(beforeStage, afterStage)` and
+/// honors exact `MPLStage` masks.
+pub(crate) unsafe fn global_barrier(
+    cmd7: &ID3D12GraphicsCommandList7,
+    sync_before: D3D12_BARRIER_SYNC,
+    sync_after: D3D12_BARRIER_SYNC,
+    access_before: D3D12_BARRIER_ACCESS,
+    access_after: D3D12_BARRIER_ACCESS,
+) {
+    let barrier = D3D12_GLOBAL_BARRIER {
+        SyncBefore: sync_before,
+        SyncAfter: sync_after,
+        AccessBefore: access_before,
+        AccessAfter: access_after,
+    };
+    let group = D3D12_BARRIER_GROUP {
+        Type: D3D12_BARRIER_TYPE_GLOBAL,
+        NumBarriers: 1,
+        Anonymous: D3D12_BARRIER_GROUP_0 {
+            pGlobalBarriers: &barrier,
+        },
+    };
+    // SAFETY: caller guarantees `cmd7` is an open command list; `barrier` lives
+    // across the synchronous `Barrier` call.
+    unsafe {
+        cmd7.Barrier(&[group]);
     }
 }
 

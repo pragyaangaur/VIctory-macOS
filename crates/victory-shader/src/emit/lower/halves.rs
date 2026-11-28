@@ -17,8 +17,10 @@
 //! * within a half, exact: DPP (rows of 16, DPP8 groups of 8), `ds_swizzle`
 //!   (groups of 32 or quads), and `ds_bpermute_b32`, which in wave64 permutes
 //!   each half on its own (RDNA2 ISA, "Data Share Operations"; measured on
-//!   RDNA2 in upstream PR #573, banbanzhige's). A lane's own bit of a mask
-//!   held as a number (a constant, data loaded or computed by scalar code),
+//!   RDNA2 in upstream PR #573, banbanzhige's). The row gathers
+//!   `v_permlane16_b32` and `v_permlanex16_b32` also stay within a half.
+//!   A lane's own bit of a mask held as a number (a constant, data loaded
+//!   or computed by scalar code),
 //!   `v_writelane_b32` (the lane named takes the scalar) and the row a DPP
 //!   row mask names (rows 2 and 3 are the upper half's) are decided by the
 //!   console lane ([`Lower::console_lane`]);

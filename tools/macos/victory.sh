@@ -95,4 +95,14 @@ if [ "${1:-}" = run ]; then
     "$(dirname "$WINE")/wineserver" -k 2>/dev/null || true
     "$(dirname "$WINE")/wineserver" -w 2>/dev/null || true
 fi
+# Keep the Mac and its display awake while VIctory runs. Runs left alone
+# stopped on the loading artwork at 0.8 fps, and a --cache pre-build paused
+# for about 16 minutes, while the same builds went on with someone at the Mac
+# (#554): display sleep hides the game's window, and macOS then throttles a
+# hidden app (App Nap). caffeinate holds its assertions on behalf of Wine and
+# lets them go when Wine exits, with Wine's exit status.
+# VICTORY_CAFFEINATE=0 leaves sleep to macOS.
+if [ "${VICTORY_CAFFEINATE:-1}" != 0 ] && [ -x /usr/bin/caffeinate ]; then
+    exec /usr/bin/caffeinate -dim "$WINE" "$target_dir/$TARGET/release/victory.exe" "$@"
+fi
 exec "$WINE" "$target_dir/$TARGET/release/victory.exe" "$@"

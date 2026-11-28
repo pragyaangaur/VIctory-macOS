@@ -442,6 +442,28 @@ pub(crate) fn make_read(slots: &[u32]) {
     }
 }
 
+/// Makes the slots of every shader-visible view heap that were left as they
+/// were while a submission ran (`VICTORY_SHOW_AFTER`,
+/// [`host::HostHeap::show_held`]). Called while a submission is prepared,
+/// when none runs.
+#[cfg(windows)]
+pub(crate) fn show_held() {
+    if !host::show_after() {
+        return;
+    }
+    let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
+    for &(_, _, at) in heaps.iter() {
+        // SAFETY: registered heaps are live (removed when dropped).
+        let heap = unsafe { &*(at as *const Heap) };
+        if heap.desc.kind != VIEWS_KIND {
+            continue;
+        }
+        if let Some(host) = heap.made_host() {
+            host.show_held();
+        }
+    }
+}
+
 /// Wakes the background heap worker for any shader-visible view heap that has
 /// queued texture slots or tracked bindless textures.
 #[cfg(windows)]

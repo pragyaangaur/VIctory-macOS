@@ -144,7 +144,11 @@
 //!   access's first and last byte: what the host copies back) and for each
 //!   page with no copy an access reached, or for an address whose 256 MiB
 //!   region has no block, bit `level-1 index` (block 0's bits). Reads there
-//!   give 0, writes are dropped. In such a program (and one with root
+//!   give 0, writes are dropped. A read of more than a dword whose bytes
+//!   reach the next 64 KiB page looks that page up too and reads its
+//!   dwords there through that page's memory, which need not be the first
+//!   page's (added 2026-11-27: through the first page's view they lay past
+//!   its end and read 0). In such a program (and one with root
 //!   parameters past its user SGPRs) root SRVs and UAVs are title memory
 //!   too: no root views; the shader reads their addresses as user data
 //!   (root type [`RootType::Descriptor`] in [`HostShader::user_data`],

@@ -21,7 +21,7 @@
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
-use super::{Batch, Holding, Host, HostList, Mark};
+use super::{Batch, Holding, Host, HostList, Mark, Step};
 use crate::object::This;
 
 /// Whether Wait-Before-Prep Flight-1 overlap is enabled (`VICTORY_FLIGHT1=1`,
@@ -124,6 +124,113 @@ impl Drop for ModeGuard {
     }
 }
 
+/// Before a flight is given to the host GPU: the pages its shaders may
+/// write with no list declaring them are armed (`Shadow::arm_undeclared`),
+/// the unordered views of its heaps (the bindless path) and every copy the
+/// page tables of its title-memory programs name. Their writes are marked
+/// and go back by the pages marked (`Shadow::copy_back_marked`), and a page
+/// the title wrote since the copy took it, and that nothing saved, keeps
+/// the title's bytes whole, the shaders' there dropped. Waited for, the
+/// title's thread that submits cannot write meanwhile; a flight lets it go
+/// on, and it writes a frame's data into pages the GPU writes too (on the
+/// console both land, byte by byte). Armed, the first title write to such
+/// a page saves its bytes from before, and the copy-back keeps both. The
+/// copies armed, to disarm when it lands.
+fn arm_undeclared(
+    segments: &[Arc<HostList>],
+    heaps: &[Arc<crate::bindless::Viewed>],
+) -> Vec<Arc<crate::shadow::Shadow>> {
+    let mut armed: Vec<Arc<crate::shadow::Shadow>> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    let mut arm = |copy: &Arc<crate::shadow::Shadow>, address: usize, len: usize| {
+        copy.arm_undeclared(address, len);
+        if seen.insert(Arc::as_ptr(copy) as usize) {
+            armed.push(copy.clone());
+        }
+    };
+    for heap in heaps {
+        crate::bindless::written_ranges(heap, &mut arm);
+    }
+    for list in segments {
+        for step in &list.deferred().copies {
+            if let &Step::Memory(key) = step {
+                crate::memory::copies(key, |copy| {
+                    let (start, len) = copy.range();
+                    arm(copy, start as usize, len as usize);
+                });
+            }
+        }
+    }
+    armed
+}
+
+/// Tests: the host queue waits on a fence of ours from [`Gate::hold`] to
+/// [`Gate::open`] (or the drop): a flight given meanwhile stays in the air.
+/// A watchdog opens it after 2 s: another test's submission behind the gate
+/// holds the submission lock while it waits, and the thread that would open
+/// it may be waiting for that lock.
+#[cfg(test)]
+pub(crate) struct Gate {
+    fence: GateFence,
+    opened: Arc<std::sync::atomic::AtomicBool>,
+}
+
+#[cfg(test)]
+#[derive(Clone)]
+struct GateFence(windows::Win32::Graphics::Direct3D12::ID3D12Fence);
+
+// SAFETY: D3D12 fences are free-threaded.
+#[cfg(test)]
+unsafe impl Send for GateFence {}
+
+#[cfg(test)]
+impl GateFence {
+    fn open(&self, opened: &std::sync::atomic::AtomicBool) {
+        if !opened.swap(true, Ordering::AcqRel) {
+            // SAFETY: our fence.
+            unsafe { self.0.Signal(1) }.expect("the gate opens");
+        }
+    }
+}
+
+#[cfg(test)]
+impl Gate {
+    pub(crate) fn hold(host: &Host) -> Gate {
+        // SAFETY: plain creation; our queue waits on our fence.
+        let fence = unsafe {
+            let fence: windows::Win32::Graphics::Direct3D12::ID3D12Fence = host
+                .device
+                .CreateFence(
+                    0,
+                    windows::Win32::Graphics::Direct3D12::D3D12_FENCE_FLAG_NONE,
+                )
+                .expect("a gate fence");
+            host.queue()
+                .Wait(&fence, 1)
+                .expect("the queue waits on the gate");
+            GateFence(fence)
+        };
+        let opened = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (f, o) = (fence.clone(), opened.clone());
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_secs(2));
+            f.open(&o);
+        });
+        Gate { fence, opened }
+    }
+
+    pub(crate) fn open(&mut self) {
+        self.fence.open(&self.opened);
+    }
+}
+
+#[cfg(test)]
+impl Drop for Gate {
+    fn drop(&mut self) {
+        self.fence.open(&self.opened);
+    }
+}
+
 /// Protected by `Host::flight` (leaf lock strictly below `HELD` and
 /// `Host::submitted`, above only `Fence::waiters`).
 #[derive(Default)]
@@ -147,6 +254,9 @@ pub(super) struct FlightState {
 struct InFlight {
     fence_value: u64,
     segments: Vec<Arc<HostList>>,
+    /// Copies whose pages it armed for its shaders' undeclared writes
+    /// ([`arm_undeclared`]), disarmed once it has landed.
+    armed: Vec<Arc<crate::shadow::Shadow>>,
     uploads: Option<crate::bindless::Uploads>,
     batch: Batch,
     heaps: Vec<Arc<crate::bindless::Viewed>>,
@@ -223,6 +333,7 @@ impl Host {
             .unwrap_or(&[]);
 
         *submitted += 1;
+        super::SUBMISSIONS_BEGUN.store(*submitted, Ordering::Release);
         let fence_value = *submitted;
         #[cfg(feature = "diagnostics")]
         crate::resource::life::note(0, crate::resource::life::SUBMITTED, fence_value, 0);
@@ -232,6 +343,9 @@ impl Host {
             mark.arm(fence_value);
             group.push(mark.list());
         }
+        // Armed before the GPU may write: a title write from here on saves
+        // its page.
+        let armed = arm_undeclared(&segments, &prep.heaps);
         let queue = self.queue();
         let launched = std::time::Instant::now();
         // SAFETY: closed lists; fence and events are ours.
@@ -267,6 +381,7 @@ impl Host {
         let flight = InFlight {
             fence_value,
             segments,
+            armed,
             uploads: prep.uploads,
             batch: prep.batch,
             heaps: prep.heaps,
@@ -427,6 +542,10 @@ impl Host {
             );
         }
 
+        // Its copy-back is done: what it armed is as anything else again.
+        for copy in &flight.armed {
+            copy.disarm_undeclared();
+        }
         // Return the upload list to `bindless::LIST` and recycle host lists
         // only after the GPU fence and post-GPU work have finished.
         drop(flight.uploads);
