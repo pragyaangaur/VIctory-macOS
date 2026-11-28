@@ -238,6 +238,38 @@ fn marked_copy_back_serializes_subranges_of_one_tracked_page() {
     assert_eq!(exercise(Layout::SharesPage), (false, true));
 }
 
+struct RegisteredViews {
+    _memory: GuestMemory,
+    starts: [usize; 2],
+}
+
+impl RegisteredViews {
+    fn new() -> Self {
+        let memory = GuestMemory::mirrored();
+        let starts = [memory.base, memory.mirror.unwrap()];
+        for at in starts {
+            register(at, at as u64, COPY_LEN as u64);
+        }
+        Self {
+            _memory: memory,
+            starts,
+        }
+    }
+
+    fn copies(&self) -> [Arc<Shadow>; 2] {
+        self.starts
+            .map(|at| find(at as u64, COPY_LEN as u64).expect("registered title buffer shadow"))
+    }
+}
+
+impl Drop for RegisteredViews {
+    fn drop(&mut self) {
+        for at in self.starts {
+            unregister(at, at as u64);
+        }
+    }
+}
+
 /// One physical section with two title addresses, acquired through the
 /// registered-buffer lookup used by descriptor binding.
 #[test]
@@ -246,13 +278,9 @@ fn benchmark_mirrored_registered_buffers() {
     const SAMPLES: usize = 9;
     const PASSES: usize = 100;
     let _quiet = host().expect("D3D12 host for buffer copies").quiet();
-    let memory = GuestMemory::mirrored();
-    let second = memory.mirror.unwrap();
-    let starts = [memory.base, second];
-    let copies = starts.map(|at| {
-        register(at, at as u64, COPY_LEN as u64);
-        find(at as u64, COPY_LEN as u64).expect("registered title buffer shadow")
-    });
+    let views = RegisteredViews::new();
+    let starts = views.starts;
+    let copies = views.copies();
     let [a, b] = &copies;
     let allocated: u64 = copies
         .iter()
@@ -301,9 +329,6 @@ fn benchmark_mirrored_registered_buffers() {
     b.update(starts[1], PAGE);
     let value = b.read_host(starts[1] as u64, 1)[0];
     assert_eq!(value.to_ne_bytes()[2..], [0x67, 0xd8]);
-    for at in starts {
-        unregister(at, at as u64);
-    }
 }
 
 #[test]
@@ -312,13 +337,10 @@ fn registered_physical_aliases_read_back_gpu_and_cpu_writes() {
     use crate::compute::{self, Param};
 
     let host = host().expect("D3D12 host for physical aliases");
-    let memory = GuestMemory::mirrored();
-    let starts = [memory.base, memory.mirror.unwrap()];
+    let views = RegisteredViews::new();
+    let starts = views.starts;
     fill_title(starts[0], COPY_LEN, INITIAL);
-    let copies = starts.map(|at| {
-        register(at, at as u64, COPY_LEN as u64);
-        find(at as u64, COPY_LEN as u64).expect("registered title buffer shadow")
-    });
+    let copies = views.copies();
     let [a, b] = &copies;
     let (write_root, write_pipeline) = compute::pipeline(
         "RWByteAddressBuffer b : register(u0);\n\
@@ -390,7 +412,4 @@ fn registered_physical_aliases_read_back_gpu_and_cpu_writes() {
     // SAFETY: both dwords are in the mapped buffer; the queue has completed.
     let readback = unsafe { data.cast::<[u32; 2]>().read_volatile() };
     assert_eq!(readback, [0xd819_6719; 2]);
-    for at in starts {
-        unregister(at, at as u64);
-    }
 }
