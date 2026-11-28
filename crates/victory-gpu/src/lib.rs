@@ -31,7 +31,6 @@ mod ambient_estimate_set;
 // Plain std, so its tests run everywhere.
 #[cfg(any(windows, test))]
 mod ambient_set;
-#[cfg(windows)]
 mod batch;
 #[cfg(windows)]
 mod bindless;

@@ -273,6 +273,7 @@ fn main() -> Result<()> {
         }
         #[cfg(windows)]
         Command::Replay(options) => replay::run(*options),
+        #[cfg(windows)]
         Command::Warm { jobs, limit, again, used, these } => warm::run(jobs, limit, again, used, these),
         Command::Config => show_config(),
         Command::GpuCheck => gpu_check(),
