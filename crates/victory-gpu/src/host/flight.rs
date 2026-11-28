@@ -359,7 +359,7 @@ pub(crate) enum Early {
     /// may mark).
     Overlap,
     /// `VICTORY_PREP_AHEAD=ranges`: the new flight reads title memory on
-    /// the CPU (a fill from what the one in the air writes, or host work).
+    /// the CPU (a fill or texture staging that overlaps writes, or host work).
     CpuRead,
 }
 
@@ -519,7 +519,7 @@ pub(crate) fn before_cpu_read(range: Option<(usize, usize)>) {
 pub(super) fn before_texture_uploads(
     has_heaps: bool,
     textures: &[(Arc<crate::texture::Staging>, Arc<crate::resource::HostTexture>)],
-) {
+) -> bool {
     let hit = AHEAD_OF.with(|w| {
         w.borrow().as_ref().is_some_and(|writes| {
             !writes.spans.is_empty()
@@ -537,6 +537,7 @@ pub(super) fn before_texture_uploads(
     if hit {
         land_ahead(Early::CpuRead);
     }
+    hit
 }
 
 /// Lands the flights in the air first if this thread prepares one behind
