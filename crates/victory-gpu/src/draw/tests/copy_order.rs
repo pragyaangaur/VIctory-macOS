@@ -263,7 +263,12 @@ fn copy_sequence(
             slot::<extern "system" fn(This, This, This)>(second, 0x88)(second, destination, source);
         }
         CopyCall::Memory => {
-            slot::<extern "system" fn(This, u64, u64, u64, u32)>(second, 0x1e0)(
+            let offset = if crate::list::has_newer_table(second) {
+                0x1f0
+            } else {
+                0x1e0
+            };
+            slot::<extern "system" fn(This, u64, u64, u64, u32)>(second, offset)(
                 second,
                 bytes(destination) as u64,
                 bytes(source) as u64,
@@ -399,4 +404,14 @@ fn copy_order_batches_consecutive_copy_only_commands() {
         release_ref(buffer);
     }
     assert_eq!(result, NEW);
+}
+
+#[test]
+fn copy_order_lands_an_earlier_flight_before_copying_an_aliased_gpu_source() {
+    let Some(host) = gpu_host() else { return };
+    let _mode = ModeGuard::with_prep_ranges();
+    for same_list in [true, false] {
+        let result = copy_sequence(host, same_list, true, Writer::Source, CopyCall::Region);
+        assert_eq!(result, [OLD, GPU], "same list {same_list}");
+    }
 }
