@@ -228,6 +228,8 @@ pub(super) fn resolve(view: &View) -> Option<ResolvedBuffer> {
 
 #[cfg(test)]
 mod tests {
+    mod records;
+
     use std::sync::atomic::Ordering;
 
     use super::*;
