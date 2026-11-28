@@ -731,6 +731,11 @@ pub(crate) enum WorkerRefresh {
 }
 
 impl Staging {
+    /// The title memory read to prepare this texture, before detiling.
+    pub(crate) fn memory_range(&self) -> (usize, usize) {
+        (self.memory as usize, self.layout.size as usize)
+    }
+
     /// Bytes required in a staging buffer for this texture.
     pub(crate) fn size_bytes(&self) -> u64 {
         self.size

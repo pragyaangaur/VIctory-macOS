@@ -513,6 +513,32 @@ pub(crate) fn before_cpu_read(range: Option<(usize, usize)>) {
     }
 }
 
+/// Lands a flight before texture staging reads bytes that its copy-back can
+/// change. A heap's texture selection is made later, including its clean
+/// tracker checks, so a heap walk must happen after potential writes land.
+pub(super) fn before_texture_uploads(
+    has_heaps: bool,
+    textures: &[(Arc<crate::texture::Staging>, Arc<crate::resource::HostTexture>)],
+) {
+    let hit = AHEAD_OF.with(|w| {
+        w.borrow().as_ref().is_some_and(|writes| {
+            !writes.spans.is_empty()
+                && (has_heaps
+                    || textures.iter().any(|(staging, _)| {
+                        let (address, len) = staging.memory_range();
+                        writes.overlaps(address, address.saturating_add(len))
+                            || crate::watch::alias_pages(address, len).into_iter().any(|page| {
+                                let from = page * crate::watch::PAGE;
+                                writes.overlaps(from, from.saturating_add(crate::watch::PAGE))
+                            })
+                    }))
+        })
+    });
+    if hit {
+        land_ahead(Early::CpuRead);
+    }
+}
+
 /// Lands the flights in the air first if this thread prepares one behind
 /// them and `why` needs the GPU done with them; nothing otherwise.
 pub(crate) fn land_ahead(why: Early) {
@@ -580,10 +606,9 @@ pub(crate) fn prep_ahead_enabled() -> bool {
 /// its pending ranges (`Shadow::update_ranges` syncs only bytes in pending
 /// ranges into the snapshot).
 ///
-/// shortcut: a texture over memory the flight's shaders write is brought up
-/// from title memory, which its landing writes: a texture the preparation
-/// brings up there is the bytes from before the flight, one submission late,
-/// as one written in the same submission already is (`bindless::uploads`).
+/// Texture uploads also wait when their source could change at landing
+/// ([`before_texture_uploads`]).
+///
 /// `VICTORY_SYNC_EARLY=1` (off by default): before a submission waits for
 /// the one in flight to land (Wait-Before-Prep), the descriptors the title
 /// wrote into its heaps are mirrored (`descriptor::sync_heaps`, ~24 ms a
@@ -2282,27 +2307,32 @@ void main(uint3 id : SV_DispatchThreadID) {
 
     #[test]
     fn sampled_texture_sees_previous_submission_in_sync_mode() {
-        texture_upload_dependency(false, false);
+        texture_upload_dependency(false, TextureMemory::Same);
     }
 
     #[test]
     fn sampled_texture_sees_previous_submission_with_prep_ranges() {
-        texture_upload_dependency(true, false);
+        texture_upload_dependency(true, TextureMemory::Same);
     }
 
     #[test]
     fn sampled_texture_sees_previous_submission_through_an_alias_with_prep_ranges() {
-        texture_upload_dependency(true, true);
+        texture_upload_dependency(true, TextureMemory::Alias);
     }
 
-    fn texture_upload_dependency(prep_ranges: bool, aliased: bool) {
-        use crate::compute::{Param, srv};
-        use windows::Win32::Graphics::Direct3D12::{
-            D3D12_DESCRIPTOR_HEAP_DESC, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
-            D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, ID3D12DescriptorHeap,
-        };
-        use windows::core::s;
+    #[test]
+    fn sampled_disjoint_texture_upload_keeps_prep_ranges_overlap() {
+        texture_upload_dependency(true, TextureMemory::Disjoint);
+    }
 
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum TextureMemory {
+        Same,
+        Alias,
+        Disjoint,
+    }
+
+    fn texture_upload_dependency(prep_ranges: bool, memory: TextureMemory) {
         let Some(host) = host() else {
             assert!(
                 std::env::var_os("VICTORY_REQUIRE_GPU_TESTS").is_none(),
@@ -2316,21 +2346,40 @@ void main(uint3 id : SV_DispatchThreadID) {
         } else {
             ModeGuard::new(false, false)
         };
-        let (write_address, texture_address, shadow) = if aliased {
-            let (a, b) = crate::watch::tests::twin_views(1);
-            (
-                a,
-                b,
-                crate::shadow::find(a as u64, crate::watch::PAGE as u64).unwrap(),
-            )
-        } else {
-            let (page, address, shadow) = title_page();
-            (page as usize, address as usize, shadow)
+        until_taken(|| texture_upload_dependency_once(host, prep_ranges, memory));
+    }
+
+    fn texture_upload_dependency_once(host: &Host, prep_ranges: bool, memory: TextureMemory) -> bool {
+        use crate::compute::{Param, srv};
+        use windows::Win32::Graphics::Direct3D12::{
+            D3D12_DESCRIPTOR_HEAP_DESC, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+            D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, ID3D12DescriptorHeap,
+        };
+        use windows::core::s;
+
+        let (write_address, texture_address, shadow) = match memory {
+            TextureMemory::Alias => {
+                let (a, b) = crate::watch::tests::twin_views(1);
+                (
+                    a,
+                    b,
+                    crate::shadow::find(a as u64, crate::watch::PAGE as u64).unwrap(),
+                )
+            }
+            TextureMemory::Same => {
+                let (page, address, shadow) = title_page();
+                (page as usize, address as usize, shadow)
+            }
+            TextureMemory::Disjoint => {
+                let (page, _, shadow) = title_page();
+                let (texture_page, _, _) = title_page();
+                (page as usize, texture_page as usize, shadow)
+            }
         };
         const OLD: u32 = 0x1234_5678;
         const NEW: u32 = 0xb89a_5522;
         // SAFETY: the first dword of a new allocation in this test.
-        unsafe { (write_address as *mut u32).write(OLD) };
+        unsafe { (texture_address as *mut u32).write(OLD) };
 
         let words = [3u32, 0, 0, 0, 4, 0, 4, 1 | 1 << 16, 42, 1, 0, 0x100, 0, 0];
         let iid = crate::object::guid(
@@ -2425,23 +2474,24 @@ void main() {
         close_title_list(writer);
         close_title_list(reader);
         queue_execute(q, &[writer]);
-        let had_flight = host.has_in_flight();
+        let by_ranges = BEHIND_BY_RANGES.load(Ordering::Relaxed);
+        let before = ahead_counts();
         queue_execute(q, &[reader]);
+        let behind = BEHIND_BY_RANGES.load(Ordering::Relaxed) > by_ranges;
+        let launched_behind = ahead_counts()[1] > before[1];
         TEST_PAUSE_LANDING.store(false, Ordering::Release);
         crate::queue::drain_submit(crate::queue::Why::Present);
         // SAFETY: both lists have completed, including the GPU write's copy-back.
         let sampled = unsafe { mapped.cast::<u32>().read() };
-        // SAFETY: this dword belongs to the texture allocation.
-        let title_word = unsafe { (texture_address as *const u32).read() };
+        // SAFETY: this dword belongs to the writer's allocation.
+        let title_word = unsafe { (write_address as *const u32).read() };
         for object in [writer, reader, alloc_n, alloc_next, q, texture] {
             crate::object::release_ref(object);
         }
-        assert_eq!(
-            had_flight, prep_ranges,
-            "submission N was left in flight only in ranges mode"
-        );
         assert_eq!(title_word, NEW, "submission N copied its write back");
-        assert_eq!(sampled, NEW, "submission N+1 sampled the wrong texel");
+        let expected = if memory == TextureMemory::Disjoint { OLD } else { NEW };
+        assert_eq!(sampled, expected, "submission N+1 sampled the wrong texel");
+        !prep_ranges || (behind && (memory != TextureMemory::Disjoint || launched_behind))
     }
 
     /// With `VICTORY_PREP_AHEAD=ranges`, a submission behind a flight whose

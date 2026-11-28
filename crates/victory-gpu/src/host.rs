@@ -2999,6 +2999,7 @@ impl Host {
         crate::list::trim_idle();
         #[cfg(feature = "diagnostics")]
         let uploading = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::UploadsUs);
+        flight::before_texture_uploads(!heaps.is_empty(), &textures);
         let uploads = crate::bindless::uploads(&heaps, &textures);
         #[cfg(feature = "diagnostics")]
         drop(uploading);
