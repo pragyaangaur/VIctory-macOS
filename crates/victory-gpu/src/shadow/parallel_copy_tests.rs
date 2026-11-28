@@ -305,3 +305,92 @@ fn benchmark_mirrored_registered_buffers() {
         unregister(at, at as u64);
     }
 }
+
+#[test]
+#[ignore = "requires a D3D12 device and the HLSL compiler"]
+fn registered_physical_aliases_read_back_gpu_and_cpu_writes() {
+    use crate::compute::{self, Param};
+
+    let host = host().expect("D3D12 host for physical aliases");
+    let memory = GuestMemory::mirrored();
+    let starts = [memory.base, memory.mirror.unwrap()];
+    fill_title(starts[0], COPY_LEN, INITIAL);
+    let copies = starts.map(|at| {
+        register(at, at as u64, COPY_LEN as u64);
+        find(at as u64, COPY_LEN as u64).expect("registered title buffer shadow")
+    });
+    let [a, b] = &copies;
+    let (write_root, write_pipeline) = compute::pipeline(
+        "RWByteAddressBuffer b : register(u0);\n\
+         [numthreads(1,1,1)] void main() {\n\
+             uint prior = b.Load(0);\n\
+             b.Store(0, (prior & 0xffff00ffu) | 0x00006700u);\n\
+          }",
+        windows::core::s!("physical alias writer"),
+        0,
+        &[Param::Uav { register: 0 }],
+    )
+    .expect("compile physical alias writer");
+    let writer = host.new_list().expect("record physical alias writer");
+    a.refresh(&writer, starts[0] as u64, PAGE as u64);
+    a.gpu_writes(&writer, starts[0] as u64, PAGE as u64, false);
+    // SAFETY: open list and live pipeline and guest shadow.
+    unsafe {
+        writer.list.SetComputeRootSignature(&write_root);
+        writer.list.SetPipelineState(&write_pipeline);
+        writer
+            .list
+            .SetComputeRootUnorderedAccessView(0, a.gpu(starts[0] as u64));
+        writer.list.Dispatch(1, 1, 1);
+    }
+    writer.close();
+    host.execute_sync(&[&writer], &[]);
+    fill_title(starts[1] + 3, 1, 0xd8);
+
+    let (read_root, read_pipeline) = compute::pipeline(
+        "ByteAddressBuffer a : register(t0), b : register(t1);\n\
+         RWByteAddressBuffer outbuf : register(u0);\n\
+         [numthreads(1,1,1)] void main() { outbuf.Store2(0, uint2(a.Load(0), b.Load(0))); }",
+        windows::core::s!("physical alias reader"),
+        0,
+        &[
+            Param::Srv {
+                register: 0,
+                space: 0,
+            },
+            Param::Srv {
+                register: 1,
+                space: 0,
+            },
+            Param::Uav { register: 0 },
+        ],
+    )
+    .expect("compile physical alias reader");
+    let reader = host.new_list().expect("record physical alias reader");
+    a.refresh(&reader, starts[0] as u64, PAGE as u64);
+    b.refresh(&reader, starts[1] as u64, PAGE as u64);
+    let (output, data) = host.shared_buffer(8).expect("readback buffer");
+    // SAFETY: open list and live pipeline, guest shadows and output buffer.
+    unsafe {
+        reader.list.SetComputeRootSignature(&read_root);
+        reader.list.SetPipelineState(&read_pipeline);
+        reader
+            .list
+            .SetComputeRootShaderResourceView(0, a.gpu(starts[0] as u64));
+        reader
+            .list
+            .SetComputeRootShaderResourceView(1, b.gpu(starts[1] as u64));
+        reader
+            .list
+            .SetComputeRootUnorderedAccessView(2, output.GetGPUVirtualAddress());
+        reader.list.Dispatch(1, 1, 1);
+    }
+    reader.close();
+    host.execute_sync(&[&reader], &[]);
+    // SAFETY: both dwords are in the mapped buffer; the queue has completed.
+    let readback = unsafe { data.cast::<[u32; 2]>().read_volatile() };
+    assert_eq!(readback, [0xd819_6719; 2]);
+    for at in starts {
+        unregister(at, at as u64);
+    }
+}
