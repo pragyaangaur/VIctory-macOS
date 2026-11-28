@@ -1,3 +1,6 @@
+#[path = "copy_order_texture.rs"]
+mod texture;
+
 use super::*;
 use crate::host::{Host, ModeGuard};
 use crate::object::{guid, release_ref, slot};
