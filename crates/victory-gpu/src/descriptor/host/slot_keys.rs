@@ -7,13 +7,25 @@ const STRIPES: usize = 64;
 /// parallel. Batch publication and eviction exclude all recorders with one
 /// lock so their descriptor copies and retention updates stay batched.
 pub(super) struct SlotKeys {
-    bulk: RwLock<()>,
-    stripes: Option<Box<[Mutex<()>; STRIPES]>>,
+    locks: PublicationLocks,
     keys: Box<[AtomicU64]>,
 }
 
+enum PublicationLocks {
+    Single(Mutex<()>),
+    Striped(Box<Stripes>),
+}
+
+struct Stripes {
+    bulk: RwLock<()>,
+    slots: [Mutex<()>; STRIPES],
+}
+
 pub(super) enum SlotGuard<'a> {
-    Exclusive {
+    Single {
+        _lock: MutexGuard<'a, ()>,
+    },
+    Bulk {
         _bulk: RwLockWriteGuard<'a, ()>,
     },
     Striped {
@@ -26,32 +38,51 @@ impl SlotKeys {
     pub(super) fn new(count: u32) -> Self {
         static ENABLED: OnceLock<bool> = OnceLock::new();
         let enabled = *ENABLED.get_or_init(|| crate::switch::on("VICTORY_SLOT_STRIPES"));
+        let locks = if enabled {
+            PublicationLocks::Striped(Box::new(Stripes {
+                bulk: RwLock::new(()),
+                slots: [const { Mutex::new(()) }; STRIPES],
+            }))
+        } else {
+            PublicationLocks::Single(Mutex::new(()))
+        };
         Self {
-            bulk: RwLock::new(()),
-            stripes: enabled.then(|| Box::new([const { Mutex::new(()) }; STRIPES])),
+            locks,
             keys: (0..count).map(|_| AtomicU64::new(0)).collect(),
         }
     }
 
     pub(super) fn one(&self, index: u32) -> SlotGuard<'_> {
-        let Some(stripes) = &self.stripes else {
-            return SlotGuard::Exclusive { _bulk: self.all() };
-        };
-        let bulk = self.bulk.read().unwrap_or_else(|error| error.into_inner());
-        let stripe = &stripes[index as usize % STRIPES];
-        #[cfg(test)]
-        let probed = super::recording_contention::lock(stripe);
-        #[cfg(not(test))]
-        let probed = None;
-        SlotGuard::Striped {
-            _stripe: probed
-                .unwrap_or_else(|| stripe.lock().unwrap_or_else(|error| error.into_inner())),
-            _bulk: bulk,
+        match &self.locks {
+            PublicationLocks::Single(lock) => SlotGuard::Single {
+                _lock: lock_one(lock),
+            },
+            PublicationLocks::Striped(stripes) => {
+                let bulk = stripes
+                    .bulk
+                    .read()
+                    .unwrap_or_else(|error| error.into_inner());
+                let stripe = &stripes.slots[index as usize % STRIPES];
+                SlotGuard::Striped {
+                    _stripe: lock_one(stripe),
+                    _bulk: bulk,
+                }
+            }
         }
     }
 
-    pub(super) fn all(&self) -> RwLockWriteGuard<'_, ()> {
-        self.bulk.write().unwrap_or_else(|error| error.into_inner())
+    pub(super) fn all(&self) -> SlotGuard<'_> {
+        match &self.locks {
+            PublicationLocks::Single(lock) => SlotGuard::Single {
+                _lock: lock.lock().unwrap_or_else(|error| error.into_inner()),
+            },
+            PublicationLocks::Striped(stripes) => SlotGuard::Bulk {
+                _bulk: stripes
+                    .bulk
+                    .write()
+                    .unwrap_or_else(|error| error.into_inner()),
+            },
+        }
     }
 
     pub(super) fn read(&self, index: u32) -> Option<u64> {
@@ -70,4 +101,13 @@ impl SlotKeys {
     pub(super) fn set(&self, index: u32, value: u64) {
         self.keys[index as usize].store(value, Ordering::Relaxed);
     }
+}
+
+#[inline]
+fn lock_one(lock: &Mutex<()>) -> MutexGuard<'_, ()> {
+    #[cfg(test)]
+    if let Some(guard) = super::recording_contention::lock(lock) {
+        return guard;
+    }
+    lock.lock().unwrap_or_else(|error| error.into_inner())
 }
