@@ -14,6 +14,7 @@
 # so neither a previous release nor an old patch can stay in the cache.
 set -eu
 VERSION="${CROSSOVER_VERSION:-26.3.0}"
+JOBS="${VICTORY_JOBS:-$(sysctl -n hw.ncpu)}"
 ROOT="${0:A:h:h:h}"
 PATCHES=("${0:A:h}"/patches/*.patch(N))
 # Keep the release readable so the partial install can check it separately.
@@ -187,7 +188,7 @@ if [[ ! -f Makefile ]] || ! grep -q '^#define SONAME_LIBSDL2 ' include/config.h 
 fi
 if (( installed )); then
   echo "rebuilding the server, ntdll and HID bus of the installed CrossOver Wine"
-  x86 make -j"$(sysctl -n hw.ncpu)" server/wineserver dlls/ntdll/ntdll.so dlls/winebus.sys/winebus.so > make.log 2>&1 || { grep -E 'error:|\*\*\*' make.log | grep -v Wno-error | head -5; exit 1; }
+  x86 make -j"$JOBS" server/wineserver dlls/ntdll/ntdll.so dlls/winebus.sys/winebus.so > make.log 2>&1 || { grep -E 'error:|\*\*\*' make.log | grep -v Wno-error | head -5; exit 1; }
   rm -f "$PREFIX/.victory-patches" "$PATCH_PATHS"
   install -m 755 server/wineserver "$PREFIX/bin/wineserver"
   install -m 755 dlls/ntdll/ntdll.so "$PREFIX/lib/wine/x86_64-unix/ntdll.so"
@@ -197,7 +198,7 @@ if (( installed )); then
   install -m 755 "$DEPS/lib/libSDL2-2.0.0.dylib" "$PREFIX/lib/"
 else
   echo "building CrossOver Wine"
-  x86 make -j"$(sysctl -n hw.ncpu)" > make.log 2>&1 || { grep -E 'error:|\*\*\*' make.log | grep -v Wno-error | head -5; exit 1; }
+  x86 make -j"$JOBS" > make.log 2>&1 || { grep -E 'error:|\*\*\*' make.log | grep -v Wno-error | head -5; exit 1; }
   # Mark the prefix incomplete before modifying it, and invalidate any
   # D3DMetal overlay so setup.sh reapplies it after make install overwrites
   # Wine's own DLLs.

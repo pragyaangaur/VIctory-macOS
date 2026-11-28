@@ -7,7 +7,14 @@
 # CodeWeavers' CrossOver source, adds Apple's D3DMetal from the Game Porting
 # Toolkit in your Downloads folder, and builds VIctory. Run it again at any
 # time: finished steps are skipped. The first run takes about an hour.
+#
+# The builds use every core. To keep the Mac cooler and quieter at the cost
+# of a longer first run, cap them with VICTORY_JOBS, for example
+#   VICTORY_JOBS=4 ./setup.sh
 set -eu
+[[ -z ${VICTORY_JOBS:-} || $VICTORY_JOBS == <1-> ]] || { print -u2 "VICTORY_JOBS must be a whole number of 1 or more, not '$VICTORY_JOBS'"; exit 1; }
+# Cargo has its own setting; VICTORY_JOBS sets it too unless it is set already.
+[[ -n ${VICTORY_JOBS:-} ]] && export CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-$VICTORY_JOBS}"
 ROOT="${0:A:h}"
 # Resolve an explicit image path relative to the caller before changing folders.
 dmg="${GPTK_DMG:-}"

@@ -99,6 +99,8 @@ cd VIctory-macOS
 
 The setup installs what it needs with Homebrew. It then builds the x86_64 libraries and CrossOver Wine, adds D3DMetal from the toolkit, and builds VIctory. The first run takes about an hour, almost all of it spent building Wine. If anything stops it, fix what it says and run it again, because finished steps are skipped.
 
+The builds use every core, which makes the fans run high. To keep the Mac cooler, cap them with `VICTORY_JOBS`: `VICTORY_JOBS=4 ./setup.sh` uses four, and takes longer.
+
 When it says **Setup finished**, you can check that VIctory starts:
 
 ```bash

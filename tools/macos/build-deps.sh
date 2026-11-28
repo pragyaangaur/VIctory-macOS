@@ -9,7 +9,7 @@ PREFIX="$1"
 SRC="${PREFIX:h}/deps-src"
 WORK="${PREFIX:h}/deps-build"
 BREW="${HOMEBREW_PREFIX:-/opt/homebrew}"
-JOBS="$(sysctl -n hw.ncpu)"
+JOBS="${VICTORY_JOBS:-$(sysctl -n hw.ncpu)}"
 . "${0:A:h}/native-build-tools.sh"
 x86() { arch -x86_64 /usr/bin/env PATH="$NATIVE_TOOLS:$BREW/opt/bison/bin:$BREW/opt/flex/bin:$BREW/bin:/usr/bin:/bin:/usr/sbin:/sbin" "$@"; }
 
