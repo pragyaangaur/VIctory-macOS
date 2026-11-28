@@ -122,6 +122,52 @@ pub(crate) fn with_clamp_cuts<R>(enabled: bool, f: impl FnOnce() -> R) -> R {
     f()
 }
 
+/// Whether indirect executions whose clamps their host list's prelude cannot
+/// take (an earlier command of the list wrote their arguments, may have, or
+/// an earlier clamp of the list is not in the prelude) are clamped in group
+/// passes (`VICTORY_CLAMP_GROUPS=1`; off by default): one pass, recorded
+/// where the first of them would have clamped inline, clamps every
+/// execution recorded after it until a command writes what the next one
+/// reads ([`GROUP_SOURCE`], `HostList::clamp_group_seat`). Inline, each
+/// clamp is a compute dispatch between two draws: the host ends the render
+/// pass for it and starts another after it, two Metal encoders on D3DMetal
+/// for each of ~4,000 executions a world frame (a Metal System Trace of the
+/// prison cell on an M5 Pro: 6,917 encoders a frame, compute and render in
+/// turn). Needs the batched clamps (`VICTORY_BATCH_CLAMPS`, on by default).
+///
+/// After avatarmanz's batches (VIctory-7900XTX 0375962, GPL-3.0: a pass
+/// reading a table of jobs the CPU fills while the list records, and the
+/// clamped records left readable as arguments, cc11ccc), with the list's
+/// tracker of written ranges deciding where a group ends and every
+/// execution its own job, charged in recorded order: what a group pass
+/// writes is word for word what the executions' inline clamps write.
+pub(crate) fn groups_enabled() -> bool {
+    #[cfg(test)]
+    if let Some(enabled) = TEST_CLAMP_GROUPS.with(std::cell::Cell::get) {
+        return enabled;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::switch::on("VICTORY_CLAMP_GROUPS"))
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static TEST_CLAMP_GROUPS: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn with_clamp_groups<R>(enabled: bool, f: impl FnOnce() -> R) -> R {
+    struct Restore(Option<bool>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            TEST_CLAMP_GROUPS.with(|c| c.set(self.0));
+        }
+    }
+    let previous = TEST_CLAMP_GROUPS.with(|c| c.replace(Some(enabled)));
+    let _restore = Restore(previous);
+    f()
+}
+
 /// Whether a clamp a title list's host list cannot hoist (a shader of the
 /// list may have written its arguments) starts a new host list for the rest
 /// of the title list, whose prelude then takes it and the clamps after it,
@@ -143,6 +189,490 @@ pub(crate) fn clamp_cuts_enabled() -> bool {
     *ON.get_or_init(|| crate::switch::on_by_default("VICTORY_CLAMP_CUTS"))
 }
 
+/// Whether an indirect execution's records `[arguments, arguments + len)`
+/// or its count word (title addresses) are read by the GPU in place in title
+/// memory, which commands the list's tracker does not see may write while
+/// it runs: such an execution is clamped inline, right before it runs, not
+/// hoisted into the prelude nor grouped (avatarmanz 631400f: hoisted, trees
+/// flickered). The hook for in-place section views
+/// (`VICTORY_INPLACE_SECTIONS`, `crate::alias::clamp_in_place_inline`);
+/// none are read in place yet.
+pub(crate) fn clamped_in_place(arguments: u64, len: u64, count: Option<u64>) -> bool {
+    let _ = (arguments, len, count);
+    false
+}
+
+/// What keeps an indirect execution's clamp out of its list's prelude:
+/// memory read in place ([`clamped_in_place`]), else what `list` recorded
+/// before ([`HostList::clamp_blocker`]).
+pub(crate) fn blocker(
+    list: &HostList,
+    (arguments, len): (u64, u64),
+    count: Option<u64>,
+) -> Option<crate::host::ClampBlock> {
+    if clamped_in_place(arguments, len, count) {
+        return Some(crate::host::ClampBlock::InPlace);
+    }
+    list.clamp_blocker(arguments, len, count)
+}
+
+/// An indirect execution's clamp was kept out of its list's prelude by
+/// `blocker` (it was grouped or clamped inline).
+pub(crate) fn note_held_out(blocker: Option<crate::host::ClampBlock>) {
+    use crate::host::ClampBlock;
+    let at = match blocker {
+        None => return,
+        Some(ClampBlock::AfterInline) => 2,
+        Some(ClampBlock::Unknown) => 3,
+        Some(ClampBlock::Overlap) => 4,
+        Some(ClampBlock::InPlace) => 5,
+    };
+    GROUPS[at].fetch_add(1, Ordering::Relaxed);
+}
+
+/// The clamps recorded a `ResourceBarrier` call of `barriers` barriers, or
+/// a `Barrier` call of one global barrier under narrow clamp sync (inline,
+/// in a prelude's batch, in a group pass, or moving their buffers back to
+/// common): each a wait D3DMetal records and submits at a cost.
+pub(crate) fn note_barriers(barriers: usize) {
+    BARRIERS[0].fetch_add(1, Ordering::Relaxed);
+    BARRIERS[1].fetch_add(barriers as u64, Ordering::Relaxed);
+}
+
+/// Since the last call: the clamps' `ResourceBarrier` calls and barriers.
+pub(crate) fn take_barriers() -> [u64; 2] {
+    BARRIERS.each_ref().map(|n| n.swap(0, Ordering::Relaxed))
+}
+static BARRIERS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+/// Since the last call: group passes in lists, executions clamped in them,
+/// clamps kept out of their list's prelude after an earlier clamp of the
+/// list that is not in it, after a command that may write any title buffer,
+/// over bytes an earlier command of the list wrote, and read in place; and
+/// group passes in preludes and the hoisted clamps in them.
+pub(crate) fn take_groups() -> [u64; 8] {
+    GROUPS.each_ref().map(|n| n.swap(0, Ordering::Relaxed))
+}
+static GROUPS: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+
+/// The work a host list's indirect executions may do (vertex instances,
+/// threads), as every clamp shader has it (`BUDGET`): past it, records run
+/// empty. One record costs at most half of it.
+pub(crate) const BUDGET: u32 = 1 << 27;
+
+/// The jobs of one group pass: a group of more goes on in another. The
+/// trace's long runs of clamped draws hold ~480 executions each (5 runs,
+/// 2,409 of a frame's 3,258 clamp/draw pairs). [`GROUP_SOURCE`] caps its
+/// count at this.
+pub(crate) const GROUP_JOBS: u32 = 512;
+/// The bytes of a group pass's table of jobs in upload memory: the count
+/// (and 12 bytes unused), then per job four words ([`GROUP_SOURCE`]).
+pub(crate) const GROUP_TABLE: u64 = 16 + 16 * GROUP_JOBS as u64;
+/// The bytes of one clamped record in a group's output: the longest record
+/// a group takes.
+pub(crate) const GROUP_SLOT: u32 = 32;
+/// The title buffers (host copies) one group pass reads records from.
+pub(crate) const GROUP_SOURCES: usize = 8;
+
+/// The group pass: the clamp of [`WORDS_SOURCE`] over the jobs of a table
+/// instead of consecutive records, each with its own source buffer (one of
+/// eight, `src0`..`src7`), record (a word index) and place in `dest`. Jobs
+/// are charged in their order, a tile of 64 at a time, as records are. In
+/// the words form, for Wine's HLSL compiler: no `Load` on read-write
+/// buffers and no stores to indexed group-shared memory (scratch slots in
+/// `budget` bytes `64..320`).
+const GROUP_SOURCE: &str = r#"
+cbuffer Params : register(b0) { uint flags; uint widest; };
+StructuredBuffer<uint> jobs : register(t0);
+RWByteAddressBuffer dest : register(u0);
+RWByteAddressBuffer budget : register(u1);
+RWStructuredBuffer<uint> budgetWords : register(u2);
+StructuredBuffer<uint> src0 : register(t1);
+StructuredBuffer<uint> src1 : register(t2);
+StructuredBuffer<uint> src2 : register(t3);
+StructuredBuffer<uint> src3 : register(t4);
+StructuredBuffer<uint> src4 : register(t5);
+StructuredBuffer<uint> src5 : register(t6);
+StructuredBuffer<uint> src6 : register(t7);
+StructuredBuffer<uint> src7 : register(t8);
+static const uint BUDGET = 1u << 27;
+static const uint MOST_DRAW = 1u << 23;
+static const uint GROUPS = 1u << 20;
+static const uint PAST = 0xffffffffu;
+uint word(uint s, uint at) {
+    if (s == 0u) { return src0[at]; }
+    if (s == 1u) { return src1[at]; }
+    if (s == 2u) { return src2[at]; }
+    if (s == 3u) { return src3[at]; }
+    if (s == 4u) { return src4[at]; }
+    if (s == 5u) { return src5[at]; }
+    if (s == 6u) { return src6[at]; }
+    return src7[at];
+}
+// The record of `kind` and `stride` bytes at word `from` of source `s`
+// clamped to byte `to` of `dest`, as `WORDS_SOURCE` clamps one; its cost.
+uint clamped(uint s, uint kind, uint stride, uint from, uint to) {
+    uint cost;
+    uint base_bytes;
+    if (kind <= 1u) {
+        uint raw_count = word(s, from);
+        uint raw_instances = word(s, from + 1u);
+        uint count = raw_count;
+        uint instances = 0u;
+        if (raw_count >= MOST_DRAW) {
+            count = 0u;
+        } else {
+            instances = min(raw_instances, (1u << 26) / max(count, 1u));
+        }
+        cost = count * instances;
+        dest.Store2(to, uint2(count, instances));
+        if (kind == 1u) {
+            dest.Store3(to + 8u, uint3(word(s, from + 2u), word(s, from + 3u), word(s, from + 4u)));
+            base_bytes = 20u;
+        } else {
+            dest.Store2(to + 8u, uint2(word(s, from + 2u), word(s, from + 3u)));
+            base_bytes = 16u;
+        }
+    } else if (kind == 2u) {
+        uint3 g = uint3(word(s, from), word(s, from + 1u), word(s, from + 2u));
+        g = uint3(g.x <= widest ? g.x : 65535u, min(g.y, 65535u), min(g.z, 65535u));
+        if ((g.y != 0u && g.x > GROUPS / g.y) || (g.z != 0u && g.x * g.y > GROUPS / g.z)) {
+            g = uint3(0u, 0u, 0u);
+        }
+        cost = g.x * g.y * g.z * 64u;
+        dest.Store3(to, g);
+        base_bytes = 12u;
+    } else {
+        uint3 raw_g = uint3(word(s, from), word(s, from + 1u), word(s, from + 2u));
+        uint3 g = uint3(raw_g.x, min(raw_g.y, 1u), min(raw_g.z, 1u));
+        if (raw_g.x > 65535u) {
+            g = uint3(0u, 0u, 0u);
+        }
+        cost = g.x * g.y * g.z * 128u;
+        dest.Store3(to, g);
+        base_bytes = 12u;
+    }
+    for (uint extra = base_bytes; extra < stride; extra += 4u) {
+        dest.Store(to + extra, word(s, from + extra / 4u));
+    }
+    return cost;
+}
+// A job: source (bits 0-3), kind (4-7) and stride in bytes (8-15); the
+// record's first word in the source; its byte in `dest`; unused.
+[numthreads(64, 1, 1)]
+void main(uint3 id : SV_DispatchThreadID) {
+    uint lane = id.x;
+    uint left = 0u;
+    if (lane == 0u) {
+        left = BUDGET - min(budgetWords[0], BUDGET);
+    }
+    uint count = min(jobs[0], 512u);
+    uint take_rest = flags & 2u;
+    // Every tile a table holds: the count is read from memory, which the
+    // compiler cannot prove is the same in every lane, and barriers need
+    // that (fxc refuses them in a loop up to it). Tiles past the count
+    // only wait at them.
+    uint tiles = 8u;
+    for (uint tile = 0u; tile < tiles; tile++) {
+        uint j = tile * 64u + lane;
+        uint head = 0u;
+        uint to = 0u;
+        uint cost = 0u;
+        if (j < count) {
+            head = jobs[4u + j * 4u];
+            to = jobs[6u + j * 4u];
+            uint from = jobs[5u + j * 4u];
+            cost = clamped(head & 15u, (head >> 4) & 15u, (head >> 8) & 255u, from, to);
+        }
+        budget.Store(64u + lane * 4u, cost);
+        AllMemoryBarrierWithGroupSync();
+        if (lane == 0u && tile * 64u < count) {
+            for (uint i = 0u; i < 64u; i++) {
+                uint c = budgetWords[16u + i];
+                if (c > left) {
+                    budget.Store(64u + i * 4u, PAST);
+                    if (take_rest != 0u) {
+                        left = 0u;
+                    }
+                } else {
+                    left -= c;
+                }
+            }
+        }
+        AllMemoryBarrierWithGroupSync();
+        if (j < count && budgetWords[16u + lane] == PAST) {
+            if (((head >> 4) & 15u) <= 1u) {
+                dest.Store2(to, uint2(0u, 0u));
+            } else {
+                dest.Store3(to, uint3(0u, 0u, 0u));
+            }
+        }
+        if (tile + 1u < tiles) {
+            AllMemoryBarrierWithGroupSync();
+        }
+    }
+    if (lane == 0u) {
+        budget.Store(0u, BUDGET - left);
+    }
+}
+"#;
+
+/// The group pass's root signature and pipeline ([`GROUP_SOURCE`]): root
+/// constants (flags, widest), the table, `dest`, the budget as bytes and as
+/// words, the eight sources.
+struct GroupClamp {
+    root: ID3D12RootSignature,
+    pso: ID3D12PipelineState,
+}
+
+// SAFETY: D3D12 objects are free-threaded.
+unsafe impl Send for GroupClamp {}
+// SAFETY: as above.
+unsafe impl Sync for GroupClamp {}
+
+fn group_clamp() -> Option<&'static GroupClamp> {
+    static CLAMP: std::sync::OnceLock<Option<GroupClamp>> = std::sync::OnceLock::new();
+    CLAMP
+        .get_or_init(|| {
+            use crate::compute::Param;
+            let mut params = vec![
+                Param::Constants {
+                    register: 0,
+                    count: 2,
+                },
+                Param::Srv {
+                    register: 0,
+                    space: 0,
+                },
+                Param::Uav { register: 0 },
+                Param::Uav { register: 1 },
+                Param::Uav { register: 2 },
+            ];
+            let sources =
+                (1..=GROUP_SOURCES as u32).map(|register| Param::Srv { register, space: 0 });
+            params.extend(sources);
+            match crate::compute::pipeline(GROUP_SOURCE, s!("clamp groups"), 0, &params) {
+                Ok((root, pso)) => Some(GroupClamp { root, pso }),
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "no group clamp: indirect arguments are clamped one execution at a time"
+                    );
+                    None
+                }
+            }
+        })
+        .as_ref()
+}
+
+/// The group pass's job for a record of `kind` and `stride` bytes at word
+/// `from` of source `source`, clamped to byte `to` of the group's output.
+pub(crate) fn group_job(source: u32, kind: u32, stride: u32, from: u32, to: u32) -> [u32; 4] {
+    [source | kind << 4 | stride << 8, from, to, 0]
+}
+
+/// Whether an execution of `max` records of `kind`, `stride` bytes apart,
+/// with a count or not, can be clamped in a group pass: one record of the
+/// kinds the host runs, no longer than [`GROUP_SLOT`], no count (all the
+/// title's indirect executions).
+pub(crate) fn groupable(kind: u32, stride: u32, max: u32, counted: bool) -> bool {
+    matches!(kind, 0 | 1 | 2 | 10)
+        && max == 1
+        && !counted
+        && stride.is_multiple_of(4)
+        && (12..=GROUP_SLOT).contains(&stride)
+}
+
+/// Records, in `l`, a group pass over the table at host address `table`
+/// into `out` (in state `before`, left readable as arguments), charging the
+/// budget at `budget`, reading the eight `sources` (host addresses of title
+/// buffers' copies, the first repeated where there are fewer). Replaces the
+/// list's compute root signature and pipeline. False if the pass is not
+/// available.
+///
+/// With `cmd7` (narrow clamp sync, [`clamp_sync_enabled`]) the barriers are
+/// global ones and `out` stays common (`before` is not read). The one
+/// before the pass waits for every shader stage, not only compute as an
+/// inline clamp's does: a job's record may have been written before the
+/// pass and ordered for its execution only by a barrier of the title's
+/// recorded after the pass, which the pass must not overtake. The title's
+/// barriers are global UAV barriers (`crate::list`), which wait for all
+/// shading; so does the legacy one here.
+pub(crate) fn record_group(
+    l: &ID3D12GraphicsCommandList,
+    cmd7: Option<&ID3D12GraphicsCommandList7>,
+    (out, before): (&ID3D12Resource, D3D12_RESOURCE_STATES),
+    budget: u64,
+    table: u64,
+    sources: &[u64; GROUP_SOURCES],
+) -> bool {
+    if group_clamp().is_none() {
+        return false;
+    }
+    // SAFETY: an open list; our buffer.
+    unsafe {
+        // Earlier shader writes (the title's argument passes) first.
+        if let Some(cmd7) = cmd7 {
+            global_barrier(
+                cmd7,
+                D3D12_BARRIER_SYNC_ALL_SHADING,
+                D3D12_BARRIER_SYNC_COMPUTE_SHADING,
+                D3D12_BARRIER_ACCESS_UNORDERED_ACCESS,
+                D3D12_BARRIER_ACCESS_SHADER_RESOURCE | D3D12_BARRIER_ACCESS_UNORDERED_ACCESS,
+            );
+            note_barriers(1);
+        } else {
+            let mut barriers = vec![uav_barrier()];
+            if before != D3D12_RESOURCE_STATE_UNORDERED_ACCESS {
+                barriers.push(transition(
+                    out,
+                    before,
+                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                ));
+            }
+            l.ResourceBarrier(&barriers);
+            note_barriers(barriers.len());
+        }
+        dispatch_group(l, out.GetGPUVirtualAddress(), budget, table, sources);
+        GROUPS[0].fetch_add(1, Ordering::Relaxed);
+        if let Some(cmd7) = cmd7 {
+            global_barrier(
+                cmd7,
+                D3D12_BARRIER_SYNC_COMPUTE_SHADING,
+                D3D12_BARRIER_SYNC_EXECUTE_INDIRECT,
+                D3D12_BARRIER_ACCESS_UNORDERED_ACCESS,
+                D3D12_BARRIER_ACCESS_INDIRECT_ARGUMENT,
+            );
+        } else {
+            l.ResourceBarrier(&[transition(
+                out,
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+            )]);
+        }
+        note_barriers(1);
+    }
+    true
+}
+
+/// The group pass over the table at host address `table` into the buffer at
+/// `out` (unordered access), with no barrier: [`record_group`]'s, or a
+/// prelude's batch ([`record_batch`]).
+fn dispatch_group(
+    l: &ID3D12GraphicsCommandList,
+    out: u64,
+    budget: u64,
+    table: u64,
+    sources: &[u64; GROUP_SOURCES],
+) {
+    let Some(c) = group_clamp() else {
+        return;
+    };
+    let constants = [u32::from(indirect_rest()) << 1, widest()];
+    // SAFETY: an open list; our root signature, pipeline and buffers; title
+    // buffers' copies the list keeps, read in the common state (promoted).
+    unsafe {
+        l.SetComputeRootSignature(&c.root);
+        l.SetPipelineState(&c.pso);
+        l.SetComputeRoot32BitConstants(0, constants.len() as u32, constants.as_ptr().cast(), 0);
+        l.SetComputeRootShaderResourceView(1, table);
+        l.SetComputeRootUnorderedAccessView(2, out);
+        l.SetComputeRootUnorderedAccessView(3, budget);
+        l.SetComputeRootUnorderedAccessView(4, budget);
+        for (i, &source) in sources.iter().enumerate() {
+            l.SetComputeRootShaderResourceView(5 + i as u32, source);
+        }
+        l.Dispatch(1, 1, 1);
+    }
+}
+
+/// What [`prelude_run`] finds: clamps taken, output buffer, sources, jobs.
+type PreludeRun = (usize, u64, [u64; GROUP_SOURCES], Vec<[u32; 4]>);
+
+/// A run of a prelude's clamps ([`record_batch`]) in one group pass: how
+/// many of `clamps` it takes (those of no record are skipped, as alone),
+/// the buffer of `outs` (host address, bytes) their records go to, the
+/// sources it binds and its jobs. `None` if the first cannot be grouped
+/// ([`PendingClamp::src_base`]).
+fn prelude_run(clamps: &[PendingClamp], outs: &[(u64, u64)]) -> Option<PreludeRun> {
+    let first = clamps.first().filter(|c| c.src_base != 0)?;
+    let (out, out_len) = *outs
+        .iter()
+        .find(|&&(at, len)| first.dst_gpu >= at && first.dst_gpu - at < len)?;
+    let mut sources = [first.src_base; GROUP_SOURCES];
+    let mut bound = 1;
+    let mut jobs = Vec::new();
+    let mut taken = 0;
+    for c in clamps {
+        if c.records == 0 {
+            taken += 1;
+            continue;
+        }
+        if c.src_base == 0 || jobs.len() == GROUP_JOBS as usize {
+            break;
+        }
+        let to = c.dst_gpu - out;
+        if c.dst_gpu < out || to + u64::from(c.stride) > out_len || to > u64::from(u32::MAX) {
+            break;
+        }
+        let source = match sources[..bound].iter().position(|&s| s == c.src_base) {
+            Some(s) => s,
+            None if bound < GROUP_SOURCES => {
+                sources[bound] = c.src_base;
+                bound += 1;
+                bound - 1
+            }
+            None => break,
+        };
+        let from = ((c.src_gpu - c.src_base) / 4) as u32;
+        jobs.push(group_job(source as u32, c.kind, c.stride, from, to as u32));
+        taken += 1;
+    }
+    (!jobs.is_empty()).then_some((taken, out, sources, jobs))
+}
+
+/// An execution of one record was clamped in a group pass.
+pub(crate) fn note_grouped() {
+    GROUPS[1].fetch_add(1, Ordering::Relaxed);
+    RECORDS[0].fetch_add(1, Ordering::Relaxed);
+}
+
+/// Whether the group pass's pipeline is available on this host.
+pub(crate) fn group_available() -> bool {
+    group_clamp().is_some()
+}
+
+/// The host copies the last grouped executions read their records from,
+/// newest first: what a group pass binds besides its first execution's
+/// ([`recent_sources`]).
+static RECENT: std::sync::Mutex<Vec<std::sync::Weak<crate::shadow::Shadow>>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// `source` was read by a grouped execution: first of [`RECENT`].
+pub(crate) fn note_source(source: &std::sync::Arc<crate::shadow::Shadow>) {
+    let mut recent = RECENT.lock().unwrap_or_else(|e| e.into_inner());
+    let this = std::sync::Arc::as_ptr(source);
+    if recent
+        .first()
+        .is_some_and(|r| std::ptr::eq(r.as_ptr(), this))
+    {
+        return;
+    }
+    recent.retain(|r| r.strong_count() > 0 && !std::ptr::eq(r.as_ptr(), this));
+    recent.insert(0, std::sync::Arc::downgrade(source));
+    recent.truncate(2 * GROUP_SOURCES);
+}
+
+/// The buffers of the host copies of [`RECENT`] that live, newest first.
+pub(crate) fn recent_sources() -> Vec<ID3D12Resource> {
+    let recent = RECENT.lock().unwrap_or_else(|e| e.into_inner());
+    recent
+        .iter()
+        .filter_map(std::sync::Weak::upgrade)
+        .map(|s| s.buffer.clone())
+        .collect()
+}
+
 /// Whether the argument clamp compute pipeline is available on this host.
 pub(crate) fn available() -> bool {
     clamp().is_some()
@@ -157,6 +687,10 @@ pub(crate) struct PendingClamp {
     pub(crate) kind: u32,
     pub(crate) stride: u32,
     pub(crate) records: u32,
+    /// The host address of the buffer `src_gpu` is in, if a group pass can
+    /// clamp it ([`groupable`], the record a word of it a 32-bit index
+    /// reaches); 0 otherwise.
+    pub(crate) src_base: u64,
 }
 
 const SOURCE: &str = include_str!("indirect-clamp.hlsl");
@@ -637,12 +1171,14 @@ fn bound_with(
                 D3D12_BARRIER_ACCESS_UNORDERED_ACCESS,
                 D3D12_BARRIER_ACCESS_SHADER_RESOURCE | D3D12_BARRIER_ACCESS_UNORDERED_ACCESS,
             );
+            note_barriers(1);
         } else {
             // Earlier shader writes (the title's argument passes) first.
             l.ResourceBarrier(&[
                 uav_barrier(),
                 transition(&out, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
             ]);
+            note_barriers(2);
         }
         l.SetComputeRootSignature(&c.root);
         l.SetPipelineState(&c.pso);
@@ -665,13 +1201,16 @@ fn bound_with(
                 D3D12_BARRIER_ACCESS_UNORDERED_ACCESS,
                 D3D12_BARRIER_ACCESS_INDIRECT_ARGUMENT,
             );
+            note_barriers(1);
         } else {
             l.ResourceBarrier(&[
                 uav_barrier(),
                 transition(&out, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT),
             ]);
+            note_barriers(2);
         }
     }
+    list.note_work(true);
     Some((out, dst_offset))
 }
 
@@ -680,9 +1219,21 @@ fn bound_with(
 /// argument arena. Returns the arena buffer and byte offset ready for
 /// `ExecuteIndirect` (the prelude transitions the buffer into
 /// `INDIRECT_ARGUMENT`, and `list.close()` transitions it back to `COMMON`).
+#[cfg(test)]
 pub(crate) fn enqueue(
     list: &HostList,
     gpu: u64,
+    spec: (u32, u32, u32),
+    count: Option<u64>,
+) -> Option<(ID3D12Resource, u64)> {
+    enqueue_from(list, (None, gpu), spec, count)
+}
+
+/// [`enqueue`] of a record in the buffer `source` if it is known: with clamp
+/// groups on, the prelude may clamp it in a group pass ([`record_batch`]).
+pub(crate) fn enqueue_from(
+    list: &HostList,
+    (source, gpu): (Option<&ID3D12Resource>, u64),
     (kind, stride, records): (u32, u32, u32),
     count: Option<u64>,
 ) -> Option<(ID3D12Resource, u64)> {
@@ -692,6 +1243,21 @@ pub(crate) fn enqueue(
     }
     let count_gpu = count.filter(|at| at.is_multiple_of(4));
     let bytes = u64::from(stride) * u64::from(records.max(1));
+    let src_base = source
+        .filter(|_| groups_enabled() && groupable(kind, stride, records, count_gpu.is_some()))
+        .map(|buffer| {
+            // SAFETY: plain queries on a live buffer.
+            let (at, len) = unsafe { (buffer.GetGPUVirtualAddress(), buffer.GetDesc().Width) };
+            let inside = gpu >= at
+                && gpu + bytes <= at.saturating_add(len)
+                && (gpu - at) / 4 <= u64::from(u32::MAX);
+            if inside && at.is_multiple_of(4) {
+                at
+            } else {
+                0
+            }
+        })
+        .unwrap_or(0);
     let out = list.enqueue_hoisted_clamp(bytes, |dst_gpu| PendingClamp {
         src_gpu: gpu,
         dst_gpu,
@@ -699,6 +1265,7 @@ pub(crate) fn enqueue(
         kind,
         stride,
         records,
+        src_base,
     })?;
     RECORDS[0].fetch_add(u64::from(records), Ordering::Relaxed);
     if count_gpu.is_some() {
@@ -714,12 +1281,19 @@ pub(crate) fn enqueue(
 /// UAV barrier between consecutive dispatches so the shared list budget is
 /// charged in exact recorded order), and one post-batch transition into
 /// `INDIRECT_ARGUMENT`.
+///
+/// With clamp groups on ([`groups_enabled`]), runs of clamps a group pass
+/// can take are one dispatch each instead, over a table of jobs in memory
+/// from `table` (bytes: host address, CPU pointer, the list's upload
+/// memory): the barriers between dispatches, one per clamp, become one per
+/// pass.
 pub(crate) fn record_batch(
     cmd: &ID3D12GraphicsCommandList,
     cmd7: Option<&ID3D12GraphicsCommandList7>,
     budget: u64,
     buffers: &[ID3D12Resource],
     clamps: &[PendingClamp],
+    table: &mut dyn FnMut(u64) -> Option<(u64, *mut u8)>,
 ) {
     let Some(c) = clamp() else {
         return;
@@ -752,6 +1326,17 @@ pub(crate) fn record_batch(
     };
     let widest = widest();
     let rest = indirect_rest();
+    let grouped = groups_enabled() && group_available();
+    // The buffers' host addresses and bytes, where group passes write.
+    let outs: Vec<(u64, u64)> = if grouped {
+        buffers
+            .iter()
+            // SAFETY: plain queries on live buffers.
+            .map(|b| unsafe { (b.GetGPUVirtualAddress(), b.GetDesc().Width) })
+            .collect()
+    } else {
+        Vec::new()
+    };
     // SAFETY: `cmd` is the host list's open prelude command list; our clamp
     // pipeline, budget buffer, hoisted argument buffers, and title shadow
     // copies are kept alive by the host list until reset.
@@ -764,18 +1349,20 @@ pub(crate) fn record_batch(
                 D3D12_BARRIER_ACCESS_UNORDERED_ACCESS,
                 D3D12_BARRIER_ACCESS_SHADER_RESOURCE | D3D12_BARRIER_ACCESS_UNORDERED_ACCESS,
             );
+            note_barriers(1);
         } else {
             cmd.ResourceBarrier(&pre);
+            note_barriers(pre.len());
         }
-        cmd.SetComputeRootSignature(&c.root);
-        cmd.SetPipelineState(&c.pso);
-        cmd.SetComputeRootUnorderedAccessView(2, budget);
-        if c.words {
-            cmd.SetComputeRootUnorderedAccessView(5, budget);
-        }
+        // Whether the one-execution clamp's root signature and pipeline are
+        // bound (a group pass binds its own).
+        let mut single = false;
         let mut dispatched = false;
-        for clamp in clamps {
+        let mut at = 0;
+        while at < clamps.len() {
+            let clamp = &clamps[at];
             if clamp.records == 0 {
+                at += 1;
                 continue;
             }
             if dispatched {
@@ -792,6 +1379,35 @@ pub(crate) fn record_batch(
                 } else {
                     cmd.ResourceBarrier(&[uav_barrier()]);
                 }
+                note_barriers(1);
+            }
+            dispatched = true;
+            let run = grouped.then(|| prelude_run(&clamps[at..], &outs)).flatten();
+            if let Some((taken, out, sources, jobs)) = run
+                && let Some((table_gpu, words)) = table(GROUP_TABLE)
+            {
+                let words = words.cast::<u32>();
+                words.write_volatile(jobs.len() as u32);
+                for (i, job) in jobs.iter().enumerate() {
+                    for (k, &word) in job.iter().enumerate() {
+                        words.add(4 + 4 * i + k).write_volatile(word);
+                    }
+                }
+                dispatch_group(cmd, out, budget, table_gpu, &sources);
+                GROUPS[6].fetch_add(1, Ordering::Relaxed);
+                GROUPS[7].fetch_add(jobs.len() as u64, Ordering::Relaxed);
+                single = false;
+                at += taken;
+                continue;
+            }
+            if !single {
+                cmd.SetComputeRootSignature(&c.root);
+                cmd.SetPipelineState(&c.pso);
+                cmd.SetComputeRootUnorderedAccessView(2, budget);
+                if c.words {
+                    cmd.SetComputeRootUnorderedAccessView(5, budget);
+                }
+                single = true;
             }
             let constants = [
                 clamp.kind,
@@ -810,7 +1426,7 @@ pub(crate) fn record_batch(
             cmd.SetComputeRootUnorderedAccessView(3, clamp.dst_gpu);
             cmd.SetComputeRootShaderResourceView(4, clamp.count_gpu.unwrap_or(clamp.src_gpu));
             cmd.Dispatch(1, 1, 1);
-            dispatched = true;
+            at += 1;
         }
         if let Some(cmd7) = cmd7 {
             global_barrier(
@@ -820,8 +1436,10 @@ pub(crate) fn record_batch(
                 D3D12_BARRIER_ACCESS_UNORDERED_ACCESS,
                 D3D12_BARRIER_ACCESS_INDIRECT_ARGUMENT,
             );
+            note_barriers(1);
         } else {
             cmd.ResourceBarrier(&post);
+            note_barriers(post.len());
         }
     }
 }
@@ -849,17 +1467,18 @@ pub(crate) fn note_inline(why: Option<crate::host::ClampBlock>) {
         Some(ClampBlock::Overlap) => 1,
         Some(ClampBlock::AfterInline) => 2,
         None => 3,
+        Some(ClampBlock::InPlace) => 4,
     };
     INLINE_WHY[at].fetch_add(1, Ordering::Relaxed);
 }
 
 /// Inline clamps since the last call by what kept them out of the
 /// prelude: `[a write anywhere, a write of their arguments, an inline clamp
-/// before them, batching off]`.
-pub(crate) fn take_inline_why() -> [u64; 4] {
+/// before them, batching off, read in place]`.
+pub(crate) fn take_inline_why() -> [u64; 5] {
     INLINE_WHY.each_ref().map(|n| n.swap(0, Ordering::Relaxed))
 }
-static INLINE_WHY: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+static INLINE_WHY: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
 
 /// A title list went on in a new host list for a clamp
 /// ([`clamp_cuts_enabled`]).
@@ -887,6 +1506,7 @@ pub(crate) fn done(list: &HostList, arguments: &ID3D12Resource) {
             D3D12_RESOURCE_STATE_COMMON,
         )])
     };
+    note_barriers(1);
 }
 
 #[cfg(test)]
@@ -894,7 +1514,9 @@ mod tests {
     use crate::backend::{HostGpu, HostMemory};
 
     /// The clamp compiles with the system's compiler (including both 64-lane
-    /// and 1-lane words forms) and the host takes it.
+    /// and 1-lane words forms) and the host takes it, and so does the group
+    /// pass, whose compiler messages a failure shows (fxc on Windows refused
+    /// what Wine's compiler takes).
     #[test]
     fn argument_clamp_builds() {
         if super::host().is_none() {
@@ -903,6 +1525,47 @@ mod tests {
         assert!(super::clamp().is_some());
         assert!(super::make_words().is_ok());
         assert!(super::make_words_1().is_ok());
+        assert!(
+            super::group_available(),
+            "the group pass compiles and the host takes it: {}",
+            compiler_messages(super::GROUP_SOURCE)
+        );
+    }
+
+    /// What the system's compiler says about `source` (`main`, `cs_5_1`).
+    fn compiler_messages(source: &str) -> String {
+        use super::{D3DCompile, ID3DBlob, s};
+        let (mut code, mut errors): (Option<ID3DBlob>, Option<ID3DBlob>) = (None, None);
+        // SAFETY: the source and names live through the call; out pointers ours.
+        let compiled = unsafe {
+            D3DCompile(
+                source.as_ptr().cast(),
+                source.len(),
+                s!("clamp groups"),
+                None,
+                None,
+                s!("main"),
+                s!("cs_5_1"),
+                0,
+                0,
+                &mut code,
+                Some(&mut errors),
+            )
+        };
+        let text = errors.map(|e| {
+            // SAFETY: the blob's own bytes.
+            let bytes = unsafe {
+                std::slice::from_raw_parts(e.GetBufferPointer().cast::<u8>(), e.GetBufferSize())
+            };
+            String::from_utf8_lossy(bytes).into_owned()
+        });
+        match compiled {
+            Ok(()) => format!(
+                "compiles, so the host refused it ({})",
+                text.unwrap_or_default()
+            ),
+            Err(e) => format!("{e}: {}", text.unwrap_or_default()),
+        }
     }
 
     /// Every word the clamp `c` writes for `records` records of `kind` made
@@ -1471,6 +2134,20 @@ void main(uint3 g : SV_GroupID) {
         let why = super::take_inline_why();
         // Other tests may clamp at the same time: at least these.
         assert!(why[0] >= 1 && why[2] >= 1 && why[3] >= 1, "{why:?}");
+    }
+
+    /// Clamp groups are a switch (`VICTORY_CLAMP_GROUPS=1`), off unless set;
+    /// tests turn them on and off per thread.
+    #[test]
+    fn clamp_groups_switch_toggles_per_thread() {
+        super::with_clamp_groups(true, || {
+            assert!(super::groups_enabled());
+            super::with_clamp_groups(false, || assert!(!super::groups_enabled()));
+            assert!(super::groups_enabled());
+        });
+        if std::env::var_os("VICTORY_CLAMP_GROUPS").is_none() {
+            assert!(!super::groups_enabled(), "off by default");
+        }
     }
 
     #[test]
@@ -2060,6 +2737,1091 @@ void main() {
         assert!(cut.clamp_cut_pays(), "a reset list is no longer a cut one");
         writer.reset();
         crate::shadow::unregister(addr as usize, addr);
+        assert_eq!(host.log_messages(), None);
+    }
+
+    /// Every clamp shader has the budget the frame line's figures are of
+    /// (`crate::host::take_budget_spent`), and caps one record's cost at
+    /// half of it: a draw's instances at 2^26 over its count, a dispatch's
+    /// groups at 2^20 of 64 threads.
+    #[test]
+    fn every_clamp_charges_the_budget_half_a_record_at_most() {
+        let budget = format!(
+            "static const uint BUDGET = 1u << {};",
+            super::BUDGET.trailing_zeros()
+        );
+        for source in [
+            super::SOURCE,
+            super::WORDS_SOURCE,
+            super::WORDS_1_SOURCE,
+            super::GROUP_SOURCE,
+        ] {
+            assert!(source.contains(&budget), "{budget}");
+            assert!(source.contains("(1u << 26) / max(count, 1u)"));
+            assert!(source.contains("GROUPS = 1u << 20"));
+        }
+        // A draw: count times instances; a dispatch: groups of 64 threads.
+        assert_eq!(1u32 << 26, super::BUDGET / 2);
+        assert_eq!((1u32 << 20) * 64, super::BUDGET / 2);
+    }
+
+    /// A host list whose executions spent more than half of its budget is
+    /// counted when it is reset, with the most a list spent: two dispatches
+    /// of 2^20 groups spend all of it.
+    #[test]
+    fn a_list_past_half_of_its_budget_is_counted() {
+        use super::*;
+        let Some(host) = host() else {
+            return; // no host GPU here
+        };
+        let (record, ptr) = host.shared_buffer(12).unwrap();
+        // SAFETY: our mapped buffer, written before the list runs; live.
+        let gpu = unsafe {
+            ptr.cast::<[u32; 3]>().write_volatile([1024, 1024, 1]);
+            record.GetGPUVirtualAddress()
+        };
+        let list = host.new_list().unwrap();
+        for _ in 0..2 {
+            let (out, _) = bound(&list, gpu, (2, 12, 1), None).unwrap();
+            list.note_inline_clamp();
+            done(&list, &out);
+        }
+        list.close();
+        host.execute(&[&list]);
+        assert_eq!(list.budget_used(), Some(BUDGET));
+        list.reset();
+        let [past_half, most] = crate::host::take_budget_spent();
+        assert!(past_half >= 1, "{past_half}");
+        assert_eq!(most, u64::from(BUDGET));
+        assert_eq!(list.budget_used(), Some(0), "cleared at the reset");
+        assert_eq!(host.log_messages(), None);
+    }
+
+    /// Group passes take executions of one record of 12 to 32 bytes with no
+    /// count, at most a table's jobs a pass.
+    #[test]
+    fn groups_take_one_record_of_12_to_32_bytes_with_no_count() {
+        use super::groupable;
+        assert!(
+            groupable(10, 12, 1, false) && groupable(0, 16, 1, false) && groupable(1, 20, 1, false)
+        );
+        assert!(groupable(2, 12, 1, false) && groupable(0, 32, 1, false));
+        assert!(!groupable(0, 16, 2, false), "one record");
+        assert!(!groupable(0, 16, 0, false), "one record");
+        assert!(!groupable(0, 16, 1, true), "no count");
+        assert!(!groupable(0, 36, 1, false), "no longer than a slot");
+        assert!(!groupable(0, 18, 1, false), "whole words");
+        assert!(!groupable(3, 12, 1, false), "the kinds the host runs");
+        let cap = format!("min(jobs[0], {}u)", super::GROUP_JOBS);
+        assert!(
+            super::GROUP_SOURCE.contains(&cap),
+            "the pass walks at most a table's jobs"
+        );
+        let tiles = format!("uint tiles = {}u;", super::GROUP_JOBS.div_ceil(64));
+        assert!(
+            super::GROUP_SOURCE.contains(&tiles),
+            "every tile a table holds, a constant"
+        );
+    }
+
+    /// The executions the world frame clamps inline come after the compute
+    /// passes that write their arguments. In one list: a dispatch writes
+    /// every record over stale words, an inline clamp spends half the
+    /// budget, then executions of every kind, some from other buffers than
+    /// the first (bound by the pass from the recent ones, or past the eight
+    /// it binds: another pass), one clamped inline among them (its count:
+    /// the group after it is another), and records the budget no longer
+    /// holds. Their group passes write word for word what inline clamps
+    /// after the same producer write, reading what it wrote, with the
+    /// clamps' barriers of either kind (`VICTORY_CLAMP_SYNC`): narrow ones
+    /// record no transition, and a pass waits for every shader stage.
+    #[test]
+    fn group_passes_clamp_as_inline_clamps_do() {
+        use super::*;
+        use crate::compute::Param;
+        const PRODUCE: &str = r#"
+StructuredBuffer<uint> src : register(t0);
+RWByteAddressBuffer dst : register(u0);
+cbuffer Count : register(b0) { uint n; };
+[numthreads(64, 1, 1)]
+void main(uint3 id : SV_DispatchThreadID) {
+    for (uint i = id.x; i < n; i += 64u) {
+        dst.Store(i * 4u, src[i]);
+    }
+}
+"#;
+        let Some(host) = host() else {
+            return; // no host GPU here
+        };
+        let (root, pso) = crate::compute::pipeline(
+            PRODUCE,
+            s!("produce"),
+            0,
+            &[
+                Param::Srv {
+                    register: 0,
+                    space: 0,
+                },
+                Param::Uav { register: 0 },
+                Param::Constants {
+                    register: 0,
+                    count: 1,
+                },
+            ],
+        )
+        .unwrap();
+        // (buffer, kind, stride, words of the record, a count word)
+        type Case = (usize, u32, u32, Vec<u32>, Option<u32>);
+        let cases: Vec<Case> = vec![
+            (0, 0, 16, vec![12, 2, 7, 9], None),
+            (0, 1, 20, vec![100, 3, 7, 8, 9], None),
+            (1, 2, 12, vec![widest() + 5, 1, 1], None),
+            (0, 10, 12, vec![100, 5, 3], None),
+            (1, 10, 32, vec![70_000, 1, 1, 4, 5, 6, 7, 8], None),
+            (0, 0, 32, vec![1 << 25, 10, 1, 2, 11, 12, 13, 14], None),
+            (2, 2, 12, vec![65_535, 17, 1], None),
+            // Clamped inline (a count): the next execution opens a pass.
+            (0, 0, 16, vec![5, 1, 3, 4], Some(1)),
+            (0, 0, 16, vec![6, 2, 3, 4], None),
+            // Nine more buffers: past the eight one pass binds.
+            (3, 10, 12, vec![9, 1, 1], None),
+            (4, 10, 12, vec![10, 1, 1], None),
+            (5, 10, 12, vec![11, 1, 1], None),
+            (6, 10, 12, vec![12, 1, 1], None),
+            (7, 10, 12, vec![13, 1, 1], None),
+            (8, 10, 12, vec![14, 1, 1], None),
+            (9, 10, 12, vec![15, 1, 1], None),
+            (10, 10, 12, vec![16, 1, 1], None),
+            (11, 10, 12, vec![17, 1, 1], None),
+            // Half the budget each: after the half spent and the rest, the
+            // first no longer fits; then small ones still do.
+            (0, 0, 16, vec![1 << 22, 16, 0, 0], None),
+            (1, 0, 16, vec![1 << 22, 16, 0, 0], None),
+            (0, 0, 16, vec![3, 1, 0, 0], None),
+            (1, 1, 20, vec![3, 1, 0, 0, 0], None),
+        ];
+        const STALE: u32 = 0x5a5a_5a5a;
+        const BUFFERS: usize = 12;
+        let at_of = |i: usize| -> u64 { 64 * i as u64 + 16 };
+        // Per buffer: the title's (stale until produced, at 16 bytes in) and
+        // what the producer writes there.
+        let buffers: Vec<_> = (0..BUFFERS)
+            .map(|b| {
+                let (title, title_ptr) = host.shared_buffer(64 * cases.len() as u64 + 64).unwrap();
+                let (produced, produced_ptr) =
+                    host.shared_buffer(64 * cases.len() as u64 + 64).unwrap();
+                for (i, (buffer, _, _, words, _)) in cases.iter().enumerate() {
+                    if *buffer == b {
+                        // SAFETY: our mapped buffers, written before any list runs.
+                        unsafe {
+                            for (w, &word) in words.iter().enumerate() {
+                                produced_ptr
+                                    .cast::<u8>()
+                                    .add(at_of(i) as usize)
+                                    .cast::<u32>()
+                                    .add(w)
+                                    .write_volatile(word);
+                            }
+                        }
+                    }
+                }
+                (title, title_ptr, produced)
+            })
+            .collect();
+        let (counter, counter_ptr) = host.shared_buffer(4).unwrap();
+        let (half, half_ptr) = host.shared_buffer(16).unwrap();
+        // SAFETY: as above.
+        unsafe {
+            counter_ptr.cast::<u32>().write_volatile(1);
+            half_ptr
+                .cast::<[u32; 4]>()
+                .write_volatile([1 << 22, 16, 0, 0]);
+        }
+        // SAFETY: live buffers.
+        let gpu = |b: &ID3D12Resource| unsafe { b.GetGPUVirtualAddress() };
+        let words = (64 * cases.len() + 64) / 4;
+        let stale = || {
+            for (_, ptr, _) in &buffers {
+                // SAFETY: our mapped buffers; no list is running.
+                unsafe { (0..words).for_each(|i| ptr.cast::<u32>().add(i).write_volatile(STALE)) };
+            }
+        };
+        // The producer, then an inline clamp spending half the budget.
+        let produce = |list: &HostList| {
+            let l = &list.list;
+            let n = words as u32;
+            // SAFETY: an open list; our pipeline and live buffers.
+            unsafe {
+                l.SetComputeRootSignature(&root);
+                l.SetPipelineState(&pso);
+                for (title, _, produced) in &buffers {
+                    l.SetComputeRootShaderResourceView(0, gpu(produced));
+                    l.SetComputeRootUnorderedAccessView(1, gpu(title));
+                    l.SetComputeRoot32BitConstants(2, 1, (&raw const n).cast(), 0);
+                    l.Dispatch(1, 1, 1);
+                }
+                l.ResourceBarrier(&[uav_barrier()]);
+            }
+            list.note_unknown_gpu_write();
+            let (spent, _) = bound(list, gpu(&half), (0, 16, 1), None).unwrap();
+            list.note_inline_clamp();
+            done(list, &spent);
+        };
+        let read = |buffer: &ID3D12Resource, offset: u64, n: usize| -> Vec<u32> {
+            let mut p = std::ptr::null_mut();
+            // SAFETY: a mapped buffer of ours; the lists have run.
+            unsafe {
+                buffer.Map(0, None, Some(&mut p)).unwrap();
+                let base = p.cast::<u8>().add(offset as usize).cast::<u32>();
+                let out = (0..n).map(|i| base.add(i).read_volatile()).collect();
+                buffer.Unmap(0, None);
+                out
+            }
+        };
+        // Where an inline clamp's record can be read once the list ran: a
+        // copy taken before the next clamp writes the list's one argument
+        // buffer, or, under narrow clamp sync, its own slice.
+        let copy_out = |list: &HostList, (out, offset): (ID3D12Resource, u64), bytes: u64| {
+            if list.narrow_clamp_sync() {
+                done(list, &out);
+                return (out, offset);
+            }
+            let (copy, _) = host.shared_buffer(bytes).unwrap();
+            // SAFETY: an open list; live buffers.
+            unsafe {
+                list.list.ResourceBarrier(&[transition(
+                    &out,
+                    D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+                    D3D12_RESOURCE_STATE_COPY_SOURCE,
+                )]);
+                list.list.CopyBufferRegion(&copy, 0, &out, offset, bytes);
+                list.list.ResourceBarrier(&[transition(
+                    &out,
+                    D3D12_RESOURCE_STATE_COPY_SOURCE,
+                    D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+                )]);
+            }
+            done(list, &out);
+            (copy, 0)
+        };
+
+        // Inline: the producer and every clamp in one list C, with legacy
+        // barriers.
+        let copies: Vec<_> = with_clamp_sync(false, || {
+            stale();
+            let c = host.new_list().unwrap();
+            produce(&c);
+            let copies: Vec<_> = cases
+                .iter()
+                .enumerate()
+                .map(|(i, (b, kind, stride, _, count))| {
+                    let (title, ..) = &buffers[*b];
+                    let counted = count.map(|_| gpu(&counter));
+                    let out =
+                        bound(&c, gpu(title) + at_of(i), (*kind, *stride, 1), counted).unwrap();
+                    c.note_inline_clamp();
+                    copy_out(&c, out, u64::from(*stride))
+                })
+                .collect();
+            c.close();
+            host.execute(&[&c]);
+            copies
+        });
+        let inline: Vec<Vec<u32>> = cases
+            .iter()
+            .zip(&copies)
+            .map(|(case, (copy, offset))| read(copy, *offset, case.2 as usize / 4))
+            .collect();
+        for (i, words) in inline.iter().enumerate() {
+            assert!(
+                !words.contains(&STALE),
+                "execution {i} read the producer's words"
+            );
+        }
+
+        // Grouped: the producer and the executions in one list A, with
+        // legacy and with narrow clamp barriers.
+        // The buffers other executions read lately, newest first.
+        let recent: Vec<ID3D12Resource> = [1, 2, 4, 5, 6, 7, 8, 9, 10, 11, 3]
+            .iter()
+            .map(|&b| buffers[b].0.clone())
+            .collect();
+        for narrow in [false, true] {
+            with_clamp_sync(narrow, || {
+                stale();
+                let a = host.new_list().unwrap();
+                assert_eq!(
+                    a.narrow_clamp_sync(),
+                    narrow,
+                    "the host has enhanced barriers"
+                );
+                produce(&a);
+                let _ = (
+                    crate::host::tests::issued(),
+                    crate::host::tests::global_issued(),
+                );
+                let mut opened = Vec::new();
+                let places: Vec<(ID3D12Resource, u64)> = cases
+                    .iter()
+                    .enumerate()
+                    .map(|(i, (b, kind, stride, _, count))| {
+                        let (title, ..) = &buffers[*b];
+                        let record = gpu(title) + at_of(i);
+                        if count.is_some() {
+                            let out = bound(&a, record, (*kind, *stride, 1), Some(gpu(&counter)))
+                                .unwrap();
+                            a.note_inline_clamp();
+                            opened.push(false);
+                            return copy_out(&a, out, u64::from(*stride));
+                        }
+                        assert!(groupable(*kind, *stride, 1, false));
+                        assert!(group_available(), "the group pass compiles");
+                        let (seat, open) = a
+                            .clamp_group_seat((title, record), (record, u64::from(*stride)), || {
+                                recent.clone()
+                            })
+                            .expect("a seat");
+                        opened.push(open);
+                        a.clamp_group_join(&seat, record, (*kind, *stride))
+                            .expect("a place")
+                    })
+                    .collect();
+                a.close();
+                // A pass opens at the first execution (binding buffers 0, 1,
+                // 2 and 4 to 8), after the inline one, and at the first
+                // execution of each buffer the pass before does not bind.
+                let passes: Vec<usize> = opened
+                    .iter()
+                    .enumerate()
+                    .filter(|&(_, &o)| o)
+                    .map(|(i, _)| i)
+                    .collect();
+                assert_eq!(passes, [0, 8, 9, 15, 16, 17, 18], "narrow {narrow}");
+                let (moved, global) = (
+                    crate::host::tests::issued(),
+                    crate::host::tests::global_issued(),
+                );
+                if narrow {
+                    assert!(moved.is_empty(), "narrow passes move no buffer: {moved:?}");
+                    let all = (
+                        D3D12_BARRIER_SYNC_ALL_SHADING.0,
+                        D3D12_BARRIER_SYNC_COMPUTE_SHADING.0,
+                    );
+                    let waits = global.iter().filter(|&&b| b == all).count();
+                    assert_eq!(
+                        waits,
+                        passes.len(),
+                        "each pass waits for every shader stage: {global:?}"
+                    );
+                } else {
+                    assert!(global.is_empty() && !moved.is_empty());
+                }
+                host.execute(&[&a]);
+                for (i, (case, (buffer, offset))) in cases.iter().zip(&places).enumerate() {
+                    let grouped = read(buffer, *offset, case.2 as usize / 4);
+                    assert_eq!(
+                        grouped, inline[i],
+                        "narrow {narrow}: execution {i} kind {}",
+                        case.1
+                    );
+                }
+            });
+        }
+        let n = cases.len();
+        assert_eq!(
+            inline[n - 4][0],
+            0,
+            "the budget left no room for the first half"
+        );
+        assert_eq!(inline[n - 2][..2], [3, 1], "small ones fit");
+        assert_eq!(host.log_messages(), None);
+    }
+
+    /// With clamp groups on, a prelude's clamps go in group passes where
+    /// they can (one record, no count; up to eight buffers a pass) and one
+    /// at a time where not (several records, a count, none), in their
+    /// order: word for word what inline clamps write, across kinds and
+    /// strides, ten buffers, and records the budget no longer holds. With
+    /// legacy and with narrow clamp barriers (`VICTORY_CLAMP_SYNC`), where
+    /// the budget's barrier between dispatches is one a pass.
+    #[test]
+    fn prelude_group_passes_clamp_as_inline_clamps_do() {
+        use super::*;
+        let Some(host) = host() else {
+            return; // no host GPU here
+        };
+        // (buffer, kind, stride, records, words, a count word)
+        type Case = (usize, u32, u32, u32, Vec<u32>, Option<u32>);
+        let mut cases: Vec<Case> = vec![
+            (0, 0, 16, 1, vec![12, 2, 7, 9], None),
+            (1, 1, 20, 1, vec![100, 3, 7, 8, 9], None),
+            (2, 2, 12, 1, vec![widest() + 5, 1, 1], None),
+            (0, 10, 32, 1, vec![70_000, 1, 1, 4, 5, 6, 7, 8], None),
+            (1, 0, 16, 3, [5, 1, 0, 0].repeat(3), None),
+            (2, 10, 12, 1, vec![100, 5, 3], None),
+            (0, 0, 16, 2, [6, 2, 0, 0].repeat(2), Some(1)),
+            (1, 2, 12, 0, vec![9, 1, 1], None),
+            (0, 0, 32, 1, vec![1 << 25, 10, 1, 2, 11, 12, 13, 14], None),
+        ];
+        cases.extend((3..10).map(|b| (b, 10, 12, 1, vec![b as u32, 1, 1], None)));
+        cases.extend([
+            (0, 0, 16, 1, vec![1 << 22, 16, 0, 0], None),
+            (4, 0, 16, 1, vec![1 << 22, 16, 0, 0], None),
+            (5, 1, 20, 1, vec![1 << 22, 16, 0, 0, 0], None),
+            (6, 0, 16, 1, vec![3, 1, 0, 0], None),
+        ]);
+        let at_of = |i: usize| -> u64 { 128 * i as u64 + 32 };
+        let bytes = 128 * cases.len() as u64 + 128;
+        let buffers: Vec<_> = (0..10)
+            .map(|b| {
+                let (buffer, ptr) = host.shared_buffer(bytes).unwrap();
+                for (i, (from, _, _, _, words, _)) in cases.iter().enumerate() {
+                    if *from == b {
+                        // SAFETY: our mapped buffer, written before any list runs.
+                        unsafe {
+                            let to = ptr.cast::<u8>().add(at_of(i) as usize).cast::<u32>();
+                            words
+                                .iter()
+                                .enumerate()
+                                .for_each(|(w, &word)| to.add(w).write_volatile(word));
+                        }
+                    }
+                }
+                buffer
+            })
+            .collect();
+        let (counter, counter_ptr) = host.shared_buffer(4).unwrap();
+        // SAFETY: as above.
+        unsafe { counter_ptr.cast::<u32>().write_volatile(1) };
+        // SAFETY: live buffers.
+        let gpu = |b: &ID3D12Resource| unsafe { b.GetGPUVirtualAddress() };
+        let walked = |(_, _, stride, records, _, count): &Case| {
+            count.map_or(*records, |c| c.min(*records)) as usize * (*stride as usize / 4)
+        };
+        let read = |buffer: &ID3D12Resource, offset: u64, n: usize| -> Vec<u32> {
+            let mut p = std::ptr::null_mut();
+            // SAFETY: a mapped buffer of ours; the list has run.
+            unsafe {
+                buffer.Map(0, None, Some(&mut p)).unwrap();
+                let base = p.cast::<u8>().add(offset as usize).cast::<u32>();
+                let out = (0..n).map(|i| base.add(i).read_volatile()).collect();
+                buffer.Unmap(0, None);
+                out
+            }
+        };
+
+        let copies: Vec<_> = with_clamp_sync(false, || {
+            let c = host.new_list().unwrap();
+            let copies: Vec<_> = cases
+                .iter()
+                .enumerate()
+                .map(|(i, (b, kind, stride, records, _, count))| {
+                    let counted = count.map(|_| gpu(&counter));
+                    let at = gpu(&buffers[*b]) + at_of(i);
+                    let (out, offset) = bound(&c, at, (*kind, *stride, *records), counted).unwrap();
+                    c.note_inline_clamp();
+                    let bytes = u64::from(*stride) * u64::from((*records).max(1));
+                    let (copy, _) = host.shared_buffer(bytes).unwrap();
+                    // SAFETY: an open list; live buffers.
+                    unsafe {
+                        c.list.ResourceBarrier(&[transition(
+                            &out,
+                            D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+                            D3D12_RESOURCE_STATE_COPY_SOURCE,
+                        )]);
+                        c.list.CopyBufferRegion(&copy, 0, &out, offset, bytes);
+                        c.list.ResourceBarrier(&[transition(
+                            &out,
+                            D3D12_RESOURCE_STATE_COPY_SOURCE,
+                            D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+                        )]);
+                    }
+                    done(&c, &out);
+                    copy
+                })
+                .collect();
+            c.close();
+            host.execute(&[&c]);
+            copies
+        });
+        let inline: Vec<Vec<u32>> = cases
+            .iter()
+            .zip(&copies)
+            .map(|(case, copy)| read(copy, 0, walked(case)))
+            .collect();
+        let n = cases.len();
+        assert_eq!(
+            (inline[n - 4][0], inline[n - 3][0], inline[n - 2][0]),
+            (1 << 22, 0, 0)
+        );
+        assert_eq!(inline[n - 1][..2], [3, 1]);
+
+        assert!(group_available(), "the group pass compiles");
+        for narrow in [false, true] {
+            let _ = crate::host::tests::global_issued();
+            let p = host.new_list().unwrap();
+            assert_eq!(
+                with_clamp_sync(narrow, || p.narrow_clamp_sync()),
+                narrow,
+                "the host has enhanced barriers"
+            );
+            let places: Vec<_> = with_clamp_sync(narrow, || {
+                super::with_clamp_groups(true, || {
+                    cases
+                        .iter()
+                        .enumerate()
+                        .map(|(i, (b, kind, stride, records, _, count))| {
+                            let record = (Some(&buffers[*b]), gpu(&buffers[*b]) + at_of(i));
+                            let counted = count.map(|_| gpu(&counter));
+                            enqueue_from(&p, record, (*kind, *stride, *records), counted).unwrap()
+                        })
+                        .collect()
+                })
+            });
+            with_clamp_sync(narrow, || {
+                p.close();
+                super::with_clamp_groups(true, || host.execute(&[&p]));
+            });
+            if narrow {
+                // Before and after the batch, and between its five dispatches
+                // (three group passes, a clamp of three records and a counted
+                // one) instead of between its nineteen clamps.
+                let global = crate::host::tests::global_issued();
+                assert_eq!(global.len(), 1 + 4 + 1, "{global:?}");
+            }
+            for (i, (case, (b, at))) in cases.iter().zip(&places).enumerate() {
+                assert_eq!(
+                    read(b, *at, walked(case)),
+                    inline[i],
+                    "narrow {narrow}: clamp {i} kind {}",
+                    case.1
+                );
+            }
+        }
+        assert_eq!(host.log_messages(), None);
+    }
+
+    /// A producer, executions, the producer again over the same records,
+    /// executions again, in one list: the executions after the second
+    /// write cannot join the pass before it and get one of their own after
+    /// it, so every execution runs the groups written last before it (those
+    /// after an unrelated write still join). Twice through the same list,
+    /// reset between: its passes' outputs start common again; and twice
+    /// more with narrow clamp barriers (`VICTORY_CLAMP_SYNC`).
+    #[test]
+    fn a_write_ends_the_group_of_what_it_writes() {
+        use super::*;
+        use crate::compute::Param;
+        const MARK: &str = r#"
+RWByteAddressBuffer marks : register(u0);
+cbuffer Offset : register(b0) { uint base; };
+[numthreads(1, 1, 1)]
+void main(uint3 g : SV_GroupID) {
+    marks.Store((base + g.x) * 4, 1);
+}
+"#;
+        const PRODUCE: &str = r#"
+RWByteAddressBuffer records : register(u0);
+cbuffer First : register(b0) { uint first; };
+[numthreads(4, 1, 1)]
+void main(uint3 id : SV_DispatchThreadID) {
+    records.Store3(id.x * 12u, uint3(first + id.x, 1u, 1u));
+}
+"#;
+        let Some(host) = host() else {
+            return; // no host GPU here
+        };
+        let (mark_root, mark_pso) = crate::compute::pipeline(
+            MARK,
+            s!("group_marks"),
+            0,
+            &[
+                Param::Uav { register: 0 },
+                Param::Constants {
+                    register: 0,
+                    count: 1,
+                },
+            ],
+        )
+        .unwrap();
+        let (produce_root, produce_pso) = crate::compute::pipeline(
+            PRODUCE,
+            s!("group_produce"),
+            0,
+            &[
+                Param::Uav { register: 0 },
+                Param::Constants {
+                    register: 0,
+                    count: 1,
+                },
+            ],
+        )
+        .unwrap();
+        let argument = D3D12_INDIRECT_ARGUMENT_DESC {
+            Type: D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH,
+            ..Default::default()
+        };
+        let desc = D3D12_COMMAND_SIGNATURE_DESC {
+            ByteStride: 12,
+            NumArgumentDescs: 1,
+            pArgumentDescs: &argument,
+            NodeMask: 0,
+        };
+        let mut signature: Option<ID3D12CommandSignature> = None;
+        // SAFETY: plain command signature creation.
+        unsafe {
+            host.device
+                .CreateCommandSignature(&desc, None::<&ID3D12RootSignature>, &mut signature)
+                .unwrap()
+        };
+        let signature = signature.unwrap();
+        let (marks, marks_ptr) = host.shared_buffer(256 * 4).unwrap();
+        // The title's buffer of records (a registered host copy, stale: one
+        // group each) and one elsewhere.
+        let backing = vec![0u8; 4096];
+        let at = backing.as_ptr() as u64;
+        crate::shadow::register(at as usize, at, 4096);
+        let records = crate::shadow::find(at, 48).expect("registered shadow");
+        let list = host.new_list().unwrap();
+        assert!(group_available(), "the group pass compiles");
+        for round in 0..4 {
+            let narrow = round >= 2;
+            with_clamp_sync(narrow, || {
+                assert_eq!(
+                    list.narrow_clamp_sync(),
+                    narrow,
+                    "the host has enhanced barriers"
+                );
+                // SAFETY: our mapped buffers, written before the list runs.
+                unsafe {
+                    std::ptr::write_bytes(marks_ptr, 0, 256 * 4);
+                    let mut p = std::ptr::null_mut();
+                    records.buffer.Map(0, None, Some(&mut p)).unwrap();
+                    let stale = p
+                        .cast::<u8>()
+                        .add(records.offset(at) as usize)
+                        .cast::<[u32; 3]>();
+                    (0..4).for_each(|i| stale.add(i).write_volatile([1, 1, 1]));
+                    records.buffer.Unmap(0, None);
+                }
+                let produce = |first: u32| {
+                    records.gpu_writes(&list, at, 48, false);
+                    // SAFETY: an open list; our pipeline and live buffers.
+                    unsafe {
+                        let l = &list.list;
+                        l.SetComputeRootSignature(&produce_root);
+                        l.SetPipelineState(&produce_pso);
+                        l.SetComputeRootUnorderedAccessView(0, records.gpu(at));
+                        l.SetComputeRoot32BitConstants(1, 1, (&raw const first).cast(), 0);
+                        l.Dispatch(1, 1, 1);
+                        l.ResourceBarrier(&[uav_barrier()]);
+                    }
+                };
+                let mut opened = Vec::new();
+                let mut execute = |i: u64, base: u32| {
+                    let record = at + 12 * (i % 4);
+                    assert!(
+                        list.clamp_blocker(record, 12, None).is_some(),
+                        "out of the prelude"
+                    );
+                    let (seat, open) = list
+                        .clamp_group_seat(
+                            (&records.buffer, records.gpu(record)),
+                            (record, 12),
+                            Vec::new,
+                        )
+                        .expect("a seat");
+                    opened.push(open);
+                    let (clamped, offset) = list
+                        .clamp_group_join(&seat, records.gpu(record), (2, 12))
+                        .unwrap();
+                    // SAFETY: an open list; our pipeline, signature and live buffers.
+                    unsafe {
+                        let l = &list.list;
+                        l.SetComputeRootSignature(&mark_root);
+                        l.SetPipelineState(&mark_pso);
+                        l.SetComputeRootUnorderedAccessView(0, marks.GetGPUVirtualAddress());
+                        l.SetComputeRoot32BitConstants(1, 1, (&raw const base).cast(), 0);
+                        l.ExecuteIndirect(&signature, 1, &clamped, offset, None, 0);
+                    }
+                };
+                produce(3);
+                (0..4).for_each(|i| execute(i, 16 * i as u32));
+                // A write elsewhere: the group goes on.
+                list.defer_gpu_write(&records, at as usize + 1024, 16, false);
+                execute(1, 64);
+                produce(7);
+                (4..8).for_each(|i| execute(i, 16 * i as u32 + 64));
+                assert_eq!(
+                    opened,
+                    [true, false, false, false, false, true, false, false, false],
+                    "round {round}"
+                );
+                list.close();
+                host.execute(&[&list]);
+                let ran = |base: usize| {
+                    // SAFETY: mapped; the list has run.
+                    (0..16).filter(|&k| unsafe { marks_ptr.cast::<u32>().add(base + k).read_volatile() } != 0).count()
+                };
+                let first: Vec<usize> = (0..4).map(|i| ran(16 * i)).collect();
+                assert_eq!(
+                    first,
+                    [3, 4, 5, 6],
+                    "round {round}: the first write's groups"
+                );
+                assert_eq!(ran(64), 4, "round {round}: after the write elsewhere");
+                let second: Vec<usize> = (4..8).map(|i| ran(16 * i + 64)).collect();
+                assert_eq!(
+                    second,
+                    [7, 8, 9, 10],
+                    "round {round}: the second write's groups"
+                );
+                list.reset();
+            });
+        }
+        // SAFETY: a live buffer.
+        let past = unsafe { marks.GetGPUVirtualAddress() } + (1 << 30);
+        assert!(
+            list.clamp_group_seat((&marks, past), (past, 12), Vec::new)
+                .is_none(),
+            "a record outside its buffer is clamped inline"
+        );
+        crate::shadow::unregister(at as usize, at);
+        drop(backing);
+        assert_eq!(host.log_messages(), None);
+    }
+
+    /// A culling dispatch writes the draw records right before the indirect
+    /// draws that read them, then writes them again before the next draws
+    /// (shadow cascades over one argument buffer), in one list: each draw
+    /// draws what the culling dispatch before it wrote, not what the one
+    /// before that did. Each draw's record asks for one small triangle a
+    /// unit into a row of its own; the rows' lit pixels are the counts the
+    /// draws ran. With legacy and narrow clamp barriers.
+    #[test]
+    fn draws_after_a_culling_pass_draw_what_it_wrote_last() {
+        use super::*;
+        use crate::compute::Param;
+        use windows::Win32::Graphics::Direct3D::D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
+        use windows::Win32::Graphics::Dxgi::Common::{
+            DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_SAMPLE_DESC,
+        };
+        const CULL: &str = r#"
+RWByteAddressBuffer records : register(u0);
+cbuffer First : register(b0) { uint first; };
+[numthreads(4, 1, 1)]
+void main(uint3 id : SV_DispatchThreadID) {
+    records.Store4(id.x * 16u, uint4(3u * (first + id.x), 1u, 0u, 0u));
+}
+"#;
+        // Triangle t of a draw covers the centre of pixel (t, row) of a 16x16
+        // target and no other.
+        const DRAW: &str = r#"
+cbuffer Row : register(b0) { uint row; };
+float4 vs(uint id : SV_VertexID) : SV_Position {
+    float x = float(id / 3u);
+    uint corner = id % 3u;
+    float2 at = float2(x + (corner == 1u ? 1.75 : -0.25), float(row) + (corner == 2u ? 1.75 : -0.25));
+    return float4(at.x / 8.0 - 1.0, 1.0 - at.y / 8.0, 0.0, 1.0);
+}
+float4 ps() : SV_Target { return float4(1.0, 1.0, 1.0, 1.0); }
+"#;
+        let Some(host) = host() else {
+            return; // no host GPU here
+        };
+        assert!(group_available(), "the group pass compiles");
+        let (cull_root, cull_pso) = crate::compute::pipeline(
+            CULL,
+            s!("group_cull"),
+            0,
+            &[
+                Param::Uav { register: 0 },
+                Param::Constants {
+                    register: 0,
+                    count: 1,
+                },
+            ],
+        )
+        .unwrap();
+        let compile = |entry: windows::core::PCSTR, target: windows::core::PCSTR| {
+            let mut blob: Option<ID3DBlob> = None;
+            // SAFETY: a static source and names that outlive the call.
+            unsafe {
+                D3DCompile(
+                    DRAW.as_ptr().cast(),
+                    DRAW.len(),
+                    s!("group_draw"),
+                    None,
+                    None,
+                    entry,
+                    target,
+                    0,
+                    0,
+                    &mut blob,
+                    None,
+                )
+                .unwrap();
+            }
+            blob.unwrap()
+        };
+        let (vs, ps) = (
+            compile(s!("vs"), s!("vs_5_1")),
+            compile(s!("ps"), s!("ps_5_1")),
+        );
+        let draw_root = crate::compute::root_signature(
+            &host.device,
+            &[Param::Constants {
+                register: 0,
+                count: 1,
+            }],
+        )
+        .unwrap();
+        let target_desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            Width: 16,
+            Height: 16,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Flags: D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+            ..Default::default()
+        };
+        // SAFETY: compiled shaders, a live root signature; plain creation.
+        let (draw_pso, target, rtv_heap, rtv, back, footprint) = unsafe {
+            let mut desc = D3D12_GRAPHICS_PIPELINE_STATE_DESC {
+                pRootSignature: std::mem::transmute_copy(&draw_root),
+                VS: D3D12_SHADER_BYTECODE {
+                    pShaderBytecode: vs.GetBufferPointer(),
+                    BytecodeLength: vs.GetBufferSize(),
+                },
+                PS: D3D12_SHADER_BYTECODE {
+                    pShaderBytecode: ps.GetBufferPointer(),
+                    BytecodeLength: ps.GetBufferSize(),
+                },
+                SampleMask: u32::MAX,
+                PrimitiveTopologyType: D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
+                NumRenderTargets: 1,
+                SampleDesc: DXGI_SAMPLE_DESC {
+                    Count: 1,
+                    Quality: 0,
+                },
+                ..Default::default()
+            };
+            desc.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+            desc.BlendState.RenderTarget[0].RenderTargetWriteMask = 0xf;
+            desc.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+            desc.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+            let pso: ID3D12PipelineState = host.device.CreateGraphicsPipelineState(&desc).unwrap();
+            let mut target: Option<ID3D12Resource> = None;
+            host.device
+                .CreateCommittedResource(
+                    &D3D12_HEAP_PROPERTIES {
+                        Type: D3D12_HEAP_TYPE_DEFAULT,
+                        ..Default::default()
+                    },
+                    D3D12_HEAP_FLAG_NONE,
+                    &target_desc,
+                    D3D12_RESOURCE_STATE_RENDER_TARGET,
+                    None,
+                    &mut target,
+                )
+                .unwrap();
+            let target = target.unwrap();
+            let rtv_heap: ID3D12DescriptorHeap = host
+                .device
+                .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                    Type: D3D12_DESCRIPTOR_HEAP_TYPE_RTV,
+                    NumDescriptors: 1,
+                    ..Default::default()
+                })
+                .unwrap();
+            let rtv = rtv_heap.GetCPUDescriptorHandleForHeapStart();
+            host.device.CreateRenderTargetView(&target, None, rtv);
+            let mut footprint = D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default();
+            let mut total = 0u64;
+            host.device.GetCopyableFootprints(
+                &target_desc,
+                0,
+                1,
+                0,
+                Some(&mut footprint),
+                None,
+                None,
+                Some(&mut total),
+            );
+            let (back, _) = host.shared_buffer(total).unwrap();
+            (pso, target, rtv_heap, rtv, back, footprint)
+        };
+        let argument = D3D12_INDIRECT_ARGUMENT_DESC {
+            Type: D3D12_INDIRECT_ARGUMENT_TYPE_DRAW,
+            ..Default::default()
+        };
+        let desc = D3D12_COMMAND_SIGNATURE_DESC {
+            ByteStride: 16,
+            NumArgumentDescs: 1,
+            pArgumentDescs: &argument,
+            NodeMask: 0,
+        };
+        let mut signature: Option<ID3D12CommandSignature> = None;
+        // SAFETY: plain command signature creation.
+        unsafe {
+            host.device
+                .CreateCommandSignature(&desc, None::<&ID3D12RootSignature>, &mut signature)
+                .unwrap()
+        };
+        let signature = signature.unwrap();
+        // The title's argument buffer (a registered host copy, stale: one
+        // triangle each).
+        let backing = vec![0u8; 4096];
+        let at = backing.as_ptr() as u64;
+        crate::shadow::register(at as usize, at, 4096);
+        let records = crate::shadow::find(at, 64).expect("registered shadow");
+        for narrow in [false, true] {
+            with_clamp_sync(narrow, || {
+                let list = host.new_list().unwrap();
+                assert_eq!(
+                    list.narrow_clamp_sync(),
+                    narrow,
+                    "the host has enhanced barriers"
+                );
+                // SAFETY: our mapped buffer, written before the list runs.
+                unsafe {
+                    let mut p = std::ptr::null_mut();
+                    records.buffer.Map(0, None, Some(&mut p)).unwrap();
+                    let stale = p
+                        .cast::<u8>()
+                        .add(records.offset(at) as usize)
+                        .cast::<[u32; 4]>();
+                    (0..4).for_each(|i| stale.add(i).write_volatile([3, 1, 0, 0]));
+                    records.buffer.Unmap(0, None);
+                }
+                let l = &list.list;
+                let cull = |first: u32| {
+                    // As a title dispatch binding the records' UAV declares it.
+                    records.gpu_writes(&list, at, 64, false);
+                    // SAFETY: an open list; our pipeline and live buffers.
+                    unsafe {
+                        l.SetComputeRootSignature(&cull_root);
+                        l.SetPipelineState(&cull_pso);
+                        l.SetComputeRootUnorderedAccessView(0, records.gpu(at));
+                        l.SetComputeRoot32BitConstants(1, 1, (&raw const first).cast(), 0);
+                        l.Dispatch(1, 1, 1);
+                        // The title's barrier before its draws.
+                        l.ResourceBarrier(&[uav_barrier()]);
+                    }
+                };
+                let mut opened = Vec::new();
+                let mut draw = |i: u64, row: u32| {
+                    let record = at + 16 * i;
+                    assert!(
+                        list.clamp_blocker(record, 16, None).is_some(),
+                        "out of the prelude"
+                    );
+                    let (seat, open) = list
+                        .clamp_group_seat(
+                            (&records.buffer, records.gpu(record)),
+                            (record, 16),
+                            Vec::new,
+                        )
+                        .expect("a seat");
+                    opened.push(open);
+                    let (clamped, offset) = list
+                        .clamp_group_join(&seat, records.gpu(record), (0, 16))
+                        .unwrap();
+                    let viewport = D3D12_VIEWPORT {
+                        Width: 16.0,
+                        Height: 16.0,
+                        MaxDepth: 1.0,
+                        ..Default::default()
+                    };
+                    let scissor = windows::Win32::Foundation::RECT {
+                        left: 0,
+                        top: 0,
+                        right: 16,
+                        bottom: 16,
+                    };
+                    // SAFETY: an open list; our pipeline, signature and live buffers.
+                    unsafe {
+                        l.OMSetRenderTargets(1, Some(&rtv), false, None);
+                        l.RSSetViewports(&[viewport]);
+                        l.RSSetScissorRects(&[scissor]);
+                        l.SetGraphicsRootSignature(&draw_root);
+                        l.SetPipelineState(&draw_pso);
+                        l.SetGraphicsRoot32BitConstants(0, 1, (&raw const row).cast(), 0);
+                        l.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+                        l.ExecuteIndirect(&signature, 1, &clamped, offset, None, 0);
+                    }
+                };
+                // SAFETY: an open list and a live view.
+                unsafe { l.ClearRenderTargetView(rtv, &[0.0; 4], None) };
+                cull(3);
+                (0..4).for_each(|i| draw(i, i as u32));
+                cull(7);
+                (0..4).for_each(|i| draw(i, 4 + i as u32));
+                // SAFETY: an open list; live resources in the states named.
+                unsafe {
+                    l.ResourceBarrier(&[transition(
+                        &target,
+                        D3D12_RESOURCE_STATE_RENDER_TARGET,
+                        D3D12_RESOURCE_STATE_COPY_SOURCE,
+                    )]);
+                    let to = D3D12_TEXTURE_COPY_LOCATION {
+                        pResource: std::mem::transmute_copy(&back),
+                        Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+                        Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                            PlacedFootprint: footprint,
+                        },
+                    };
+                    let from = D3D12_TEXTURE_COPY_LOCATION {
+                        pResource: std::mem::transmute_copy(&target),
+                        Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                        Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                            SubresourceIndex: 0,
+                        },
+                    };
+                    l.CopyTextureRegion(&to, 0, 0, 0, &from, None);
+                    l.ResourceBarrier(&[transition(
+                        &target,
+                        D3D12_RESOURCE_STATE_COPY_SOURCE,
+                        D3D12_RESOURCE_STATE_RENDER_TARGET,
+                    )]);
+                }
+                list.close();
+                host.execute(&[&list]);
+                let mut p = std::ptr::null_mut();
+                // SAFETY: a mapped readback of ours; the list has run.
+                let lit: Vec<usize> = unsafe {
+                    back.Map(0, None, Some(&mut p)).unwrap();
+                    let pitch = footprint.Footprint.RowPitch as usize;
+                    let lit = (0..8)
+                        .map(|y| {
+                            let row =
+                                std::slice::from_raw_parts(p.cast::<u8>().add(y * pitch), 16 * 4);
+                            row.chunks(4).filter(|px| px[0] != 0).count()
+                        })
+                        .collect();
+                    back.Unmap(0, None);
+                    lit
+                };
+                assert_eq!(
+                    lit,
+                    [3, 4, 5, 6, 7, 8, 9, 10],
+                    "narrow {narrow}: each draw ran its last culled record"
+                );
+                assert_eq!(
+                    opened,
+                    [true, false, false, false, true, false, false, false],
+                    "narrow {narrow}"
+                );
+            });
+        }
+        drop(rtv_heap);
+        crate::shadow::unregister(at as usize, at);
+        drop(backing);
         assert_eq!(host.log_messages(), None);
     }
 
