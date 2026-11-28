@@ -1107,7 +1107,7 @@ pub(crate) fn left_out(this: This) -> bool {
 /// The hash of a shader of `this` that `VICTORY_TRACE_DISPATCH` lists
 /// (comma-separated 16-digit hashes), whose dispatches' sizes are logged.
 pub(crate) fn traced_dispatch(this: This) -> Option<String> {
-    static LIST: OnceLock<Vec<String>> = OnceLock::new();
+    static LIST: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
     let list = LIST.get_or_init(|| {
         std::env::var("VICTORY_TRACE_DISPATCH")
             .unwrap_or_default()
