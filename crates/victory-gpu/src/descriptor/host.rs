@@ -1739,7 +1739,7 @@ impl HostHeap {
                         Some(m) if is_current => {
                             m != (u64::from(generation) << 32 | u64::from(view))
                         }
-                        Some(&m) => m != 0,
+                        Some(m) => m != 0,
                         None => true,
                     };
                     if changed {
