@@ -566,7 +566,7 @@ pub(crate) struct HostHeap {
     /// With it the view's own copy of title memory, if it has one. Paged:
     /// the title views through a fraction of the slots, and a dense table
     /// of them all was 37.7 MB, written when the heap was made.
-    kept: Mutex<Paged<Held>>,
+    kept: Mutex<Holds>,
     /// Unordered views of textures left null by [`HostHeap::evict`]
     /// (`VICTORY_EVICT_HEAP_UAV`), made again by
     /// [`HostHeap::remake_unordered`] once shaders write through heaps.
@@ -779,7 +779,7 @@ impl HostHeap {
                 .collect(),
             ready: (0..count).map(|_| AtomicU64::new(0)).collect(),
             staging: std::sync::OnceLock::new(),
-            kept: Mutex::new(Paged::new((count + extra) as usize)),
+            kept: Mutex::new(Holds::new((count + extra) as usize, evict_index())),
             nulled_unordered: Mutex::new(Vec::new()),
             next: Mutex::new((0, vec![0; (extra as usize).div_ceil(64)])),
             pairs: Mutex::new((count + extra, Vec::new())),
@@ -1222,6 +1222,10 @@ impl HostHeap {
                 _ => None,
             });
             let old = std::mem::replace(slot, resource);
+            let new = slot.as_ref().map(|(r, _)| windows::core::Interface::as_raw(r) as usize);
+            kept.moved(index, old.as_ref().map(|(r, _)| windows::core::Interface::as_raw(r) as usize), new);
+            #[cfg(feature = "diagnostics")]
+            let slot = kept.slot(index as usize, false).expect("the slot just written");
             self.note_widened(old_widened.as_ref(), false);
             self.note_widened(new_widened.as_ref(), true);
             #[cfg(feature = "diagnostics")]
@@ -1294,11 +1298,12 @@ impl HostHeap {
                     continue;
                 }
                 let old = std::mem::replace(slot, resource);
+                let new = slot.as_ref().map(|(r, _)| windows::core::Interface::as_raw(r) as usize);
+                kept.moved(index, old.as_ref().map(|(r, _)| windows::core::Interface::as_raw(r) as usize), new);
                 #[cfg(feature = "diagnostics")]
                 if let Some((old, _)) = &old
                     && !self.sampler
-                    && slot.as_ref().map(|s| windows::core::Interface::as_raw(&s.0))
-                        != Some(windows::core::Interface::as_raw(old))
+                    && new != Some(windows::core::Interface::as_raw(old) as usize)
                     // SAFETY: a live resource.
                     && unsafe { old.GetDesc() }.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER
                 {
@@ -2730,14 +2735,21 @@ impl HostHeap {
         let made = self.made.lock().unwrap_or_else(|e| e.into_inner());
         let slots: Vec<u32> = {
             let kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
-            kept.iter()
-                .filter(|&(i, k)| {
-                    i < self.count as usize
-                        && k.1.is_none()
-                        && textures.contains(&(windows::core::Interface::as_raw(&k.0) as usize))
-                })
-                .map(|(i, _)| i as u32)
-                .collect()
+            let gives_up = |i: usize, k: &Held| {
+                i < self.count as usize
+                    && k.1.is_none()
+                    && textures.contains(&(windows::core::Interface::as_raw(&k.0) as usize))
+            };
+            match kept.holding(textures) {
+                // `VICTORY_EVICT_INDEX=1`: the slots holding them, looked up.
+                Some(mut slots) => {
+                    slots.retain(|&i| kept.get(i as usize).is_some_and(|k| gives_up(i as usize, k)));
+                    slots.sort_unstable();
+                    slots
+                }
+                // Every slot held, each looked at.
+                None => kept.iter().filter(|&(i, k)| gives_up(i, k)).map(|(i, _)| i as u32).collect(),
+            }
         };
         for index in slots {
             if let Some(ready) = self.ready.get(index as usize) {
@@ -3276,6 +3288,135 @@ enum HeldSource {
 
 /// What a slot made by [`make`] holds, if anything.
 type Kept = Option<Held>;
+
+/// `VICTORY_EVICT_INDEX=1` (off by default), read when a heap is made.
+///
+/// The eviction pass gives up host textures (`crate::resource::give_up`)
+/// and nulls the heap slots that view them ([`HostHeap::evict`]). Without
+/// the switch that looks at every slot each views heap holds, ~9-14 ms a
+/// frame in the world (runs T0/T1, S0/S1: the evicting line's "given up");
+/// with it, each heap keeps the slots holding each resource, and the pass
+/// looks up those of the textures it gives up.
+fn evict_index() -> bool {
+    #[cfg(test)]
+    if let Some(on) = TEST_EVICT_INDEX.with(std::cell::Cell::get) {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = crate::switch::on("VICTORY_EVICT_INDEX");
+        if on {
+            tracing::info!("heaps index their slots by the resource held (VICTORY_EVICT_INDEX=1)");
+        }
+        on
+    })
+}
+
+#[cfg(test)]
+thread_local! {
+    /// [`evict_index`] for heaps made on this test's thread.
+    static TEST_EVICT_INDEX: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// A heap's held resources by slot ([`HostHeap::kept`]) and, with
+/// [`evict_index`], the slots holding each resource (by its raw pointer).
+/// Read through [`Paged`]; a slot's resource changes only with
+/// [`Holds::moved`] following the write.
+struct Holds {
+    slots: Paged<Held>,
+    by: Option<SlotIndex>,
+}
+
+impl Holds {
+    fn new(len: usize, indexed: bool) -> Self {
+        Self { slots: Paged::new(len), by: indexed.then(SlotIndex::default) }
+    }
+
+    /// Slot `index` (of [`Paged::slot`]), to write.
+    fn slot(&mut self, index: usize, make: bool) -> Option<&mut Option<Held>> {
+        self.slots.slot(index, make)
+    }
+
+    /// Slot `index` held the resource `old` and now `new` (raw pointers).
+    fn moved(&mut self, index: u32, old: Option<usize>, new: Option<usize>) {
+        if old != new
+            && let Some(by) = &mut self.by
+        {
+            by.moved(index, old, new);
+        }
+    }
+
+    /// The slots holding any of `resources` (raw pointers), unsorted;
+    /// `None` without the index.
+    fn holding(&self, resources: &std::collections::HashSet<usize>) -> Option<Vec<u32>> {
+        let by = self.by.as_ref()?;
+        Some(resources.iter().flat_map(|r| by.slots(*r)).copied().collect())
+    }
+}
+
+impl std::ops::Deref for Holds {
+    type Target = Paged<Held>;
+    fn deref(&self) -> &Paged<Held> {
+        &self.slots
+    }
+}
+
+/// The slots holding each resource (raw pointer): most are held by one or a
+/// few.
+#[derive(Default)]
+struct SlotIndex(std::collections::HashMap<usize, Vec<u32>>);
+
+impl SlotIndex {
+    fn moved(&mut self, index: u32, old: Option<usize>, new: Option<usize>) {
+        if let Some(old) = old
+            && let std::collections::hash_map::Entry::Occupied(mut e) = self.0.entry(old)
+        {
+            if let Some(at) = e.get().iter().position(|&i| i == index) {
+                e.get_mut().swap_remove(at);
+            }
+            if e.get().is_empty() {
+                e.remove();
+            }
+        }
+        if let Some(new) = new {
+            let slots = self.0.entry(new).or_default();
+            if !slots.contains(&index) {
+                slots.push(index);
+            }
+        }
+    }
+
+    fn slots(&self, resource: usize) -> &[u32] {
+        self.0.get(&resource).map_or(&[], Vec::as_slice)
+    }
+}
+
+#[cfg(test)]
+mod slot_index_tests {
+    use super::SlotIndex;
+
+    #[test]
+    fn the_index_follows_what_each_slot_holds() {
+        let mut by = SlotIndex::default();
+        by.moved(3, None, Some(0xa));
+        by.moved(5, None, Some(0xa));
+        by.moved(7, None, Some(0xb));
+        let sorted = |by: &SlotIndex, r| {
+            let mut v = by.slots(r).to_vec();
+            v.sort_unstable();
+            v
+        };
+        assert_eq!(sorted(&by, 0xa), [3, 5]);
+        by.moved(3, Some(0xa), Some(0xb));
+        assert_eq!(sorted(&by, 0xa), [5], "slot 3 left a");
+        assert_eq!(sorted(&by, 0xb), [3, 7]);
+        by.moved(5, Some(0xa), None);
+        assert!(by.slots(0xa).is_empty(), "nothing holds a");
+        assert!(!by.0.contains_key(&0xa), "and it is forgotten");
+        by.moved(7, Some(0xb), Some(0xb));
+        assert_eq!(sorted(&by, 0xb), [3, 7], "the same again is kept once");
+    }
+}
 
 /// An old descriptor's resource and any arena slice it still reads.
 type RetiredView = (ID3D12Resource, Option<std::sync::Arc<crate::shadow::Shadow>>);
@@ -4746,6 +4887,74 @@ mod tests {
     }
 
     /// A null 3D UAV made on the real device leaves it alive.
+    /// `VICTORY_EVICT_INDEX=1`: the eviction pass nulls the same slots with
+    /// the index as when it looks at every slot, after slots were written
+    /// one at a time and in batches, and moved to other resources.
+    #[test]
+    fn eviction_nulls_the_same_slots_with_the_index() {
+        let Some(host) = host() else {
+            return; // no host GPU
+        };
+        let buffer = || {
+            let mut buffer: Option<ID3D12Resource> = None;
+            // SAFETY: a plain committed buffer with an output slot here.
+            unsafe {
+                host.device
+                    .CreateCommittedResource(
+                        &D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() },
+                        D3D12_HEAP_FLAG_NONE,
+                        &D3D12_RESOURCE_DESC {
+                            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                            Width: 256,
+                            Height: 1,
+                            DepthOrArraySize: 1,
+                            MipLevels: 1,
+                            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                            ..Default::default()
+                        },
+                        D3D12_RESOURCE_STATE_COMMON,
+                        None,
+                        &mut buffer,
+                    )
+                    .unwrap();
+            }
+            buffer.unwrap()
+        };
+        let (a, b) = (buffer(), buffer());
+        let raw = |r: &ID3D12Resource| windows::core::Interface::as_raw(r) as usize;
+        let mut held = Vec::new();
+        for indexed in [false, true] {
+            TEST_EVICT_INDEX.with(|i| i.set(Some(indexed)));
+            let heap = HostHeap::new(false, 16);
+            TEST_EVICT_INDEX.with(|i| i.set(None));
+            let Some(heap) = heap else {
+                return;
+            };
+            assert_eq!(heap.kept.lock().unwrap().by.is_some(), indexed);
+            heap.keep(1, Some((a.clone(), None)));
+            heap.keep(2, Some((a.clone(), None)));
+            heap.keep(3, Some((b.clone(), None)));
+            heap.keep(2, Some((b.clone(), None))); // moved from a to b
+            let mut retired = Vec::new();
+            heap.keep_batch(vec![(5, Some((a.clone(), None))), (6, Some((a.clone(), None)))], &mut retired);
+            heap.keep_batch(vec![(6, None)], &mut retired); // a slot let go
+            heap.keep(7, Some((a.clone(), None)));
+            heap.evict(&std::collections::HashSet::from([raw(&a)]));
+            let kept = heap.kept.lock().unwrap();
+            let now: Vec<(u32, Option<usize>)> =
+                (1..8).map(|i| (i, kept.get(i as usize).map(|(r, _)| raw(r)))).collect();
+            held.push(now);
+        }
+        let none = None;
+        assert_eq!(
+            held[0],
+            [(1, none), (2, Some(raw(&b))), (3, Some(raw(&b))), (4, none), (5, none), (6, none), (7, none)],
+            "a's slots nulled, b's kept"
+        );
+        assert_eq!(held[1], held[0], "the same with the index");
+    }
+
     #[test]
     fn null_3d_uav_is_accepted_by_the_device() {
         let Some(host) = host() else {
