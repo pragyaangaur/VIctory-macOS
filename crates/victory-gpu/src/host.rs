@@ -2997,6 +2997,9 @@ impl Host {
         // submission staged) age on each one (`uploads`), and so do the
         // idle spare lists. The last submission has run.
         crate::list::trim_idle();
+        if flight::before_texture_uploads(!heaps.is_empty(), &textures) {
+            clock.lap(Phase::LandingEarly);
+        }
         #[cfg(feature = "diagnostics")]
         let uploading = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::UploadsUs);
         let uploads = crate::bindless::uploads(&heaps, &textures);
