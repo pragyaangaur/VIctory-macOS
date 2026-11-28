@@ -166,22 +166,44 @@ enum Writer {
     Destination,
 }
 
-fn copy_sequence(host: &Host, same_list: bool, aliased: bool, writer: Writer) -> [[u32; WORDS]; 2] {
+#[derive(Clone, Copy, Debug)]
+enum CopyCall {
+    Region,
+    Resource,
+    Memory,
+}
+
+fn two_buffer_views() -> (This, This) {
+    let (a, b) = crate::watch::tests::twin_views(1);
+    let page = crate::watch::PAGE as u64;
+    (
+        buffer_at_address(a as u64, page),
+        buffer_at_address(b as u64, page),
+    )
+}
+
+fn copy_sequence(
+    host: &Host,
+    same_list: bool,
+    aliased: bool,
+    writer: Writer,
+    call: CopyCall,
+) -> [[u32; WORDS]; 2] {
     let commands = Commands::new();
     let (read_alias, destination) = if aliased {
-        let (a, b) = crate::watch::tests::twin_views(1);
-        let page = crate::watch::PAGE as u64;
-        (
-            buffer_at_address(a as u64, page),
-            buffer_at_address(b as u64, page),
-        )
+        two_buffer_views()
     } else {
         let buffer = crate::resource::test_buffer(256);
         (buffer, buffer)
     };
-    let source = crate::resource::test_buffer(256);
+    let (write_source, source) = if aliased && matches!(writer, Writer::Source) {
+        two_buffer_views()
+    } else {
+        let buffer = crate::resource::test_buffer(256);
+        (buffer, buffer)
+    };
     write_words(read_alias, OLD);
-    write_words(source, NEW);
+    write_words(write_source, NEW);
 
     let shader = compile_cs(
         READ_BUFFER,
@@ -223,17 +245,33 @@ fn copy_sequence(host: &Host, same_list: bool, aliased: bool, writer: Writer) ->
     read(first, 0);
     match writer {
         Writer::None => (),
-        Writer::Source => record_writer(first, bytes(source) as u64, &writer_shader, false),
+        Writer::Source => record_writer(first, bytes(write_source) as u64, &writer_shader, false),
         Writer::Destination => record_writer(first, bytes(read_alias) as u64, &writer_shader, true),
     }
-    slot::<extern "system" fn(This, This, u64, This, u64, u64)>(second, 0x78)(
-        second,
-        destination,
-        0,
-        source,
-        0,
-        BYTES,
-    );
+    match call {
+        CopyCall::Region => {
+            slot::<extern "system" fn(This, This, u64, This, u64, u64)>(second, 0x78)(
+                second,
+                destination,
+                0,
+                source,
+                0,
+                BYTES,
+            );
+        }
+        CopyCall::Resource => {
+            slot::<extern "system" fn(This, This, This)>(second, 0x88)(second, destination, source);
+        }
+        CopyCall::Memory => {
+            slot::<extern "system" fn(This, u64, u64, u64, u32)>(second, 0x1e0)(
+                second,
+                bytes(destination) as u64,
+                bytes(source) as u64,
+                BYTES,
+                0,
+            );
+        }
+    }
     read(second, BYTES as u32);
     commands.submit(if same_list { &[0] } else { &[0, 1] });
     commands.drain();
@@ -241,6 +279,9 @@ fn copy_sequence(host: &Host, same_list: bool, aliased: bool, writer: Writer) ->
     // SAFETY: the queue has finished and the readback holds both dispatch outputs.
     let result = unsafe { mapped.cast::<[[u32; WORDS]; 2]>().read() };
     release_ref(source);
+    if write_source != source {
+        release_ref(write_source);
+    }
     release_ref(read_alias);
     if aliased {
         release_ref(destination);
@@ -248,56 +289,114 @@ fn copy_sequence(host: &Host, same_list: bool, aliased: bool, writer: Writer) ->
     result
 }
 
-fn check_buffer_order(same_list: bool, aliased: bool, writer: Writer) {
+fn check_buffer_order(same_list: bool, aliased: bool, writer: Writer, call: CopyCall) {
     let Some(host) = gpu_host() else { return };
-    let _mode = ModeGuard::new(false, false);
-    let result = copy_sequence(host, same_list, aliased, writer);
     let expected = match writer {
         Writer::Source => [OLD, GPU],
         Writer::None | Writer::Destination => [OLD, NEW],
     };
-    assert_eq!(
-        result, expected,
-        "same list {same_list}, alias {aliased}, writer {writer:?}"
-    );
+    for (flight, worker) in [(false, false), (true, false), (false, true), (true, true)] {
+        let _mode = ModeGuard::new(flight, worker);
+        let result = copy_sequence(host, same_list, aliased, writer, call);
+        assert_eq!(
+            result, expected,
+            "same list {same_list}, alias {aliased}, writer {writer:?}, call {call:?}, Flight-1 {flight}, worker {worker}"
+        );
+    }
 }
 
 #[test]
 fn copy_order_same_list() {
-    check_buffer_order(true, false, Writer::None);
+    check_buffer_order(true, false, Writer::None, CopyCall::Region);
 }
 
 #[test]
 fn copy_order_cross_list() {
-    check_buffer_order(false, false, Writer::None);
+    check_buffer_order(false, false, Writer::None, CopyCall::Region);
 }
 
 #[test]
 fn copy_order_alias_same_list() {
-    check_buffer_order(true, true, Writer::None);
+    check_buffer_order(true, true, Writer::None, CopyCall::Region);
 }
 
 #[test]
 fn copy_order_alias_cross_list() {
-    check_buffer_order(false, true, Writer::None);
+    check_buffer_order(false, true, Writer::None, CopyCall::Region);
 }
 
 #[test]
 fn copy_order_gpu_source_same_list() {
-    check_buffer_order(true, false, Writer::Source);
+    check_buffer_order(true, false, Writer::Source, CopyCall::Region);
 }
 
 #[test]
 fn copy_order_gpu_source_cross_list() {
-    check_buffer_order(false, false, Writer::Source);
+    check_buffer_order(false, false, Writer::Source, CopyCall::Region);
 }
 
 #[test]
 fn copy_order_gpu_destination_same_list() {
-    check_buffer_order(true, false, Writer::Destination);
+    check_buffer_order(true, false, Writer::Destination, CopyCall::Region);
 }
 
 #[test]
 fn copy_order_gpu_destination_cross_list() {
-    check_buffer_order(false, false, Writer::Destination);
+    check_buffer_order(false, false, Writer::Destination, CopyCall::Region);
+}
+
+#[test]
+fn copy_order_gpu_source_alias() {
+    for same_list in [true, false] {
+        check_buffer_order(same_list, true, Writer::Source, CopyCall::Region);
+    }
+}
+
+#[test]
+fn copy_order_gpu_destination_alias() {
+    for same_list in [true, false] {
+        check_buffer_order(same_list, true, Writer::Destination, CopyCall::Region);
+    }
+}
+
+#[test]
+fn copy_order_copy_resource() {
+    for same_list in [true, false] {
+        check_buffer_order(same_list, false, Writer::None, CopyCall::Resource);
+    }
+}
+
+#[test]
+fn copy_order_copy_memory() {
+    for same_list in [true, false] {
+        check_buffer_order(same_list, true, Writer::None, CopyCall::Memory);
+    }
+}
+
+#[test]
+fn copy_order_batches_consecutive_copy_only_commands() {
+    let Some(_host) = gpu_host() else { return };
+    let _mode = ModeGuard::new(false, false);
+    let commands = Commands::new();
+    let list = commands.lists[0];
+    let buffers = [(); 3].map(|()| crate::resource::test_buffer(256));
+    write_words(buffers[0], NEW);
+    for (source, destination) in [(buffers[0], buffers[1]), (buffers[1], buffers[2])] {
+        slot::<extern "system" fn(This, This, u64, This, u64, u64)>(list, 0x78)(
+            list,
+            destination,
+            0,
+            source,
+            0,
+            BYTES,
+        );
+    }
+    assert_eq!(crate::list::segments(list).len(), 1);
+    commands.submit(&[0]);
+    // SAFETY: one live title buffer, after queue completion.
+    let result = unsafe { bytes(buffers[2]).cast::<[u32; WORDS]>().read() };
+    for buffer in buffers {
+        release_ref(buffer);
+    }
+    assert_eq!(result, NEW);
 }

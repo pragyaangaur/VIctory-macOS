@@ -2424,6 +2424,7 @@ struct Deferred {
     /// scanning `copies` for lists that have none.
     has_heaps: bool,
     has_textures: bool,
+    has_title_copy: bool,
     has_gpu_writes: bool,
     /// Work done once the list has run, before the bottom-of-pipe writes
     /// (title memory shaders wrote at addresses they computed goes back).
@@ -3081,10 +3082,7 @@ impl Host {
                 .checked_sub(uploads_offset)
                 .and_then(|i| barrier_before.get(i).copied())
                 .unwrap_or(false);
-            if needs_barrier
-                && !lists.is_empty()
-                && let Some(barrier) = barrier_lists.get(barrier_cursor)
-            {
+            if needs_barrier && let Some(barrier) = barrier_lists.get(barrier_cursor) {
                 lists.push(barrier.list());
                 barrier_cursor += 1;
             }
@@ -4647,6 +4645,7 @@ impl HostList {
     fn defer_title_copy(&self, step: Step) {
         let mut deferred = self.deferred();
         deferred.copies.push(step);
+        deferred.has_title_copy = true;
         deferred.refreshed.clear();
         deferred.slots.clear();
         deferred.filled_scratch.clear();
@@ -5099,13 +5098,38 @@ impl HostList {
     /// over).
     pub(crate) fn is_empty(&self) -> bool {
         let d = self.deferred();
-        let deferred_empty = d.copies.is_empty() && d.uploads.is_empty() && d.writes.is_empty() && d.after.is_empty() && d.missed.is_empty();
-        drop(d);
-        deferred_empty
-            && self.states.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
-            && self.twins.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
-            && self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
-            && self.clamps.lock().unwrap_or_else(|e| e.into_inner()).pending.is_empty()
+        let has_copies = !d.copies.is_empty();
+        !self.has_work(d, has_copies)
+    }
+
+    pub(crate) fn has_title_copy(&self) -> bool {
+        self.deferred().has_title_copy
+    }
+
+    /// Earlier work must complete before a CPU title copy can change what
+    /// the GPU reads, or observe what that work writes. Consecutive CPU
+    /// title copies already run in order in preparation.
+    pub(crate) fn needs_completion_before_title_copy(&self) -> bool {
+        let deferred = self.deferred();
+        let other_steps = deferred
+            .copies
+            .iter()
+            .any(|step| !matches!(step, Step::Copy(..) | Step::Move(..)));
+        self.has_work(deferred, other_steps)
+    }
+
+    fn has_work(&self, deferred: std::sync::MutexGuard<'_, Deferred>, has_steps: bool) -> bool {
+        let has_work = has_steps
+            || !deferred.uploads.is_empty()
+            || !deferred.writes.is_empty()
+            || !deferred.after.is_empty()
+            || !deferred.missed.is_empty();
+        drop(deferred);
+        has_work
+            || !self.states.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
+            || !self.twins.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
+            || !self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
+            || !self.clamps.lock().unwrap_or_else(|e| e.into_inner()).pending.is_empty()
     }
 
     /// `size` bytes of mapped upload memory for a texture to copy from,

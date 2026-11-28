@@ -383,6 +383,39 @@ impl HeldTick {
     }
 }
 
+/// Runs an ordered queue piece in parts when deferred CPU copies need the
+/// work in an earlier segment to have landed before their preparation.
+#[cfg(windows)]
+fn for_each_copy_ordered_part(
+    segments: Vec<(std::sync::Arc<crate::host::HostList>, bool)>,
+    mut run: impl FnMut(Vec<(std::sync::Arc<crate::host::HostList>, bool)>),
+) {
+    let mut boundaries = Vec::new();
+    let mut checked = 0;
+    for (index, (list, _)) in segments.iter().enumerate().skip(1) {
+        if list.has_title_copy() {
+            if segments[checked..index]
+                .iter()
+                .any(|(prior, _)| prior.needs_completion_before_title_copy())
+            {
+                boundaries.push(index);
+            }
+            checked = index;
+        }
+    }
+    if boundaries.is_empty() {
+        run(segments);
+        return;
+    }
+    let mut remaining = segments.into_iter();
+    let mut start = 0;
+    for end in boundaries {
+        run(remaining.by_ref().take(end - start).collect());
+        start = end;
+    }
+    run(remaining.collect());
+}
+
 /// Pumps all currently ready segments/signals from `HELD` while holding
 /// `SUBMIT_DRAIN` and releasing `HELD` around every host GPU call.
 #[cfg(windows)]
@@ -479,17 +512,17 @@ fn pump_ready_under_drain(why: Why) -> bool {
                 coalesced_bop_total += coalesced_bop_waits;
                 hazard_splits_total += hazard_splits;
                 waited_all.extend(waited);
-                let barriers: Vec<bool> = segments.iter().map(|&(_, b)| b).collect();
-                let run_segments: Vec<std::sync::Arc<crate::host::HostList>> =
-                    segments.into_iter().map(|(s, _)| s).collect();
                 let at = std::time::Instant::now();
-                #[cfg(feature = "diagnostics")]
-                crate::copystat::add(crate::copystat::C::PumpExecutes, 1);
-                if crate::host::flight1_enabled() {
-                    host.execute_flight1(run_segments, barriers);
-                } else {
-                    host.execute_sync_segments(run_segments, barriers);
-                }
+                for_each_copy_ordered_part(segments, |part| {
+                    let (run_segments, barriers) = part.into_iter().unzip();
+                    #[cfg(feature = "diagnostics")]
+                    crate::copystat::add(crate::copystat::C::PumpExecutes, 1);
+                    if crate::host::flight1_enabled() {
+                        host.execute_flight1(run_segments, barriers);
+                    } else {
+                        host.execute_sync_segments(run_segments, barriers);
+                    }
+                });
                 for (fence, value) in signals {
                     if !crate::host::flight1_enabled()
                         || !host.attach_signal(fence as This, value, true)
@@ -926,18 +959,17 @@ fn pump_work(held: &mut Holding, why: Why) {
     };
     let started = std::time::Instant::now();
     let mut ran = std::time::Duration::ZERO;
-    let mut run = |segments: Vec<(std::sync::Arc<crate::host::HostList>, bool)>| {
-        let lists: Vec<&crate::host::HostList> = segments.iter().map(|(s, _)| &**s).collect();
-        let barriers: Vec<bool> = segments.iter().map(|&(_, b)| b).collect();
+    let mut run = |segments| {
         let at = std::time::Instant::now();
-        #[cfg(feature = "diagnostics")]
-        crate::copystat::add(crate::copystat::C::PumpExecutes, 1);
-        host.execute_with_barriers(&lists, &barriers);
+        for_each_copy_ordered_part(segments, |part| {
+            let (lists, barriers): (Vec<_>, Vec<_>) =
+                part.iter().map(|(list, barrier)| (&**list, *barrier)).unzip();
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::add(crate::copystat::C::PumpExecutes, 1);
+            host.execute_with_barriers(&lists, &barriers);
+            part.into_iter().for_each(|(list, _)| crate::list::recycle(list));
+        });
         ran += at.elapsed();
-        drop(lists);
-        segments
-            .into_iter()
-            .for_each(|(s, _)| crate::list::recycle(s));
     };
     let mut signal = |f: usize, value: u64| {
         crate::fence::set(f as This, value);
