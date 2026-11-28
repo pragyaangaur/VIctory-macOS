@@ -1205,11 +1205,13 @@ impl Shadow {
                 self.forget_sums(a, b);
             }
         }
-        #[cfg(feature = "diagnostics")]
         let started = std::time::Instant::now();
         let splits = t.take_split_many(ranges);
+        let taken = started.elapsed().as_micros() as u64;
+        REFRESH_PARTS[0].fetch_add(taken, Ordering::Relaxed);
         #[cfg(feature = "diagnostics")]
-        crate::copystat::add(crate::copystat::C::WatchUs, started.elapsed().as_micros() as u64);
+        crate::copystat::add(crate::copystat::C::WatchUs, taken);
+        let copying = std::time::Instant::now();
         let start = self.start as usize;
         let mut before = busy
             .iter()
@@ -1258,6 +1260,7 @@ impl Shadow {
                 }
             }
             copied[i] = bytes;
+            REFRESH_PARTS[2].fetch_add(1, Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
             {
                 use crate::copystat::{C, add};
@@ -1266,6 +1269,7 @@ impl Shadow {
                 add(C::Unchanged, (to - from).saturating_sub(bytes) as u64);
             }
         }
+        REFRESH_PARTS[1].fetch_add(copying.elapsed().as_micros() as u64, Ordering::Relaxed);
     }
 
     /// Puts the copy's bytes of `[a, b)` (title addresses), just updated,
@@ -2786,6 +2790,11 @@ pub(crate) fn forget_range(at: usize, len: usize) {
 type RefreshedBy = std::collections::HashMap<usize, (u64, u64, bool, u64, u64)>;
 static REFRESHED: Mutex<Option<RefreshedBy>> = Mutex::new(None);
 
+/// Tracked refreshes since the last frame report, summed over threads:
+/// microseconds taking the changed pages (`Tracked::take_split_many`, the
+/// pages guarded again among it), microseconds copying them, and ranges.
+static REFRESH_PARTS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+
 /// A refresh of `copy` copied `bytes` in `us` microseconds.
 pub(crate) fn note_refreshed(copy: &Arc<Shadow>, bytes: usize, us: u64) {
     if bytes == 0 {
@@ -2903,13 +2912,18 @@ pub(crate) fn log_refreshed(frames: f64) {
             )
         })
         .collect();
+    let parts = REFRESH_PARTS.each_ref().map(|c| c.swap(0, Ordering::Relaxed));
     tracing::info!(
         "host copies refreshed per frame: {:.0} copies, tracked {:.1} MB, untracked (whole) {:.1} MB \
-         (copies on physical pages with pages unmapped so far: {}); most: {}",
+         (copies on physical pages with pages unmapped so far: {}); tracked ranges {:.0}, ms on all threads \
+         taking their changed pages {:.1}, copying them {:.1}; most: {}",
         map.len() as f64 / frames,
         mb(tracked),
         mb(whole),
         crate::tiled::partial_made(),
+        parts[2] as f64 / frames,
+        parts[0] as f64 / 1e3 / frames,
+        parts[1] as f64 / 1e3 / frames,
         top.join(", ")
     );
 }
