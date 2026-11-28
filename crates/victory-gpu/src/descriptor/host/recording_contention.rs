@@ -15,7 +15,7 @@ thread_local! {
     static WAIT: Cell<Option<Wait>> = const { Cell::new(None) };
 }
 
-pub(super) fn lock(made: &Mutex<Vec<u64>>) -> Option<MutexGuard<'_, Vec<u64>>> {
+pub(super) fn lock<T>(made: &Mutex<T>) -> Option<MutexGuard<'_, T>> {
     WAIT.with(|counter| {
         let mut wait = counter.get()?;
         wait.acquisitions += 1;
