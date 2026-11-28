@@ -119,7 +119,7 @@ fn pipeline() -> HostPipeline {
     assert!(host.memory);
     assert!(host.root_srvs.is_empty());
     let shader = crate::pipeline::Shader::for_test(
-        "scalar root reads",
+        "compute",
         crate::pipeline::Translated {
             host,
             used: native.used,
@@ -128,7 +128,10 @@ fn pipeline() -> HostPipeline {
             threads: None,
         },
     );
-    HostPipeline::new(&[shader], None, |_, _| {}).expect("scalar loads compute pipeline")
+    HostPipeline::new(&[shader], None, |reason, code| {
+        panic!("scalar loads pipeline: {reason} ({code:?})")
+    })
+    .expect("scalar loads compute pipeline")
 }
 
 #[test]
